@@ -496,6 +496,10 @@ namespace fastllm {
             "layers.*.ffn.shared_experts.w1.weight",
             "layers.*.ffn.shared_experts.w2.weight",
             "layers.*.ffn.shared_experts.w3.weight",
+            "vision.patch_embed.proj.weight",
+            "vision.blocks.*.attn.wqkv.weight", "vision.blocks.*.attn.wo.weight",
+            "vision.blocks.*.mlp.w1.weight", "vision.blocks.*.mlp.w2.weight",
+            "aligner.w1.weight", "aligner.w2.weight",
         };
     }
 
@@ -596,12 +600,13 @@ namespace fastllm {
         }
 
         LoadEngramMeta();
+        InitVisionParams();
 
         printf("[Fastllm] DeepSeek-V4.1: %d layers, %d experts (top-%d), kv sources = %d, index sources = %d, "
-               "engram layers = %d%s\n",
+               "engram layers = %d%s, vision layers = %d\n",
                block_cnt, num_experts, num_experts_per_tok, (int)kv_source_layer_ids.size(),
                (int)index_source_layer_ids.size(), (int)engram_layer_ids.size(),
-               engramMeta.loaded ? "" : " (engram meta NOT loaded)");
+               engramMeta.loaded ? "" : " (engram meta NOT loaded)", vision_n_layers);
         fflush(stdout);
     }
 
@@ -708,10 +713,20 @@ namespace fastllm {
         std::map<std::string, std::vector<std::pair<std::string, DataType> > > result;
         std::vector<std::string> ordinary;
         for (const std::string &name : tensorNames) {
-            // 视觉编码器与 DSpark 草稿层暂不加载
-            if (V41StartsWith(name, "vision.") || V41StartsWith(name, "aligner.") ||
-                name == "image_start" || name == "image_end" || name == "image_newline" ||
-                V41StartsWith(name, "mtp.")) {
+            // DSpark 草稿层暂不加载
+            if (V41StartsWith(name, "mtp.")) {
+                continue;
+            }
+            // 视觉编码器：线性层权重走通用映射（float16），其余（norm / bias / 分隔符嵌入）保持 float32
+            if (IsVisionTensor(name)) {
+                if (!VisionEnabled()) {
+                    continue;
+                }
+                if (V41EndsWith(name, ".weight") && this->weight.GetWeightType(name) == WeightType::LINEAR) {
+                    ordinary.push_back(name);
+                } else {
+                    result[name].push_back({name, DataType::FLOAT32});
+                }
                 continue;
             }
             // Engram 表由模型自行读取（超出通用加载器的 int32 scale 索引范围）
@@ -933,12 +948,27 @@ namespace fastllm {
 
     namespace {
         // 原地清空请求状态（layers 里的 Data 没有深拷贝赋值，只能重建）
+        bool V41HasImageToken(const std::vector<int> &tokens, int imageTokenId) {
+            if (imageTokenId < 0) {
+                return false;
+            }
+            for (int tok : tokens) {
+                if (tok == imageTokenId) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         void V41ResetState(DeepSeekV41RequestState &state, int blockCnt) {
             state.layers.clear();
             state.layers.resize(blockCnt);
             state.engramHistory.clear();
             state.totalLen = 0;
             state.restoredLen = 0;
+            // pendingMultimodal 由 ResponseContext 持有，重建时保留；图像嵌入需要重新编码
+            state.imagesEncoded = false;
+            state.imageSpans.clear();
         }
     }
 
@@ -1000,6 +1030,11 @@ namespace fastllm {
             }
         }
         RegisterState(key, firstKey, state);
+        // 图文请求：调度器可能只用普通 Forward 逐块 prefill，因此在这里就把多模态输入记到请求状态里，
+        // 由第一个 prefill 块编码图像（见 ForwardSegments 的调用方）
+        if (!context->multimodalInput.empty()) {
+            state->pendingMultimodal = &context->multimodalInput;
+        }
     }
 
     void DeepSeekV41Model::OnResponseContextRemoved(ResponseContext *context) {
@@ -1230,6 +1265,10 @@ namespace fastllm {
         if (!state || state->totalLen <= 0 || context->allTokens.empty()) {
             return;
         }
+        // 图文请求的状态不进前缀缓存（原因同 TryRestoreHistoryCache）
+        if (!context->multimodalInput.empty() || V41HasImageToken(context->allTokens, image_token_id)) {
+            return;
+        }
         auto memory = SnapshotState(*state, context->allTokens);
         if (!memory) {
             if (V41PrefixCacheDebug()) {
@@ -1254,6 +1293,10 @@ namespace fastllm {
         }
         const int minTokens = std::max(1, V41EnvInt("FASTLLM_DSV41_PREFIX_CACHE_MIN_TOKENS", 16));
         if ((int)inputTokens.size() <= minTokens) {
+            return false;
+        }
+        // 图文请求不复用前缀：图像占位 token 的 id 与图像内容无关，同样的文字配不同的图会误命中
+        if (V41HasImageToken(inputTokens, image_token_id)) {
             return false;
         }
         auto candidates = v41HistoryCache.GetCandidates(inputTokens);
@@ -1360,12 +1403,43 @@ namespace fastllm {
         (void)attentionMask;
         AssertInFastLLM(batch == 1 && inputIds.dims.size() == 2 && inputIds.dims[0] == 1,
                         "DeepSeekV41Model::ForwardBatch only supports one sequence per call.");
+        return ForwardSingle(inputIds, positionIds, pastKeyValues, generationConfig, lastTokens, retLogits,
+                             nullptr, nullptr);
+    }
+
+    std::vector<int> DeepSeekV41Model::ForwardSingle(const Data &inputIds, const Data &positionIds,
+                                                     std::vector<std::pair<Data, Data> > &pastKeyValues,
+                                                     const GenerationConfig &generationConfig,
+                                                     const LastTokensManager &lastTokens,
+                                                     std::vector<std::vector<float>*> *retLogits,
+                                                     const Data *inputEmbeds,
+                                                     const std::vector<int> *imageMask) {
         const int seqlen = inputIds.dims[1];
         const int startPos = V41FirstPosition(&positionIds);
+        AssertInFastLLM(inputEmbeds == nullptr ||
+                        (inputEmbeds->dims.size() == 3 && inputEmbeds->dims[1] == seqlen &&
+                         inputEmbeds->dims[2] == embed_dim),
+                        "DeepSeekV41Model: inputEmbeds must be [1, seqlen, dim].");
+        AssertInFastLLM(imageMask == nullptr || (int)imageMask->size() == seqlen,
+                        "DeepSeekV41Model: imageMask length mismatch.");
+        // 重建缓存时 V41ResetState 保留 pendingMultimodal（图像会重新编码）
         auto state = GetOrCreateState(pastKeyValues, startPos == 0);
         AssertInFastLLM(state->totalLen == startPos,
                         "DeepSeekV41Model: position mismatch (cache has " + std::to_string(state->totalLen) +
                         " tokens, request starts at " + std::to_string(startPos) + ").");
+
+        // 图文请求：第一个块编码全部图像，之后每个块把与图像 span 重叠的位置换成图像嵌入
+        Data imageEmbeds;
+        std::vector<int> imageMaskStorage;
+        if (inputEmbeds == nullptr && state->pendingMultimodal != nullptr) {
+            if (!state->imagesEncoded) {
+                EncodeImageSpans(*state->pendingMultimodal, *state);
+            }
+            if (PrepareImageEmbeds(inputIds, startPos, *state, imageEmbeds, imageMaskStorage)) {
+                inputEmbeds = &imageEmbeds;
+                imageMask = &imageMaskStorage;
+            }
+        }
 
         std::vector<DeepSeekV41Segment> segments(1);
         segments[0].state = state;
@@ -1377,7 +1451,7 @@ namespace fastllm {
         for (auto &kvPair : pastKeyValues) {
             samplingPastKeyValues.push_back(std::make_pair(&kvPair.first, &kvPair.second));
         }
-        std::vector<int> ret = ForwardSegments(segments, inputIds, nullptr, nullptr, generationConfigs,
+        std::vector<int> ret = ForwardSegments(segments, inputIds, inputEmbeds, imageMask, generationConfigs,
                                                lastTokens, retLogits, samplingPastKeyValues);
         if (!pastKeyValues.empty()) {
             V41UpdateStubKV(pastKeyValues[0].first, pastKeyValues[0].second, state->totalLen);
@@ -1506,6 +1580,18 @@ namespace fastllm {
         }
         const bool single = numSegments == 1;
         const int seqlen = total;   // 拼接后的 token 总数
+        // 图像 token（掩码按拼接后的全局下标）：Engram 置 -1，专家选择改用 gate.bias_vl
+        AssertInFastLLM(imageMask == nullptr || (int)imageMask->size() == seqlen,
+                        "DeepSeekV41Model::ForwardSegments: imageMask length mismatch.");
+        bool hasImageTokens = false;
+        if (imageMask != nullptr) {
+            for (int v : *imageMask) {
+                if (v != 0) {
+                    hasImageTokens = true;
+                    break;
+                }
+            }
+        }
         // --kv_cache_dtype fp8_e4m3：滑窗 KV 与压缩 KV 以 FP8 + UE8M0 块 scale 存储（默认 BF16）
         const bool fp8KV = this->kvCacheDataType == DataType::FP8_E4M3;
 
@@ -1864,9 +1950,19 @@ namespace fastllm {
                     Mul(logits, 1.0f / gate_temp, logits);
                 }
                 Data &gateBias = weight[gpre + ".bias"];
+                // 图像 token 使用 bias_vl 做专家选择（只影响 prefill，走 CPU 参考路径）
+                Data *gateBiasVl = nullptr;
+                if (hasImageTokens) {
+                    auto vlIt = weight.weight.find(gpre + ".bias_vl");
+                    AssertInFastLLM(vlIt != weight.weight.end(),
+                                    "DeepSeekV41: " + gpre + ".bias_vl is required for image tokens.");
+                    gateBiasVl = &vlIt->second;
+                    gateBiasVl->ToDevice(DataDevice::CPU);
+                }
                 bool routed = false;
 #ifdef USE_CUDA
-                if (logits.dataDevice == DataDevice::CUDA && !V41EnvFlag("FASTLLM_DSV41_DISABLE_CUDA_ROUTE") &&
+                if (!hasImageTokens && logits.dataDevice == DataDevice::CUDA &&
+                    !V41EnvFlag("FASTLLM_DSV41_DISABLE_CUDA_ROUTE") &&
                     FastllmCudaDeepSeekV4RouteScoreTransform(logits, 2)) {
                     gateBias.ToDevice(DataDevice::CUDA);
                     SelectExpert(logits, expertIndex, expertScore, num_experts_per_tok, true,
@@ -1883,9 +1979,11 @@ namespace fastllm {
                     std::vector<float> scores((uint64_t)seqlen * num_experts_per_tok);
                     std::vector<float> original(num_experts), select(num_experts);
                     for (int t = 0; t < seqlen; t++) {
+                        const float *tokenBias = (gateBiasVl != nullptr && (*imageMask)[t] != 0) ?
+                                                 (const float*)gateBiasVl->cpuData : bias;
                         for (int e = 0; e < num_experts; e++) {
                             original[e] = std::sqrt(V41Softplus(raw[(uint64_t)t * num_experts + e]));
-                            select[e] = original[e] + bias[e];
+                            select[e] = original[e] + tokenBias[e];
                         }
                         float sum = 0.0f;
                         for (int k = 0; k < num_experts_per_tok; k++) {

@@ -219,13 +219,15 @@ PYTHONPATH=build/tools python test/basic/deepseek_v41_vision_reference.py \
 | 稀疏注意力（4 层合计 / 每层 prefill） | 574 ms / 165 ms | 34 ms / 10.6 ms |
 | indexer 打分（3 层合计） | 797 ms | 5.7 ms |
 | HcMix（合计 / 每次 prefill 调用） | 23.3 ms / 1.92 ms | 6.9 ms / 254 us |
-| 端到端 prefill | 1.57 s | 0.38 s |
+| 端到端 prefill | 1.56 s | 0.32 s |
+| 端到端 decode | 102 tok/s | 271 tok/s |
 | 单 token decode 的注意力 kernel | 88 us | 12 us（+ 6 us 合并） |
 
 长上下文（同一配置，`--chunked-prefill 4096`）：
 
 | prefill 长度 | 旧 kernel | 新 kernel | decode（旧 / 新） |
 | --- | --- | --- | --- |
+| 4096 | 1.56 s | 0.32 s | 102 / 271 tok/s |
 | 8192 | 3.77 s | 0.39 s | 86 / 172 tok/s |
 | 32768 | 33.60 s | 1.08 s | 58 / 99 tok/s |
 | 65536 | — | 2.87 s | — |

@@ -1755,7 +1755,8 @@ class model:
         messages.insert(0, {"role": "system", "tools": tools})
         return messages
 
-    def _prepare_deepseek_v41_multimodal(self, conversation, images, tools, enable_thinking):
+    def _prepare_deepseek_v41_multimodal(self, conversation, images, tools, enable_thinking,
+                                         reasoning_effort = None):
         """DeepSeek-V4.1 图文输入：官方 encode_messages 渲染带占位符的 prompt，再展开图像 span。
         有 HF tokenizer 时与纯文本路径一样用它编码，否则退回 fastllm 原生 tokenizer。"""
         from ftllm.encoding_dsv41 import encode_messages
@@ -1773,6 +1774,7 @@ class model:
             encode_messages = encode_messages,
             encode_fn = encode_fn,
             thinking_mode = thinking_mode,
+            reasoning_effort = reasoning_effort,
         )
 
     def get_prompt(self,
@@ -1987,7 +1989,7 @@ class model:
                 if multimodal_videos:
                     raise ValueError("DeepSeek-V4.1 does not support video input.")
                 native_inputs = self._prepare_deepseek_v41_multimodal(
-                    conversation, multimodal_images, tools, enable_thinking)
+                    conversation, multimodal_images, tools, enable_thinking, thinking_effort)
                 return len(native_inputs["input_ids"])
             if architecture == "Gemma4ForConditionalGeneration":
                 if self.hf_tokenizer is None:
@@ -2511,7 +2513,7 @@ class model:
                     prompt_text = query if self.direct_query else self.get_prompt(query, history)
                     conversation = [{"role": "user", "content": prompt_text}]
                 native_inputs = self._prepare_deepseek_v41_multimodal(
-                    conversation, multimodal_images, tools, enable_thinking)
+                    conversation, multimodal_images, tools, enable_thinking, thinking_effort)
                 payload_config, payload = build_deepseek_v41_multimodal_payload(native_inputs)
                 payload_json = json.dumps(payload_config)
                 payload_buffer = ctypes.create_string_buffer(payload) if payload else None

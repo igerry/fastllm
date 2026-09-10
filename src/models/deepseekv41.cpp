@@ -496,6 +496,20 @@ namespace fastllm {
             "layers.*.ffn.shared_experts.w1.weight",
             "layers.*.ffn.shared_experts.w2.weight",
             "layers.*.ffn.shared_experts.w3.weight",
+            // DSpark 草稿层（mtp.*，见 src/models/deepseekv41_dspark.cpp）
+            "mtp.*.attn.wq_a.weight", "mtp.*.attn.wq_b.weight",
+            "mtp.*.attn.wkv.weight",
+            "mtp.*.attn.wo_a.weight", "mtp.*.attn.wo_b.weight",
+            "mtp.*.ffn.gate.weight",
+            "mtp.*.ffn.experts.*.w1.weight",
+            "mtp.*.ffn.experts.*.w2.weight",
+            "mtp.*.ffn.experts.*.w3.weight",
+            "mtp.*.ffn.shared_experts.w1.weight",
+            "mtp.*.ffn.shared_experts.w2.weight",
+            "mtp.*.ffn.shared_experts.w3.weight",
+            "mtp.*.main_proj.weight",
+            "mtp.*.markov_head.head.weight",
+            "mtp.*.confidence_head.proj.weight",
             "vision.patch_embed.proj.weight",
             "vision.blocks.*.attn.wqkv.weight", "vision.blocks.*.attn.wo.weight",
             "vision.blocks.*.mlp.w1.weight", "vision.blocks.*.mlp.w2.weight",
@@ -505,6 +519,7 @@ namespace fastllm {
 
     DeepSeekV41Model::~DeepSeekV41Model() {
         ShutdownRuntime();
+        DsparkReportStats();
         {
             std::lock_guard<std::mutex> guard(v41StateMutex);
             v41States.clear();
@@ -601,6 +616,7 @@ namespace fastllm {
 
         LoadEngramMeta();
         InitVisionParams();
+        InitDsparkParams();
 
         printf("[Fastllm] DeepSeek-V4.1: %d layers, %d experts (top-%d), kv sources = %d, index sources = %d, "
                "engram layers = %d%s, vision layers = %d\n",
@@ -713,9 +729,21 @@ namespace fastllm {
         std::map<std::string, std::vector<std::pair<std::string, DataType> > > result;
         std::vector<std::string> ordinary;
         for (const std::string &name : tensorNames) {
-            // DSpark 草稿层暂不加载
+            // DSpark 草稿层：只有开启投机解码时才加载（默认跳过，省下约 30 GB 权重）
             if (V41StartsWith(name, "mtp.")) {
-                continue;
+                if (!DsparkTensorNeeded(name)) {
+                    continue;
+                }
+                if (V41EndsWith(name, ".confidence_head.proj.weight")) {
+                    // 置信度是调度用的概率而不是激活，参考实现用 fp32 计算
+                    result[name].push_back({name, DataType::FLOAT32});
+                    continue;
+                }
+                if (V41EndsWith(name, ".markov_head.embed.weight")) {
+                    result[name].push_back({name, DataType::BFLOAT16});
+                    continue;
+                }
+                // 其余（attn_sink / gate.bias / gate.weight / 线性层）走下面的通用规则
             }
             // 视觉编码器：线性层权重走通用映射（float16），其余（norm / bias / 分隔符嵌入）保持 float32
             if (IsVisionTensor(name)) {
@@ -969,6 +997,8 @@ namespace fastllm {
             // pendingMultimodal 由 ResponseContext 持有，重建时保留；图像嵌入需要重新编码
             state.imagesEncoded = false;
             state.imageSpans.clear();
+            // DSpark：滑窗与待发队列都是相对旧缓存的，一并丢弃
+            state.dspark.reset();
         }
     }
 
@@ -1424,6 +1454,17 @@ namespace fastllm {
                         "DeepSeekV41Model: imageMask length mismatch.");
         // 重建缓存时 V41ResetState 保留 pendingMultimodal（图像会重新编码）
         auto state = GetOrCreateState(pastKeyValues, startPos == 0);
+
+        // ---- DSpark：已经校验通过的 token 直接出队，不需要前向 ----
+        if (v41DsparkEnabled && state->dspark && !state->dspark->pending.empty()) {
+            int queued = DsparkTakePending(*state, inputIds, seqlen);
+            if (queued >= 0) {
+                if (!pastKeyValues.empty()) {
+                    V41UpdateStubKV(pastKeyValues[0].first, pastKeyValues[0].second, state->totalLen);
+                }
+                return std::vector<int>{queued};
+            }
+        }
         AssertInFastLLM(state->totalLen == startPos,
                         "DeepSeekV41Model: position mismatch (cache has " + std::to_string(state->totalLen) +
                         " tokens, request starts at " + std::to_string(startPos) + ").");
@@ -1451,8 +1492,9 @@ namespace fastllm {
         for (auto &kvPair : pastKeyValues) {
             samplingPastKeyValues.push_back(std::make_pair(&kvPair.first, &kvPair.second));
         }
-        std::vector<int> ret = ForwardSegments(segments, inputIds, inputEmbeds, imageMask, generationConfigs,
-                                               lastTokens, retLogits, samplingPastKeyValues);
+        std::vector<int> ret = ForwardSegmentsWithDspark(segments, inputIds, inputEmbeds, imageMask,
+                                                         generationConfigs, lastTokens, retLogits,
+                                                         samplingPastKeyValues, true);
         if (!pastKeyValues.empty()) {
             V41UpdateStubKV(pastKeyValues[0].first, pastKeyValues[0].second, state->totalLen);
         }
@@ -1478,6 +1520,100 @@ namespace fastllm {
         }
         AssertInFastLLM(inputIds.Count(0) == (uint64_t)total,
                         "DeepSeekV41Model::ForwardBatch: inputIds length does not match seqLens.");
+
+        // ---- DSpark：已经校验通过的 token 直接出队，这些请求不参与本次前向 ----
+        // （批量前向里不做投机，但仍然要采集 main hidden，让草稿侧的滑窗跟上目标缓存）
+        std::vector<int> pendingRet(batch, -1);
+        std::vector<char> isPending(batch, 0);
+        int pendingCount = 0;
+        if (v41DsparkEnabled) {
+            Data cpuIds;
+            cpuIds.CopyFrom(inputIds);
+            cpuIds.ToDevice(DataDevice::CPU);
+            int scan = 0;
+            for (int i = 0; i < batch; i++) {
+                auto state = GetStateByFirstKey(pastKeyValues[(size_t)i * block_cnt].first);
+                if (state && state->dspark && !state->dspark->pending.empty()) {
+                    Data one;
+                    Split(cpuIds, cpuIds.dims.size() - 1, scan, scan + seqLens[i], one);
+                    int queued = DsparkTakePending(*state, one, seqLens[i]);
+                    if (queued >= 0) {
+                        pendingRet[i] = queued;
+                        isPending[i] = 1;
+                        pendingCount++;
+                    }
+                }
+                scan += seqLens[i];
+            }
+        }
+        if (pendingCount == batch) {
+            for (int i = 0; i < batch; i++) {
+                auto state = GetStateByFirstKey(pastKeyValues[(size_t)i * block_cnt].first);
+                if (state) {
+                    V41UpdateStubKV(*pastKeyValues[(size_t)i * block_cnt].first,
+                                    *pastKeyValues[(size_t)i * block_cnt].second, state->totalLen);
+                }
+            }
+            return pendingRet;
+        }
+        // 有请求出队时，把剩下的请求重新拼成一次前向
+        if (pendingCount > 0) {
+            Data cpuIds;
+            cpuIds.CopyFrom(inputIds);
+            cpuIds.ToDevice(DataDevice::CPU);
+            std::vector<Data*> activeMask, activePosition;
+            std::vector<int> activeSeqLens, activeIndex;
+            std::vector<std::pair<Data*, Data*> > activePast;
+            std::vector<GenerationConfig> activeConfigs;
+            std::vector<std::vector<float>*> activeLogits;
+            LastTokensManager activeTokens;
+            Data activeIds, part, catTmp;
+            int scan = 0;
+            bool first = true;
+            for (int i = 0; i < batch; i++) {
+                if (!isPending[i]) {
+                    Split(cpuIds, cpuIds.dims.size() - 1, scan, scan + seqLens[i], part);
+                    if (first) {
+                        activeIds.CopyFrom(part);
+                        first = false;
+                    } else {
+                        Cat(activeIds, part, activeIds.dims.size() - 1, catTmp);
+                        activeIds.CopyFrom(catTmp);
+                    }
+                    activePosition.push_back(positionIds[i]);
+                    activeSeqLens.push_back(seqLens[i]);
+                    activeConfigs.push_back(generationConfigs[i]);
+                    activeIndex.push_back(i);
+                    for (int l = 0; l < block_cnt; l++) {
+                        activePast.push_back(pastKeyValues[(size_t)i * block_cnt + l]);
+                    }
+                    if ((int)lastTokens.units.size() > i) {
+                        activeTokens.units.push_back(lastTokens.units[i]);
+                    }
+                    if (retLogits != nullptr && (int)retLogits->size() > i) {
+                        activeLogits.push_back((*retLogits)[i]);
+                    }
+                }
+                scan += seqLens[i];
+            }
+            std::vector<Data*> emptyMask;
+            auto sub = ForwardBatch((int)activeSeqLens.size(), activeIds, emptyMask, activePosition,
+                                    activeSeqLens, activePast, activeConfigs, activeTokens,
+                                    retLogits != nullptr ? &activeLogits : nullptr);
+            for (size_t k = 0; k < activeIndex.size(); k++) {
+                pendingRet[activeIndex[k]] = sub[k];
+            }
+            for (int i = 0; i < batch; i++) {
+                if (isPending[i]) {
+                    auto state = GetStateByFirstKey(pastKeyValues[(size_t)i * block_cnt].first);
+                    if (state) {
+                        V41UpdateStubKV(*pastKeyValues[(size_t)i * block_cnt].first,
+                                        *pastKeyValues[(size_t)i * block_cnt].second, state->totalLen);
+                    }
+                }
+            }
+            return pendingRet;
+        }
 
         std::vector<DeepSeekV41Segment> segments(batch);
         int offset = 0;
@@ -1546,13 +1682,14 @@ namespace fastllm {
                 std::vector<std::pair<Data*, Data*> > curPastKeyValues(
                         pastKeyValues.begin() + (size_t)i * block_cnt,
                         pastKeyValues.begin() + (size_t)(i + 1) * block_cnt);
-                auto cur = ForwardSegments(one, curIds, nullptr, nullptr, curConfigs, curTokens,
-                                           retLogits != nullptr ? &curLogits : nullptr, curPastKeyValues);
+                auto cur = ForwardSegmentsWithDspark(one, curIds, nullptr, nullptr, curConfigs, curTokens,
+                                                     retLogits != nullptr ? &curLogits : nullptr,
+                                                     curPastKeyValues, true);
                 ret.push_back(cur[0]);
             }
         } else {
-            ret = ForwardSegments(segments, inputIds, nullptr, nullptr, generationConfigs, lastTokens,
-                                  retLogits, pastKeyValues);
+            ret = ForwardSegmentsWithDspark(segments, inputIds, nullptr, nullptr, generationConfigs, lastTokens,
+                                            retLogits, pastKeyValues, batch == 1);
         }
         for (int i = 0; i < batch; i++) {
             V41UpdateStubKV(*pastKeyValues[(size_t)i * block_cnt].first, *pastKeyValues[(size_t)i * block_cnt].second,
@@ -1727,6 +1864,33 @@ namespace fastllm {
                 }
             }
 
+            // ---- DSpark：目标层的 main hidden（attention 的输入，对 hc 份取均值）----
+            if (v41DsparkEnabled && (int)v41IsDsparkTarget.size() == block_cnt && v41IsDsparkTarget[layer]) {
+                int slot = 0;
+                for (size_t k = 0; k < v41DsparkTargetLayerIds.size(); k++) {
+                    if (v41DsparkTargetLayerIds[k] == layer) {
+                        slot = (int)k;
+                        break;
+                    }
+                }
+                for (int s = 0; s < numSegments; s++) {
+                    DeepSeekV41SpecScratch *spec = segments[s].spec;
+                    if (spec == nullptr || !spec->captureMain) {
+                        continue;
+                    }
+                    if (spec->mainHidden.size() != v41DsparkTargetLayerIds.size()) {
+                        spec->mainHidden.resize(v41DsparkTargetLayerIds.size());
+                    }
+                    Data segHidden;
+                    Data *src = sliceOf(*curHidden, s, segHidden);
+                    Data uniform;
+                    std::vector<float> uniformValues((uint64_t)segments[s].seqlen * hc_mult,
+                                                     1.0f / (float)hc_mult);
+                    uniform.CopyFrom(Data(DataType::FLOAT32, {1, segments[s].seqlen, hc_mult}, uniformValues));
+                    V41HcApplyPre(*src, uniform, spec->mainHidden[slot]);
+                }
+            }
+
             // ---- attention（整批部分）----
             V41HcMix(*curHidden, weight[pre + ".hc_attn_fn"], weight[pre + ".hc_attn_scale"],
                      weight[pre + ".hc_attn_base"], hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
@@ -1794,12 +1958,23 @@ namespace fastllm {
                         Data *rawKV = sliceOf(rawKVAll, s, rawKVSeg);
                         Data *rawScore = ratio > 1 ? sliceOf(rawScoreAll, s, rawScoreSeg) : nullptr;
                         Data *kvAll = rawKV, *scoreAll = rawScore;
+                        const int specPrevTail = cache.rawTail;
+                        const int specPrevBlocks = cache.compressedBlocks;
                         if (cache.rawTail > 0) {
                             Cat(cache.rawTailKV, *rawKV, 1, allKV);
                             kvAll = &allKV;
                             if (ratio > 1) {
                                 Cat(cache.rawTailScore, *rawScore, 1, allScore);
                                 scoreAll = &allScore;
+                            }
+                        }
+                        // DSpark 校验：保存压缩器的原始输入流与回滚点，接受长度确定后重建
+                        if (seg.spec != nullptr && seg.spec->deferWindow) {
+                            seg.spec->prevRawTail[layer] = specPrevTail;
+                            seg.spec->prevBlocks[layer] = specPrevBlocks;
+                            seg.spec->rawKV[layer].CopyFrom(*kvAll);
+                            if (ratio > 1) {
+                                seg.spec->rawScore[layer].CopyFrom(*scoreAll);
                             }
                         }
                         const int n = kvAll->dims[1];
@@ -1902,12 +2077,19 @@ namespace fastllm {
                         V41DumpTensor(cache.windowKV, tag + "_ring" + dumpSuffix);
                     }
                 }
+                Data kvSeg8;
+                const Data *windowRows = kvSeg;
                 if (fp8KV) {
-                    Data kvSeg8;
                     V41QuantizeKV(*kvSeg, kvSeg8);
-                    V41WindowStore(kvSeg8, cache.windowKV, startPos, window_size);
+                    windowRows = &kvSeg8;
+                }
+                if (seg.spec != nullptr && seg.spec->deferWindow) {
+                    // DSpark 校验：环形缓冲的写入推迟到接受长度确定之后。片段内的位置
+                    // 一律从 chunkKV 读取，因此推迟写入不改变本次前向的任何结果，
+                    // 也就不需要为回滚保存被覆盖的旧行。
+                    seg.spec->windowKV[layer].CopyFrom(*windowRows);
                 } else {
-                    V41WindowStore(*kvSeg, cache.windowKV, startPos, window_size);
+                    V41WindowStore(*windowRows, cache.windowKV, startPos, window_size);
                 }
                 V41RotaryQuant(*attnOutSeg, rope, startPos, 1, true, 0, 32);
                 cache.totalLen += segLen;
@@ -2052,6 +2234,29 @@ namespace fastllm {
             if (dumpDebug) {
                 V41DumpTensor(*curHidden, "fl_layer" + std::to_string(layer) + dumpSuffix);
             }
+        }
+
+        // ---- DSpark 校验片段：对本片段的每个位置都出贪心 token ----
+        // 只在单片段（单请求）时启用，见 ForwardSingle。要求请求是简单贪心，因此
+        // 这里的 RMSNorm + head + TopK 与 LLMSamplingBlock 的 allSimple 分支等价。
+        if (numSegments == 1 && segments[0].spec != nullptr && segments[0].spec->wantAllGreedy) {
+            Data allHidden, normed, allLogits, topk;
+            V41HcApplyPre(*curHidden, preMix, allHidden);
+            RMSNorm(allHidden, weight["norm.weight"], rms_norm_eps, normed);
+            Linear(normed, weight["head.weight"], *GetEmptyData(), allLogits);
+            ToDataType(allLogits, DataType::FLOAT32);
+            TopK(allLogits, topk, 1);
+            topk.ToDevice(DataDevice::CPU);
+            const int stride = topk.dims[topk.dims.size() - 1];
+            const float *topkData = (const float*)topk.cpuData;
+            segments[0].spec->greedy.resize(seqlen);
+            for (int i = 0; i < seqlen; i++) {
+                segments[0].spec->greedy[i] = (int)(topkData[(uint64_t)i * stride] + 1e-3);
+            }
+            for (auto &seg : segments) {
+                seg.state->totalLen += seg.seqlen;
+            }
+            return std::vector<int>{segments[0].spec->greedy[seqlen - 1]};
         }
 
         // ---- head（每个片段只取最后一个 token）----

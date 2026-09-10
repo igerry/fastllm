@@ -9,11 +9,13 @@
 - `src/models/deepseekv41_vision.cpp`：视觉编码器（ViT + aligner）与图文前向 `ForwardMultimodal`
 - `src/devices/cpu/deepseekv41ops.cpp`：V4.1 专用算子的 CPU 参考实现
 - `src/devices/cuda/models/deepseekv41-kernels.cu`：对应的 CUDA kernel（面向 SM86 等无 FP8 tensor core 的设备，FP32 计算）
+- `src/models/deepseekv41_dspark.cpp`：DSpark 投机解码（草稿层 `mtp.*`、校验与回滚）
 - `tools/fastllm_pytools/deepseek_v41_engram.py`：Engram 哈希元数据生成
 - `tools/fastllm_pytools/encoding_dsv41.py`：官方 V4.1 prompt 编码（vendored）
 - `tools/fastllm_pytools/deepseek_v41_multimodal.py`：图像动态分辨率预处理（移植自官方 `image_processor.py`）与图像占位符展开
 - `test/basic/deepseek_v41_reference.py`：与官方 `inference/model.py` 的端到端数值对齐测试
 - `test/basic/deepseek_v41_vision_reference.py`：图文输入的端到端对齐测试（含真实 ViT 权重验证）
+- `test/basic/deepseek_v41_dspark.py`：DSpark 的精确性（开 / 关输出一致）与回滚测试
 
 ## 相对 DeepSeek-V4 的架构变化
 
@@ -27,7 +29,7 @@
 | 路由 | 前若干层 hash 路由 | 全部 noaux_tc，`gate.bias`；图像 token 使用 `gate.bias_vl` |
 | q 处理 | 额外 RMS 归一 | 无 |
 | 权重格式 | FP8 128x128 块 scale | 稠密与共享专家 FP8 32x32 块 UE8M0 scale；路由专家 FP4（沿 K 每 32 个一组 UE8M0 scale） |
-| 附加模块 | MTP / DSpark | DSpark 草稿层（mtp.*）、视觉编码器（vision.* / aligner.* / image_start / image_end / image_newline） |
+| 附加模块 | MTP / DSpark | DSpark 草稿层（mtp.*，markov head 为 embed + head、草稿层 128 专家 top-3、目标层取自主干）、视觉编码器（vision.* / aligner.* / image_start / image_end / image_newline） |
 
 ## 当前支持范围
 
@@ -40,12 +42,13 @@
 - 跨层共享压缩 KV（ratio 1 / 2）、两级 indexer top-k、Engram、Hyper-Connections、sqrt-softplus 路由；
 - 与官方实现一致的 FP8 / FP4 伪量化（窗口 KV、压缩 KV、indexer q/k）；
 - 真实 checkpoint 的权重格式（FP8 32x32、FP4 路由专家、FP8 + UE8M0 的 Engram 表）；
-- 图像输入（OpenAI 接口的 `image_url`）：ViT + aligner、图像 token 的 `gate.bias_vl` 路由与 Engram 掩码，详见下文。
+- 图像输入（OpenAI 接口的 `image_url`）：ViT + aligner、图像 token 的 `gate.bias_vl` 路由与 Engram 掩码，详见下文；
+- DSpark 投机解码（`mtp.*` 草稿层），详见下文"DSpark 投机解码"。
 
 尚未实现：
 
-- DSpark 投机解码（`mtp.*` 权重不加载）；
-- CUDA Graph、张量并行等 V4 已有的性能特性。
+- CUDA Graph、张量并行等 V4 已有的性能特性；
+- DSpark 与批量 decode 的组合（批内不产生候选，只保持草稿缓存同步）、DSpark 与采样 / 图文请求的组合。
 
 ## Engram 元数据
 
@@ -139,6 +142,97 @@ decode 吞吐从 209 tok/s（1 并发）提高到 573 tok/s（8 并发）。
 迷你模型上精确命中与 T-1 截断命中后的贪心输出与不中断的原请求逐 bit 一致；800 token 提示词的
 首 token 延迟从 39–54 ms 降到 6 ms。
 
+## DSpark 投机解码
+
+`config.json` 的 `text_config` 里 `dspark_block_size > 0` 且 checkpoint 带 `mtp.*` 权重时可以开启。
+启动加 `--speculative_algorithm dspark --dspark 5`（5 = `dspark_block_size`，也可以更小，
+每轮少校验几个候选）：
+
+```bash
+ftllm server /path/to/DeepSeek-V4.1-Flash \
+  --device cuda --moe_device numa --dtype float16 \
+  --speculative_algorithm dspark --dspark 5
+```
+
+`ftllm` 的自动配置（launcher）在 `enable_speculative_decoding` 时会识别 V4.1 的内置 DSpark，
+按 checkpoint 的训练 block size 填 `--draft_tokens`。不加 `--dspark` / `--draft_tokens` 时
+不加载 `mtp.*`（省下约 30 GB 权重）。
+
+### 结构
+
+`mtp.0/1/2` 是三个与主干同构的草稿层：`compress_ratios` 在这三层是 0（纯滑窗注意力），
+MoE 是 `dspark_n_routed_experts` = 128 专家 top-3，embedding 与 lm_head 与主干共享。
+另外 `mtp.0` 有 `main_proj` / `main_norm`，`mtp.2` 有 `norm`、`markov_head`（`embed` + `head`，
+秩 256）与 `confidence_head`（输入 `dim + 256`）。
+
+草稿层的滑窗 KV 不来自草稿 token 自身，而来自目标模型：`dspark_target_layer_ids`（[37, 38, 39]）
+各层 attention 的输入（对 4 份 Hyper-Connections 取均值）拼成 `3 * dim` 后经 `main_proj` / `main_norm`
+得到 `main_x`，每个草稿层再用自己的 `wkv` / `kv_norm` 把它写进一行滑窗 KV。也就是说每个已提交
+位置在草稿侧只有一行 KV，草稿模型不需要重跑主干。
+
+一次 proposal：把 `block_size` 个位置的输入 token 置为 `dspark_noise_token_id`（第 0 个位置放锚点
+token，即目标模型刚产出、还没进 KV 缓存的那个 token），一次前向产出 `block_size` 组 logits；
+再用 markov head 逐位置做 bigram 修正后贪心采样，得到 `block_size` 个候选 token；
+`confidence_head` 对每个位置给出一个 sigmoid 后的置信度。
+
+### 校验与回滚
+
+候选与锚点拼成一个 `1 + N` 长度的片段一次喂给目标模型（`ForwardSegments` 天然支持一次多 token），
+逐位置贪心比对，第一个不匹配处截断。接受 n 个候选时这一轮提交 n + 1 个 token、产出 n + 1 个输出
+token：第一个立刻返回，其余进入请求的待发队列，调度器之后每轮直接出队，不再前向。
+
+校验前向按完整 block 更新缓存，接受长度确定后要把多算的部分退回：
+
+- 滑窗环形缓冲：写入**延后**到接受长度确定之后。片段内的位置在稀疏注意力里一律从 `chunkKV` 读取，
+  推迟写入不改变本次前向的任何结果，因此也不需要为回滚保存被覆盖的旧行；
+- 压缩 KV 与 indexer key：按接受后的长度重新截断行数，并用保存下来的 compressor 原始输入流
+  （旧 `rawTail` + 本次新行）重建 `rawTail`；
+- Engram 历史与各层 `totalLen`：截断到接受后的长度。
+
+投机解码是精确的：接受的 token 就是目标模型在同一次前向里算出的贪心 token，因此开启 DSpark 与
+关闭时的贪心输出一致。唯一的差异来源与批量 decode 相同——一次多 token 的前向与逐 token 前向会
+选到不同的 GEMM kernel，BF16 舍入可能让几乎并列的 argmax 翻转（这一点不开 DSpark 时，
+一次大 prefill 与逐 token 解码之间同样存在）。
+
+### 限制
+
+- 只对**简单贪心**请求生效：`do_sample` / `top_k > 1` / 重复惩罚 / 工具约束 / `output_logits` /
+  `output_token_least` 中任何一项打开，该请求就退回普通解码（草稿侧仍然保持滑窗同步）；
+- 只在**单请求**前向里产生候选。批量 decode 的那一轮不投机，但仍然采集 main hidden，
+  让草稿滑窗跟上目标缓存；已经校验通过的 token 在批量路径里也能正常出队；
+- 图文请求不投机；
+- 前缀缓存命中恢复出来的前缀没有草稿侧的滑窗（`main_x` 无法从目标缓存反推），
+  草稿注意力只看得到恢复之后新增的位置，接受率会在最初的 `window_size` 个 token 内偏低；
+- 请求在待发队列还没取完时结束（EOS / 长度上限），这一轮多算的 token 会让缓存长度超过
+  `allTokens`，该请求的前缀缓存记录会被跳过；
+- 尚未接入 CUDA Graph 与张量并行。
+
+### 实测
+
+单卡 3090 Ti、迷你模型（6 层 + 3 个草稿层、2 专家、随机权重）：
+
+| 场景 | 结果 |
+| --- | --- |
+| 开 / 关 DSpark 的贪心输出 | 一致（30 个 token 中 3 处 BF16 并列翻转，重新锚定后完全一致） |
+| 注入候选构造接受 0 / 1 / 2 / 3 / 5 个 | 接受长度与构造完全一致，回滚后的续写与基准一致 |
+| 随机权重下的接受率 | 0%（草稿模型是随机初始化的，只验证正确性，不代表真实接受率） |
+| 吞吐 | 190 → 100 tok/s（草稿层占迷你模型的一半，且接受率为 0，属最坏情况） |
+
+真实 checkpoint 的 `mtp.*`（3 个 stage × 128 专家，共 2401 个张量）已核对：加载器需要的 1221 个
+张量全部存在，量化格式与主干一致（稠密 FP8 32x32 + UE8M0 scale、路由专家 FP4 沿 K 每 32 个一组），
+`markov_head.embed/head` 为 BF16 `[129280, 256]`、`confidence_head.proj` 为 BF16 `[1, 5376]`。
+真实权重下的接受率与吞吐尚未测（需要双卡 + 全量权重）。
+
+### 调试环境变量
+
+| 变量 | 作用 |
+| --- | --- |
+| `FASTLLM_DSPARK_TOKENS` | 每轮校验的候选数（由 `--dspark` / `--draft_tokens` 设置，不要直接设） |
+| `FASTLLM_DSPARK_CONFIDENCE_THRESHOLD` | 置信度低于该值的候选之后不再校验；0 表示总是用满 block |
+| `FASTLLM_DSPARK_STATS_FILE` | 每轮校验追加一行 `轮次 候选数 接受数`（测试用） |
+| `FASTLLM_DSPARK_FORCE_DRAFTS` | 用文件里的候选替换模型的候选，构造指定的接受长度（测试用） |
+| `FASTLLM_DSV41_DEBUG_STATE` | 每次前向后导出各层缓存长度（对比回滚是否正确） |
+
 ## 图像输入
 
 `config.json` 顶层的 `vision_n_layers > 0` 时加载视觉编码器：32 层 ViT（1024 维、16 头、patch 14、2D RoPE、SwiGLU MLP）
@@ -204,6 +298,21 @@ PYTHONPATH=build/tools python test/basic/deepseek_v41_vision_reference.py \
   排除官方 bf16 路径的舍入噪声，此时 ViT / aligner 输出 cos = 1.000000）；
 - `--experts 8 --bias-vl-boost 5` 给 `gate.bias_vl` 的最后两个专家加偏置，检查图像 token 的路由确实使用 `bias_vl`
   （随机权重下 8 专家的贪心 token 会因路由并列翻转而不同，属已知敏感性，正确性以 2 专家配置为准）；
+DSpark 用 `test/basic/deepseek_v41_dspark.py`（迷你文本模型 + 3 个随机初始化的草稿层）：
+
+```bash
+PYTHONPATH=build/tools python test/basic/deepseek_v41_dspark.py \
+  --work-dir /tmp/v41-tiny-dspark --tokenizer-dir /path/with/tokenizer.json \
+  --reference-dir /path/to/DeepSeek-V4.1-Flash/inference --regenerate
+```
+
+- 先跑一遍不开 DSpark 的基准（带 logits），再跑一遍开 DSpark 的，逐 token 比较并统计接受率；
+- 用 `FASTLLM_DSPARK_FORCE_DRAFTS` 注入候选构造"接受 0 个 / 接受一部分 / 全部接受 / 混合"四种场景，
+  校验每轮的实际接受长度与构造的一致、回滚后的续写与基准一致；
+- 迷你模型的 logits 是 BF16（分辨率约 1/32），几乎并列的 argmax 会因 GEMM 选核不同而翻转，
+  脚本把"差距在 3 个 BF16 ulp 以内"的分歧判为并列，以 DSpark 的输出为新前缀重新跑基准继续比较；
+- 默认用 `--dtype float32` 与 2 专家 top-2、`index_topk` 大于压缩块数，减少随机权重下的并列。
+
 - `--real-vision /path/to/DeepSeek-V4.1-Flash --image-size 640x480,1600x1200` 用真实 ViT 权重
   （aligner 维度依赖文本侧 dim，仍为随机）验证 32 层 ViT，包括接近 1024 token 上限的大图；
 - `--chunked-prefill 16` 验证带图 prompt 的分块 prefill。
@@ -218,3 +327,4 @@ PYTHONPATH=build/tools python test/basic/deepseek_v41_vision_reference.py \
 | `FASTLLM_DSV41_DISABLE_CUDA_ROUTE` | 路由退回 CPU 参考实现 |
 | `FASTLLM_DSV41_DUMP_DIR` | 把每层中间张量写到该目录（对齐调试） |
 | `FASTLLM_DSV41_DISABLE_PREFIX_CACHE` 等 | 前缀缓存相关，见"多请求与前缀缓存" |
+| `FASTLLM_DSPARK_*` | DSpark 投机解码相关，见"DSpark 投机解码" |

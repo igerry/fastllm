@@ -1200,6 +1200,17 @@ def make_normal_llm_model(args, startup_progress = None):
                                  "DeepSeekV4ForCausalLM") or
                 model_type == "deepseek_v4"
             )
+            # DeepSeek-V4.1 的内置 DSpark 草稿层同样存放在 mtp.*，但配置在 text_config 里，
+            # 且运行时的 block 可以小于 checkpoint 的训练 block（每轮少校验几个候选）
+            is_deepseek_v41_model = (
+                architecture in ("DeepseekV41ForCausalLM",
+                                 "DeepSeekV41ForCausalLM") or
+                model_type == "deepseek_v41" or
+                text_model_type == "deepseek_v41_text"
+            )
+            dspark_config = config
+            if is_deepseek_v41_model and isinstance(config.get("text_config"), dict):
+                dspark_config = config["text_config"]
             if speculative_algorithm == "dspark":
                 if speculative_draft_path:
                     if (architecture != "KimiK3ForConditionalGeneration" and
@@ -1209,22 +1220,28 @@ def make_normal_llm_model(args, startup_progress = None):
                             "Kimi-K3, got architecture=%s model_type=%s" %
                             (architecture, model_type))
                 else:
-                    if not is_deepseek_v4_model:
+                    if not (is_deepseek_v4_model or is_deepseek_v41_model):
                         raise ValueError(
-                            "Embedded DSpark requires a DeepSeek-V4 checkpoint with "
+                            "Embedded DSpark requires a DeepSeek-V4 / V4.1 checkpoint with "
                             "embedded mtp.* DSpark weights, got architecture=%s "
                             "model_type=%s" % (architecture, model_type))
-                    checkpoint_block = int(config.get(
+                    checkpoint_block = int(dspark_config.get(
                         "dspark_block_size", 0) or 0)
-                    target_layers = config.get("dspark_target_layer_ids", [])
-                    noise_token = int(config.get(
+                    target_layers = dspark_config.get("dspark_target_layer_ids", [])
+                    noise_token = int(dspark_config.get(
                         "dspark_noise_token_id", -1) or -1)
                     if (checkpoint_block <= 0 or not target_layers or
                             noise_token < 0):
                         raise ValueError(
                             "DeepSeek-V4 checkpoint is missing embedded DSpark "
                             "configuration")
-                    if dspark_tokens < checkpoint_block:
+                    if is_deepseek_v41_model:
+                        if not 1 <= dspark_tokens <= checkpoint_block:
+                            raise ValueError(
+                                "DeepSeek-V4.1 DSpark draft tokens must be in "
+                                "[1, checkpoint block size] (requested=%d, checkpoint=%d)" %
+                                (dspark_tokens, checkpoint_block))
+                    elif dspark_tokens < checkpoint_block:
                         raise ValueError(
                             "DSpark draft tokens must be at least the checkpoint training "
                             "block size (requested=%d, checkpoint=%d)" %

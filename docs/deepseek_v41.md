@@ -206,16 +206,33 @@ PYTHONPATH=build/tools python test/basic/deepseek_v41_vision_reference.py \
 - **indexer 分数矩阵的显存**：`[token, m]` 随上下文线性增长（1M 上下文的 ratio-1 层，
   4096 token 的分块要 16 GB）。现在按 token 维分块调用「打分 -> 候选块 -> top-k」，
   峰值由 `FASTLLM_DSV41_INDEX_SCORE_MB`（默认 128 MB）控制，与上下文长度解耦。
+- **Hyper-Connections 混合系数**（`V41HcMixKernelMulti`）：`hcMult` 作为模板参数，
+  累加器进寄存器；一个 block 处理 4 个相邻 token，复用同一份混合系数矩阵
+  （真实模型是 24 x 20480 的 FP32，约 2 MB，原来每个 token 都要重读一遍）。
+  结果与旧 kernel 逐 bit 相同。
 
 3090 Ti（SM86）上用 `test/basic/deepseek_v41_reference.py --perf-config`
 （4 层、64 头、head_dim 512、窗口 128、index_topk 512、32 个 indexer head）实测：
 
-| 4096 token prefill | 优化前 | 优化后 |
+| 4096 token prefill + decode | 优化前 | 优化后 |
 | --- | --- | --- |
-| 稀疏注意力（4 层合计 / 每层） | 574 ms / 165 ms | 34 ms / 10.6 ms |
-| indexer 打分（3 层合计） | 797 ms | 约 20 ms |
-| 端到端 prefill | 1.57 s | 0.45 s |
-| decode | 96 tok/s | 236 tok/s |
+| 稀疏注意力（4 层合计 / 每层 prefill） | 574 ms / 165 ms | 34 ms / 10.6 ms |
+| indexer 打分（3 层合计） | 797 ms | 5.7 ms |
+| HcMix（合计 / 每次 prefill 调用） | 23.3 ms / 1.92 ms | 6.9 ms / 254 us |
+| 端到端 prefill | 1.57 s | 0.38 s |
+| 单 token decode 的注意力 kernel | 88 us | 12 us（+ 6 us 合并） |
+
+长上下文（同一配置，`--chunked-prefill 4096`）：
+
+| prefill 长度 | 旧 kernel | 新 kernel | decode（旧 / 新） |
+| --- | --- | --- | --- |
+| 8192 | 3.77 s | 0.39 s | 86 / 172 tok/s |
+| 32768 | 33.60 s | 1.08 s | 58 / 99 tok/s |
+| 65536 | — | 2.87 s | — |
+
+indexer 分数矩阵的分块效果（65536 token prefill，扣掉同卡其它进程的 848 MiB 底噪）：
+按 token 分块后峰值显存 1832 MiB，不分块（`FASTLLM_DSV41_INDEX_SCORE_MB` 设得很大）是 3770 MiB，
+两者输出逐 token 相同，prefill 耗时 2.87 s vs 2.69 s（分块多约 7%）。
 
 ## 调试环境变量
 
@@ -223,6 +240,7 @@ PYTHONPATH=build/tools python test/basic/deepseek_v41_vision_reference.py \
 | --- | --- |
 | `FASTLLM_DSV41_LEGACY_ATTN` | 稀疏注意力退回 FP32 标量 kernel（对比 / 排查用） |
 | `FASTLLM_DSV41_LEGACY_INDEXER` | indexer 打分退回 FP32 标量 kernel |
+| `FASTLLM_DSV41_LEGACY_HCMIX` | HC 混合系数退回旧 kernel |
 | `FASTLLM_DSV41_ATTN_SPLITS` | 手动指定稀疏注意力候选维的 split-K 份数（默认自动） |
 | `FASTLLM_DSV41_INDEX_SCORE_MB` | indexer 分数矩阵的显存预算（MB，默认 128），决定 token 维分块大小 |
 | `FASTLLM_DSV41_INDEX_CHUNK` | 直接指定 indexer 的 token 分块大小（覆盖上面的预算推算） |

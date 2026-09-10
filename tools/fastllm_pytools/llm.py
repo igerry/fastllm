@@ -1,5 +1,6 @@
 import ctypes
 import concurrent.futures
+import functools
 import math
 import os
 import glob
@@ -1110,6 +1111,37 @@ def apply_hf_chat_template(tokenizer, conversation, add_generation_prompt = True
         ret = ret.tolist()
     return ret
 
+# transformers 会对这些模型真的去修补 pre_tokenizer 的正则，别去动它们。
+_MISTRAL_TOKENIZER_MODEL_TYPES = {
+    "mistral", "mistral3", "voxtral", "ministral", "pixtral",
+}
+
+
+def _hf_tokenizer_compat_kwargs(path):
+    """transformers>=5 对缺少 transformers_version 的本地目录会报 fix_mistral_regex 告警。
+
+    这个告警只是提示（不传该参数时 transformers 并不会改动 tokenizer），但对
+    DeepSeek 这类非 Mistral 模型是纯噪音——本地转换/裁剪出来的目录几乎都没有
+    transformers_version 字段。显式传 fix_mistral_regex=False 表示“确认不需要
+    这个修补”，从源头消掉告警，同时把行为固定下来，不再依赖调用处的全局
+    logging.disable。
+    """
+    try:
+        import transformers
+        if int(str(transformers.__version__).split(".")[0]) < 5:
+            return {}
+        config_path = os.path.join(path, "config.json")
+        if not os.path.isfile(config_path):
+            return {}
+        with open(config_path, encoding = "utf-8") as config_file:
+            model_type = str(json.load(config_file).get("model_type", ""))
+        if model_type in _MISTRAL_TOKENIZER_MODEL_TYPES:
+            return {}
+        return {"fix_mistral_regex": False}
+    except Exception:
+        return {}
+
+
 def try_load_hf_tokenizer(path):
     if _is_step3p5_model_dir(path):
         ret = _load_fast_tokenizer_from_tokenizer_json(path)
@@ -1127,7 +1159,9 @@ def try_load_hf_tokenizer(path):
             # 2. 完全禁止所有 logging 输出
             logging.disable(logging.CRITICAL)  # 禁用所有日志（包括 ERROR, WARNING, INFO, DEBUG）
             from transformers import AutoTokenizer
-            ret = AutoTokenizer.from_pretrained(path, trust_remote_code = True)
+            ret = AutoTokenizer.from_pretrained(
+                path, trust_remote_code = True,
+                **_hf_tokenizer_compat_kwargs(path))
         finally:
             logging.disable(original_level)  # 恢复原来的日志级别
             if original_use_torch is None:
@@ -1615,12 +1649,19 @@ class model:
         except Exception:
             return False
 
-    def _deepseek_encode_messages(self):
-        """返回与当前模型版本匹配的官方 encode_messages（V4.1 的 DSML 标签与 V4 不同）。"""
+    def _deepseek_encode_messages(self, reasoning_effort = None):
+        """返回与当前模型版本匹配的官方 encode_messages（V4.1 的 DSML 标签与 V4 不同）。
+
+        V4.1 额外支持数值 reasoning effort（1-100 或 low/high/max），由服务端
+        透传进来；V4 的 encode_messages 没有这个参数，忽略即可。
+        """
         if self._is_deepseek_v41():
             from ftllm.encoding_dsv41 import encode_messages
-        else:
-            encode_messages = self._deepseek_encode_messages()
+            if reasoning_effort is not None:
+                return functools.partial(
+                    encode_messages, reasoning_effort = reasoning_effort)
+            return encode_messages
+        from ftllm.encoding_dsv4 import encode_messages
         return encode_messages
 
     def _uses_hf_deepseek_v4_tokenizer(self) -> bool:
@@ -2011,7 +2052,7 @@ class model:
         except:
             architecture = ""
         if self._uses_hf_deepseek_v4_tokenizer():
-            encode_messages = self._deepseek_encode_messages()
+            encode_messages = self._deepseek_encode_messages(thinking_effort)
             thinking_mode = "thinking" if enable_thinking else "chat"
             rendered_conversation = self._inject_deepseek_v4_tools(
                 copy.deepcopy(conversation), tools)
@@ -2636,7 +2677,8 @@ class model:
                     input = pending_text_input_token_cache["input_ids"]
                 elif (conversation != None and len(conversation) != 0):
                     if self._uses_hf_deepseek_v4_tokenizer():
-                        encode_messages = self._deepseek_encode_messages()
+                        encode_messages = self._deepseek_encode_messages(
+                            thinking_effort)
                         thinking_mode = (
                             "thinking" if enable_thinking else "chat")
                         rendered_conversation = self._inject_deepseek_v4_tools(
@@ -2694,7 +2736,8 @@ class model:
                     prompt = self._render_qwen35_text_prompt(
                         conversation, add_generation_prompt, enable_thinking)
                 elif self._is_deepseek_v4() and not self.force_chat_template:
-                    encode_messages = self._deepseek_encode_messages()
+                    encode_messages = self._deepseek_encode_messages(
+                        thinking_effort)
                     thinking_mode = "thinking" if enable_thinking else "chat"
                     conversation = self._inject_deepseek_v4_tools(conversation, tools)
                     prompt = encode_messages(conversation, thinking_mode=thinking_mode)

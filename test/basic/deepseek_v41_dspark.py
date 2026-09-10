@@ -72,6 +72,8 @@ def parse_args():
     parser.add_argument("--dspark-tokens", type=int, default=5)
     parser.add_argument("--regenerate", action="store_true")
     parser.add_argument("--skip-rollback", action="store_true")
+    parser.add_argument("--real-checkpoint", default="",
+                        help="真实 checkpoint 目录：只静态核对 mtp.* 的张量命名 / 形状 / 量化格式，不加载模型")
     parser.add_argument("--child", default="", help="内部使用：子进程模式")
     return parser.parse_args()
 
@@ -353,6 +355,88 @@ def compare_with_reanchor(args, prompt, spec_tokens, decode_steps, max_anchors=5
     return failures, ties
 
 
+def check_real_checkpoint(path):
+    """静态核对真实 checkpoint 的 mtp.* 权重：加载器需要的张量是否齐全、量化格式是否与主干一致。
+
+    不加载模型（真实权重需要双卡 + 数百 GB 内存），只读 safetensors 的索引与头部。
+    """
+    index_path = os.path.join(path, "model.safetensors.index.json")
+    weight_map = json.load(open(index_path))["weight_map"]
+    cfg = json.load(open(os.path.join(path, "config.json")))
+    text = cfg.get("text_config", cfg)
+    stages = int(text["num_nextn_predict_layers"])
+    experts = int(text["dspark_n_routed_experts"])
+    need = []
+    for stage in range(stages):
+        pre = "mtp.%d." % stage
+        need += [pre + n for n in (
+            "attn.wq_a.weight", "attn.q_norm.weight", "attn.wq_b.weight", "attn.wkv.weight",
+            "attn.kv_norm.weight", "attn.wo_a.weight", "attn.wo_b.weight", "attn.attn_sink",
+            "attn_norm.weight", "ffn_norm.weight", "hc_attn_fn", "hc_attn_scale", "hc_attn_base",
+            "hc_ffn_fn", "hc_ffn_scale", "hc_ffn_base", "ffn.gate.weight", "ffn.gate.bias",
+            "ffn.shared_experts.w1.weight", "ffn.shared_experts.w2.weight", "ffn.shared_experts.w3.weight")]
+        need += [pre + "ffn.experts.%d.%s.weight" % (e, w)
+                 for e in range(experts) for w in ("w1", "w2", "w3")]
+    need += ["mtp.0.main_proj.weight", "mtp.0.main_norm.weight"]
+    last = "mtp.%d." % (stages - 1)
+    need += [last + n for n in ("norm.weight", "markov_head.embed.weight",
+                                "markov_head.head.weight", "confidence_head.proj.weight")]
+    missing = [n for n in need if n not in weight_map]
+    print("stages=%d experts=%d 需要 %d 个张量，缺失 %d 个" % (stages, experts, len(need), len(missing)))
+    if missing:
+        print("  缺失示例:", missing[:5])
+        return ["真实 checkpoint 缺少 %d 个 DSpark 张量" % len(missing)]
+
+    import struct
+
+    def header(filename):
+        with open(os.path.join(path, filename), "rb") as stream:
+            size, = struct.unpack("<Q", stream.read(8))
+            return json.loads(stream.read(size))
+
+    failures = []
+    expect = {
+        "mtp.0.main_proj.weight": ("F8_E4M3", "F8_E8M0", 32),          # 稠密 FP8 32x32
+        "mtp.0.attn.wkv.weight": ("F8_E4M3", "F8_E8M0", 32),
+        "mtp.0.ffn.experts.0.w1.weight": ("I8", "F8_E8M0", None),      # 路由专家 FP4，沿 K 每 32 个一组
+    }
+    for name, (dtype, scale_dtype, block) in expect.items():
+        head = header(weight_map[name])
+        info = head[name]
+        scale = head.get(name.replace(".weight", ".scale"))
+        print("  %-34s %-8s %-16s scale=%s" % (name, info["dtype"], info["shape"],
+                                               (scale["dtype"], scale["shape"]) if scale else None))
+        if info["dtype"] != dtype or scale is None or scale["dtype"] != scale_dtype:
+            failures.append("%s 的量化格式与预期不符" % name)
+            continue
+        rows, cols = info["shape"]
+        if block is not None and scale["shape"] != [rows // block, cols // block]:
+            failures.append("%s 的 scale 形状不是 %dx%d 块" % (name, block, block))
+        if block is None and scale["shape"] != [rows, cols * 2 // 32]:
+            failures.append("%s 的 FP4 scale 不是沿 K 每 32 个一组" % name)
+    for name, dtype, shape in (
+            ("mtp.%d.markov_head.embed.weight" % (stages - 1), "BF16",
+             [int(text["vocab_size"]), int(text["dspark_markov_rank"])]),
+            ("mtp.%d.markov_head.head.weight" % (stages - 1), "BF16",
+             [int(text["vocab_size"]), int(text["dspark_markov_rank"])]),
+            ("mtp.%d.confidence_head.proj.weight" % (stages - 1), "BF16",
+             [1, int(text["hidden_size"]) + int(text["dspark_markov_rank"])])):
+        info = header(weight_map[name])[name]
+        print("  %-34s %-8s %s" % (name, info["dtype"], info["shape"]))
+        if info["dtype"] != dtype or info["shape"] != shape:
+            failures.append("%s 的 dtype / 形状与预期不符（期望 %s %s）" % (name, dtype, shape))
+    try:
+        sys.path.insert(0, os.path.join(os.getcwd(), "build", "tools"))
+        from ftllm.launcher_mtp import detect_mtp_support
+        reason = detect_mtp_support(path, cfg)
+        print("  detect_mtp_support = %s" % reason)
+        if reason != "enabled":
+            failures.append("detect_mtp_support 返回 %s，应为 enabled" % reason)
+    except ImportError as exc:
+        print("  （跳过 detect_mtp_support：%s）" % exc)
+    return failures
+
+
 def read_stats(path):
     rounds = []
     if os.path.exists(path):
@@ -405,6 +489,14 @@ def main():
     if args.child:
         child_main(args)
         return
+
+    if args.real_checkpoint:
+        print("=== 真实 checkpoint 的 mtp.* 权重核对 ===")
+        problems = check_real_checkpoint(args.real_checkpoint)
+        for problem in problems:
+            print("FAIL:", problem)
+        print("PASS" if not problems else "")
+        sys.exit(1 if problems else 0)
 
     tiny = build_tiny_config()
     need_generate = args.regenerate or not os.path.exists(os.path.join(args.work_dir, "model.safetensors"))

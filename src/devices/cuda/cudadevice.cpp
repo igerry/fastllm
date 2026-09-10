@@ -6901,8 +6901,11 @@ namespace fastllm {
 
     void CudaDeepSeekV41IndexerScoreOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        int ratio = intParams.find("compressRatio") == intParams.end() ? 0 : intParams.find("compressRatio")->second;
+        int startPos = intParams.find("startPos") == intParams.end() ? 0 : intParams.find("startPos")->second;
         if (!FastllmCudaDeepSeekV41IndexerScore(*(datas.find("q")->second), *(datas.find("weights")->second),
-                                                *(datas.find("k")->second), *(datas.find("output")->second))) {
+                                                *(datas.find("k")->second), ratio, startPos,
+                                                *(datas.find("output")->second))) {
             ErrorInFastLLM("DeepSeekV41IndexerScore CUDA error: kernel rejected input.\n");
         }
     }

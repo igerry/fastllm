@@ -823,7 +823,8 @@ bool FastllmCudaDeepSeekV41RotaryQuant(fastllm::Data &x, int ropeDim, float rope
 bool FastllmCudaDeepSeekV41Compress(const fastllm::Data &kv, const fastllm::Data *score,
                                     fastllm::Data &normWeight, int ratio, float normEps, fastllm::Data &output);
 bool FastllmCudaDeepSeekV41IndexerScore(const fastllm::Data &q, const fastllm::Data &weights,
-                                        const fastllm::Data &k, fastllm::Data &output);
+                                        const fastllm::Data &k, int ratio, int startPos,
+                                        fastllm::Data &output);
 bool FastllmCudaDeepSeekV41CandidateBlocks(const fastllm::Data &score, int blockSize, int topkBlocks,
                                            int ratio, int startPos, fastllm::Data &output);
 bool FastllmCudaDeepSeekV41IndexerTopK(const fastllm::Data &score, const fastllm::Data *candidates,

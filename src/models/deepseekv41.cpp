@@ -98,6 +98,44 @@ namespace fastllm {
 
         // ---------------- 算子封装 ----------------
 
+        // indexer 分数矩阵 [token, m] 在长上下文下会非常大（1M 上下文的 ratio-1 层每个 token
+        // 有 1M 个候选，4096 token 的分块就是 16 GB）。按固定字节预算切 token 维，
+        // 让峰值显存与上下文长度解耦。FASTLLM_DSV41_INDEX_SCORE_MB 可调（默认 128 MB）。
+        int V41IndexScoreChunk(int segLen, int m) {
+            if (segLen <= 1 || m <= 0) {
+                return segLen;
+            }
+            static int forced = -2;
+            if (forced == -2) {
+                const char *env = std::getenv("FASTLLM_DSV41_INDEX_CHUNK");
+                forced = env != nullptr && env[0] != '\0' ? atoi(env) : -1;
+            }
+            if (forced > 0) {
+                return std::min(segLen, forced);
+            }
+            static size_t budget = 0;
+            if (budget == 0) {
+                const char *env = std::getenv("FASTLLM_DSV41_INDEX_SCORE_MB");
+                long mb = env != nullptr && env[0] != '\0' ? atol(env) : 0;
+                if (mb <= 0) {
+                    mb = 128;
+                }
+                budget = (size_t)mb * 1024 * 1024;
+            }
+            // 分数矩阵之外，候选块打分与掩码另外约占 m / blockSize 的量级，留 1.5 倍余量
+            const size_t perToken = (size_t)m * sizeof(float) * 3 / 2;
+            const size_t chunk = budget / std::max<size_t>(perToken, 1);
+            if (chunk >= (size_t)segLen) {
+                return segLen;
+            }
+            int c = (int)std::max<size_t>(chunk, 1);
+            if (c > 64) {
+                c = (c / 64) * 64;
+            }
+            return c;
+        }
+
+
         Executor &V41Executor() {
             return *((Executor*)GetExecutor());
         }
@@ -191,10 +229,11 @@ namespace fastllm {
             V41Executor().Run("DeepSeekV41Compress", datas, {{"normEps", normEps}}, {{"compressRatio", ratio}});
         }
 
-        void V41IndexerScore(const Data &q, const Data &weights, const Data &k, Data &output) {
+        void V41IndexerScore(const Data &q, const Data &weights, const Data &k, int ratio, int startPos,
+                             Data &output) {
             V41Executor().Run("DeepSeekV41IndexerScore", {
                 {"q", (Data*)&q}, {"weights", (Data*)&weights}, {"k", (Data*)&k}, {"output", &output}
-            }, {}, {});
+            }, {}, {{"compressRatio", ratio}, {"startPos", startPos}});
         }
 
         void V41CandidateBlocks(const Data &score, int blockSize, int topkBlocks, int ratio, int startPos, Data &output) {
@@ -264,6 +303,23 @@ namespace fastllm {
                 cache.Expansion(newDims);
             }
             CatDirect(cache, rows, 1);
+        }
+
+        // 把 [1, n, w] 的分块结果写进 [1, N, w] 的整段缓冲的第 offset 行
+        void V41WriteRows(Data &dst, const Data &src, int offset) {
+            const uint64_t rowBytes = (uint64_t)src.dims[2] * src.unitSize / src.unitSizeDiv;
+            const uint64_t bytes = (uint64_t)src.dims[1] * rowBytes;
+            if (bytes == 0) {
+                return;
+            }
+            if (dst.dataDevice == DataDevice::CUDA) {
+#ifdef USE_CUDA
+                FastllmCudaCopyFromDeviceToDevice((uint8_t*)dst.cudaData + (uint64_t)offset * rowBytes,
+                                                  (uint8_t*)src.cudaData, bytes);
+#endif
+            } else {
+                memcpy(dst.cpuData + (uint64_t)offset * rowBytes, src.cpuData, bytes);
+            }
         }
 
         // 调试：把张量以 float32 原始字节写到文件（FASTLLM_DSV41_DUMP_DIR）
@@ -2030,28 +2086,85 @@ namespace fastllm {
                     if (srcCache.compressedBlocks > 0) {
                         compressedKV = &srcCache.compressedKV;
                         if (needIndexer) {
-                            Data qIdxSeg, idxWeightsSeg, score;
+                            Data qIdxSeg, idxWeightsSeg;
                             Data *qIdx = sliceOf(qIdxAll, s, qIdxSeg);
                             V41RotaryQuant(*qIdx, rope, startPos, 1, false, 2, 32);
                             Data *idxWeightsScaled = sliceOf(idxWeightsAll, s, idxWeightsSeg);
-                            V41IndexerScore(*qIdx, *idxWeightsScaled, srcCache.indexK, score);
-                            if (dumpDebug) {
-                                V41DumpTensor(*qIdx, "fl_layer" + std::to_string(layer) + "_idxq" + dumpSuffix);
-                                V41DumpTensor(*idxWeightsScaled, "fl_layer" + std::to_string(layer) + "_idxw" + dumpSuffix);
-                                V41DumpTensor(score, "fl_layer" + std::to_string(layer) + "_score" + dumpSuffix);
-                            }
-                            if (layer == candidate_source_layer_id && candidate_block_size > 0 && candidate_topk_blocks > 0) {
-                                V41CandidateBlocks(score, candidate_block_size, candidate_topk_blocks, ratio, startPos,
-                                                   segCandidate[s]);
-                                segHasCandidates[s] = 1;
-                                if (dumpDebug) {
-                                    V41DumpTensor(segCandidate[s], "fl_layer" + std::to_string(layer) + "_cand" + dumpSuffix);
-                                }
-                            }
+                            const bool isCandidateLayer = layer == candidate_source_layer_id &&
+                                                          candidate_block_size > 0 && candidate_topk_blocks > 0;
                             const bool useCandidates = segHasCandidates[s] && candidate_source_layer_id >= 0 &&
                                                        candidate_source_layer_id < layer;
-                            V41IndexerTopK(score, useCandidates ? &segCandidate[s] : nullptr, indexTopK, ratio, startPos,
-                                           std::max(1, candidate_block_size), segTopK[s]);
+                            // 分数矩阵是 [token, m]，长上下文下会非常大（1M 上下文时每个 token 512 K 个候选）。
+                            // 按 token 维分块调用打分 / 候选块 / top-k，把峰值显存钉在一个固定预算内。
+                            const int scoreM = srcCache.indexK.dims.size() == 3 ? srcCache.indexK.dims[1] : 0;
+                            int chunkTokens = V41IndexScoreChunk(segLen, scoreM);
+                            if (chunkTokens >= segLen) {
+                                Data score;
+                                V41IndexerScore(*qIdx, *idxWeightsScaled, srcCache.indexK, ratio, startPos, score);
+                                if (dumpDebug) {
+                                    V41DumpTensor(*qIdx, "fl_layer" + std::to_string(layer) + "_idxq" + dumpSuffix);
+                                    V41DumpTensor(*idxWeightsScaled, "fl_layer" + std::to_string(layer) + "_idxw" + dumpSuffix);
+                                    V41DumpTensor(score, "fl_layer" + std::to_string(layer) + "_score" + dumpSuffix);
+                                }
+                                if (isCandidateLayer) {
+                                    V41CandidateBlocks(score, candidate_block_size, candidate_topk_blocks, ratio,
+                                                       startPos, segCandidate[s]);
+                                    segHasCandidates[s] = 1;
+                                    if (dumpDebug) {
+                                        V41DumpTensor(segCandidate[s], "fl_layer" + std::to_string(layer) + "_cand" + dumpSuffix);
+                                    }
+                                }
+                                V41IndexerTopK(score, useCandidates ? &segCandidate[s] : nullptr, indexTopK, ratio,
+                                               startPos, std::max(1, candidate_block_size), segTopK[s]);
+                            } else {
+                                const int numChunks = (segLen + chunkTokens - 1) / chunkTokens;
+                                // 整段输出先按第一块的宽度分配好，各块直接写进对应行区间（避免逐块 Cat）
+                                Data candAll, topkAll;
+                                Data prevCandidate;
+                                if (useCandidates) {
+                                    prevCandidate.CopyFrom(segCandidate[s]);
+                                }
+                                for (int c = 0; c < numChunks; c++) {
+                                    const int c0 = c * chunkTokens;
+                                    const int c1 = std::min(segLen, c0 + chunkTokens);
+                                    Data qChunk, wChunk, score, candChunk, topkChunk;
+                                    Split(*qIdx, 1, c0, c1, qChunk);
+                                    Split(*idxWeightsScaled, 1, c0, c1, wChunk);
+                                    V41IndexerScore(qChunk, wChunk, srcCache.indexK, ratio, startPos + c0, score);
+                                    Data *candPtr = nullptr;
+                                    if (isCandidateLayer) {
+                                        V41CandidateBlocks(score, candidate_block_size, candidate_topk_blocks, ratio,
+                                                           startPos + c0, candChunk);
+                                        candPtr = &candChunk;
+                                    } else if (useCandidates) {
+                                        Split(prevCandidate, 1, c0, c1, candChunk);
+                                        candPtr = &candChunk;
+                                    }
+                                    V41IndexerTopK(score, candPtr, indexTopK, ratio, startPos + c0,
+                                                   std::max(1, candidate_block_size), topkChunk);
+                                    if (c == 0) {
+                                        if (isCandidateLayer) {
+                                            candAll.dataType = candChunk.dataType;
+                                            candAll.Resize({candChunk.dims[0], segLen, candChunk.dims[2]});
+                                            candAll.ToDevice(candChunk.dataDevice);
+                                            candAll.Allocate();
+                                        }
+                                        topkAll.dataType = topkChunk.dataType;
+                                        topkAll.Resize({topkChunk.dims[0], segLen, topkChunk.dims[2]});
+                                        topkAll.ToDevice(topkChunk.dataDevice);
+                                        topkAll.Allocate();
+                                    }
+                                    if (isCandidateLayer) {
+                                        V41WriteRows(candAll, candChunk, c0);
+                                    }
+                                    V41WriteRows(topkAll, topkChunk, c0);
+                                }
+                                if (isCandidateLayer) {
+                                    segCandidate[s].CopyFrom(candAll);
+                                    segHasCandidates[s] = 1;
+                                }
+                                segTopK[s].CopyFrom(topkAll);
+                            }
                         }
                         if (segTopK[s].dims.size() == 3) {
                             cmpIdx = &segTopK[s];

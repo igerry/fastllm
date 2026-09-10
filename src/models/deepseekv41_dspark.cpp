@@ -42,7 +42,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
+#include <mutex>
+#include <sstream>
 
 namespace fastllm {
     namespace {
@@ -162,6 +165,75 @@ namespace fastllm {
 
         float DsSigmoid(float x) {
             return x >= 0.0f ? 1.0f / (1.0f + std::exp(-x)) : std::exp(x) / (1.0f + std::exp(x));
+        }
+
+        // ---- 测试用的调试钩子 ----
+        // FASTLLM_DSPARK_FORCE_DRAFTS：每行一组候选 token（空格分隔），按顺序替换模型
+        //   自己产生的候选，用来构造"接受 0 个 / 接受一部分 / 全部接受"三种回滚场景。
+        // FASTLLM_DSPARK_STATS_FILE：每轮校验追加一行 "round drafts accepted"。
+        struct DsForcedDrafts {
+            std::vector<std::vector<int> > lines;
+            size_t cursor = 0;
+            bool loaded = false;
+            std::mutex locker;
+        };
+
+        DsForcedDrafts &DsForced() {
+            static DsForcedDrafts forced;
+            return forced;
+        }
+
+        bool DsNextForcedDrafts(std::vector<int> &out) {
+            DsForcedDrafts &forced = DsForced();
+            std::lock_guard<std::mutex> guard(forced.locker);
+            if (!forced.loaded) {
+                forced.loaded = true;
+                const char *path = std::getenv("FASTLLM_DSPARK_FORCE_DRAFTS");
+                if (path != nullptr && path[0] != '\0') {
+                    std::ifstream file(path);
+                    std::string line;
+                    while (std::getline(file, line)) {
+                        std::istringstream stream(line);
+                        std::vector<int> row;
+                        int value = 0;
+                        while (stream >> value) {
+                            row.push_back(value);
+                        }
+                        if (!row.empty()) {
+                            forced.lines.push_back(row);
+                        }
+                    }
+                    printf("[Fastllm] DeepSeek-V4.1 DSpark: loaded %d forced draft rows from %s\n",
+                           (int)forced.lines.size(), path);
+                    fflush(stdout);
+                }
+            }
+            if (forced.cursor >= forced.lines.size()) {
+                return false;
+            }
+            out = forced.lines[forced.cursor++];
+            return true;
+        }
+
+        void DsRecordStats(long long round, int drafts, int accepted) {
+            static const char *path = std::getenv("FASTLLM_DSPARK_STATS_FILE");
+            if (path == nullptr || path[0] == '\0') {
+                return;
+            }
+            static std::mutex locker;
+            std::lock_guard<std::mutex> guard(locker);
+            FILE *file = fopen(path, "a");
+            if (file != nullptr) {
+                fprintf(file, "%lld %d %d\n", round, drafts, accepted);
+                fclose(file);
+            }
+        }
+
+        // FASTLLM_DSV41_DEBUG_STATE：每次前向后把各层缓存的长度写到文件，
+        // 用来对比"开 DSpark（含回滚）"与"不开 DSpark"两条路径的状态是否一致
+        const char *DsDebugStatePath() {
+            static const char *path = std::getenv("FASTLLM_DSV41_DEBUG_STATE");
+            return path != nullptr && path[0] != '\0' ? path : nullptr;
         }
 
         std::vector<int> DsReadIds(const Data &data) {
@@ -431,15 +503,53 @@ namespace fastllm {
             return 0;
         }
         drafts.assign(dspark.drafts.begin(), dspark.drafts.begin() + count);
+        {
+            // 测试钩子：用外部给定的候选替换模型的候选（构造指定的接受长度）
+            std::vector<int> forced;
+            if (DsNextForcedDrafts(forced)) {
+                if ((int)forced.size() > v41DsparkTokens) {
+                    forced.resize(v41DsparkTokens);
+                }
+                if (forced.empty()) {
+                    dspark.drafts.clear();
+                    return 0;
+                }
+                drafts = forced;
+                count = (int)forced.size();
+            }
+        }
         std::vector<float> values;
         values.reserve(count + 1);
         values.push_back((float)dspark.anchor);
         for (int t : drafts) {
             values.push_back((float)t);
         }
-        verifyIds = Data(DataType::FLOAT32, {1, count + 1}, values);
+        // Data 没有深拷贝赋值，必须用 CopyFrom，否则临时对象析构后缓冲区悬空
+        verifyIds.CopyFrom(Data(DataType::FLOAT32, {1, count + 1}, values));
         dspark.drafts.clear();
         return count;
+    }
+
+    void DeepSeekV41Model::DsparkDebugDumpState(const DeepSeekV41RequestState &state, const char *tag) {
+        const char *path = DsDebugStatePath();
+        if (path == nullptr) {
+            return;
+        }
+        FILE *file = fopen(path, "a");
+        if (file == nullptr) {
+            return;
+        }
+        fprintf(file, "%s total=%d engram=%d", tag, state.totalLen, (int)state.engramHistory.size());
+        for (int layer = 0; layer < (int)state.layers.size(); layer++) {
+            const DeepSeekV41LayerCache &cache = state.layers[layer];
+            fprintf(file, " | L%d len=%d blocks=%d tail=%d ring=%d idx=%d ckv=%d", layer, cache.totalLen,
+                    cache.compressedBlocks, cache.rawTail,
+                    cache.windowKV.dims.size() == 3 ? cache.windowKV.dims[1] : -1,
+                    cache.indexK.dims.size() == 3 ? cache.indexK.dims[1] : -1,
+                    cache.compressedKV.dims.size() == 3 ? cache.compressedKV.dims[1] : -1);
+        }
+        fprintf(file, "\n");
+        fclose(file);
     }
 
     std::vector<int> DeepSeekV41Model::ForwardSegmentsWithDspark(
@@ -454,8 +564,13 @@ namespace fastllm {
             bool allowSpeculate) {
         const int numSegments = (int)segments.size();
         if (!v41DsparkEnabled || inputEmbeds != nullptr || imageMask != nullptr) {
-            return ForwardSegments(segments, inputIds, inputEmbeds, imageMask, generationConfigs,
-                                   lastTokens, retLogits, samplingPastKeyValues);
+            std::vector<int> plain = ForwardSegments(segments, inputIds, inputEmbeds, imageMask,
+                                                     generationConfigs, lastTokens, retLogits,
+                                                     samplingPastKeyValues);
+            for (auto &seg : segments) {
+                DsparkDebugDumpState(*seg.state, "plain");
+            }
+            return plain;
         }
         std::vector<DeepSeekV41SpecScratch> scratches(numSegments);
         std::vector<char> active(numSegments, 0);
@@ -510,12 +625,14 @@ namespace fastllm {
             for (int j = 1; j <= accepted; j++) {
                 state.dspark->pending.push_back(std::make_pair(scratch.greedy[j - 1], scratch.greedy[j]));
             }
-            v41DsparkVerifyRounds.fetch_add(1);
+            const long long round = v41DsparkVerifyRounds.fetch_add(1) + 1;
             v41DsparkProposedTokens.fetch_add(drafts);
             v41DsparkAcceptedTokens.fetch_add(accepted);
+            DsRecordStats(round, drafts, accepted);
             state.dspark->rounds++;
             state.dspark->proposed += drafts;
             state.dspark->accepted += accepted;
+            DsparkDebugDumpState(state, "verify");
             DsparkAdvance(state, scratch, startPos, startPos + commitCount, scratch.greedy[accepted]);
             segments[0].seqlen = 1;
             return ret;
@@ -527,6 +644,7 @@ namespace fastllm {
             }
             // prefill 分块的中间结果不是真正的下一个 token，这时只更新滑窗、不生成候选
             const int anchor = segments[i].seqlen == 1 && (int)ret.size() > i ? ret[i] : -1;
+            DsparkDebugDumpState(*segments[i].state, "plain");
             DsparkAdvance(*segments[i].state, scratches[i], segments[i].startPos,
                           segments[i].startPos + segments[i].seqlen, anchor);
         }

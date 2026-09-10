@@ -392,6 +392,8 @@ namespace fastllm {
         void DsparkRunDraft(DeepSeekV41DsparkState &dspark, int anchorToken,
                             std::vector<int> &tokens, std::vector<float> &confidence);
         void DsparkBuildMoeWeights();
+        // 调试：把各层缓存长度写到 FASTLLM_DSV41_DEBUG_STATE 指定的文件
+        void DsparkDebugDumpState(const DeepSeekV41RequestState &state, const char *tag);
         void DsparkReportStats();
 
         void LoadEngramMeta();

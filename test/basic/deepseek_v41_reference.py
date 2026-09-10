@@ -40,6 +40,7 @@ def parse_args():
     parser.add_argument("--dtype", default="float16", help="fastllm 线性层 dtype")
     parser.add_argument("--moe-device", default="cuda")
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--kv-cache-dtype", default="", help="fastllm KV 缓存存储类型（如 fp8_e4m3；默认 BF16）")
     parser.add_argument("--threads", type=int, default=16)
     parser.add_argument("--regenerate", action="store_true")
     parser.add_argument("--skip-fastllm", action="store_true")
@@ -609,6 +610,8 @@ def run_fastllm(args, prompt, vocab_size):
                     "--moe_device", args.moe_device, "-t", str(args.threads)]
     if args.chunked_prefill > 0:
         fastllm_argv += ["--chunked_prefill_size", str(args.chunked_prefill)]
+    if args.kv_cache_dtype:
+        fastllm_argv += ["--kv_cache_dtype", args.kv_cache_dtype]
     fargs = parser.parse_args(fastllm_argv)
     if fargs.max_batch <= 0:
         fargs.max_batch = 1

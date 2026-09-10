@@ -2,7 +2,8 @@
 // DeepSeek-V4.1 专用 CUDA kernel。
 //
 // 数值语义与 src/devices/cpu/deepseekv41ops.cpp 中的 CPU 参考实现一致；
-// 这里以正确性优先，面向 SM86 等无 FP8 tensor core 的设备，全部用 FP32 计算。
+// 面向 SM86 等无 FP8 tensor core 的设备：稀疏注意力与 indexer 打分在 SM80+ 上用
+// BF16 mma（FP32 累加），其余算子为 FP32。SM80 以下或 dtype 不匹配时退回标量实现。
 //
 
 #include "fastllm-cuda.cuh"
@@ -285,6 +286,171 @@ namespace {
             for (int i = 0; i < hcMult * hcMult; i++) {
                 combOut[i] = combShared[i];
             }
+        }
+    }
+
+
+    // hcMult 编译期特化 + 一个 block 处理多个 token 的版本。
+    //
+    // 旧 kernel 的 acc[kHcMaxMix + 1] 被运行时下标访问，ptxas 把它放进 local memory
+    // （136 字节栈帧）；而且每个 token 一个 block，混合系数矩阵 fn（[(2+hc)*hc, hc*dim]，
+    // 真实模型是 24 x 20480 的 FP32，约 2 MB）要被每个 token 各读一遍。
+    // 这里把 mixHc 变成编译期常量（acc 进寄存器），并让一个 block 处理 kHcTokens 个 token，
+    // 在 k 的循环里复用同一份 fn。每个 (token, m) 的累加顺序与旧 kernel 完全一致，结果逐 bit 相同。
+
+    constexpr int kHcTokens = 4;
+
+    template <typename T, int HC>
+    __global__ void __launch_bounds__(kHcThreads)
+    V41HcMixKernelMulti(const T *x, const float *fn, const float *scale, const float *base,
+                        int tokens, int dim, int sinkhornIters, float eps, float normEps,
+                        float *pre, float *post, float *comb) {
+        constexpr int MIXHC = (2 + HC) * HC;
+        const int flatDim = HC * dim;
+        const int t0 = blockIdx.x * kHcTokens;
+        __shared__ float sharedPartial[kHcTokens][MIXHC + 1][kHcThreads / 32];
+        __shared__ float mixes[kHcTokens][MIXHC];
+        __shared__ float sumsq[kHcTokens];
+        __shared__ float combShared[kHcTokens][HC * HC];
+
+        float acc[kHcTokens][MIXHC + 1];
+#pragma unroll
+        for (int tb = 0; tb < kHcTokens; tb++) {
+#pragma unroll
+            for (int m = 0; m <= MIXHC; m++) {
+                acc[tb][m] = 0.0f;
+            }
+        }
+        for (int k = threadIdx.x; k < flatDim; k += kHcThreads) {
+            float xs[kHcTokens];
+#pragma unroll
+            for (int tb = 0; tb < kHcTokens; tb++) {
+                xs[tb] = t0 + tb < tokens ? V41Load<T>(x + (uint64_t)(t0 + tb) * flatDim, k) : 0.0f;
+                acc[tb][MIXHC] += xs[tb] * xs[tb];
+            }
+#pragma unroll
+            for (int m = 0; m < MIXHC; m++) {
+                const float f = fn[(uint64_t)m * flatDim + k];
+#pragma unroll
+                for (int tb = 0; tb < kHcTokens; tb++) {
+                    acc[tb][m] += xs[tb] * f;
+                }
+            }
+        }
+        const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+#pragma unroll
+        for (int tb = 0; tb < kHcTokens; tb++) {
+#pragma unroll
+            for (int m = 0; m <= MIXHC; m++) {
+                float v = V41WarpSum(acc[tb][m]);
+                if (lane == 0) {
+                    sharedPartial[tb][m][warp] = v;
+                }
+            }
+        }
+        __syncthreads();
+        // 每个线程负责一个 (token, m) 对，把 8 个 warp 的部分和加起来
+        for (int idx = threadIdx.x; idx < kHcTokens * (MIXHC + 1); idx += kHcThreads) {
+            const int tb = idx / (MIXHC + 1), m = idx % (MIXHC + 1);
+            float total = 0.0f;
+            for (int w = 0; w < kHcThreads / 32; w++) {
+                total += sharedPartial[tb][m][w];
+            }
+            if (m == MIXHC) {
+                sumsq[tb] = total;
+            } else {
+                mixes[tb][m] = total;
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x < kHcTokens && t0 + (int)threadIdx.x < tokens) {
+            const int tb = threadIdx.x;
+            const int t = t0 + tb;
+            const float rsqrtv = rsqrtf(sumsq[tb] / flatDim + normEps);
+            float *preOut = pre + (uint64_t)t * HC;
+            float *postOut = post + (uint64_t)t * HC;
+            float *combOut = comb + (uint64_t)t * HC * HC;
+            for (int h = 0; h < HC; h++) {
+                preOut[h] = V41SigmoidDev(mixes[tb][h] * rsqrtv * scale[0] + base[h]) + eps;
+                postOut[h] = 2.0f * V41SigmoidDev(mixes[tb][h + HC] * rsqrtv * scale[1] + base[h + HC]);
+            }
+            float *cs = combShared[tb];
+            for (int r = 0; r < HC; r++) {
+                float rowMax = -FLT_MAX;
+                for (int c = 0; c < HC; c++) {
+                    int idx = r * HC + c + 2 * HC;
+                    cs[r * HC + c] = mixes[tb][idx] * rsqrtv * scale[2] + base[idx];
+                    rowMax = fmaxf(rowMax, cs[r * HC + c]);
+                }
+                float rowSum = 0.0f;
+                for (int c = 0; c < HC; c++) {
+                    float v = __expf(cs[r * HC + c] - rowMax);
+                    cs[r * HC + c] = v;
+                    rowSum += v;
+                }
+                for (int c = 0; c < HC; c++) {
+                    cs[r * HC + c] = cs[r * HC + c] / rowSum + eps;
+                }
+            }
+            for (int c = 0; c < HC; c++) {
+                float colSum = 0.0f;
+                for (int r = 0; r < HC; r++) {
+                    colSum += cs[r * HC + c];
+                }
+                for (int r = 0; r < HC; r++) {
+                    cs[r * HC + c] /= (colSum + eps);
+                }
+            }
+            for (int it = 1; it < sinkhornIters; it++) {
+                for (int r = 0; r < HC; r++) {
+                    float rowSum = 0.0f;
+                    for (int c = 0; c < HC; c++) {
+                        rowSum += cs[r * HC + c];
+                    }
+                    for (int c = 0; c < HC; c++) {
+                        cs[r * HC + c] /= (rowSum + eps);
+                    }
+                }
+                for (int c = 0; c < HC; c++) {
+                    float colSum = 0.0f;
+                    for (int r = 0; r < HC; r++) {
+                        colSum += cs[r * HC + c];
+                    }
+                    for (int r = 0; r < HC; r++) {
+                        cs[r * HC + c] /= (colSum + eps);
+                    }
+                }
+            }
+            for (int i = 0; i < HC * HC; i++) {
+                combOut[i] = cs[i];
+            }
+        }
+    }
+
+    template <typename T>
+    bool V41LaunchHcMixMulti(const T *x, const float *fn, const float *scale, const float *base,
+                             int hcMult, int tokens, int dim, int sinkhornIters, float eps, float normEps,
+                             float *pre, float *post, float *comb) {
+        const int blocks = (tokens + kHcTokens - 1) / kHcTokens;
+        switch (hcMult) {
+            case 1:
+                V41HcMixKernelMulti<T, 1><<<blocks, kHcThreads>>>(x, fn, scale, base, tokens, dim,
+                    sinkhornIters, eps, normEps, pre, post, comb);
+                return true;
+            case 2:
+                V41HcMixKernelMulti<T, 2><<<blocks, kHcThreads>>>(x, fn, scale, base, tokens, dim,
+                    sinkhornIters, eps, normEps, pre, post, comb);
+                return true;
+            case 3:
+                V41HcMixKernelMulti<T, 3><<<blocks, kHcThreads>>>(x, fn, scale, base, tokens, dim,
+                    sinkhornIters, eps, normEps, pre, post, comb);
+                return true;
+            case 4:
+                V41HcMixKernelMulti<T, 4><<<blocks, kHcThreads>>>(x, fn, scale, base, tokens, dim,
+                    sinkhornIters, eps, normEps, pre, post, comb);
+                return true;
+            default:
+                return false;
         }
     }
 
@@ -1401,6 +1567,28 @@ extern "C" bool FastllmCudaDeepSeekV41HcMix(const fastllm::Data &x, fastllm::Dat
     hcFn.ToDevice(DataDevice::CUDA);
     hcScale.ToDevice(DataDevice::CUDA);
     hcBase.ToDevice(DataDevice::CUDA);
+    if (!V41EnvOn("FASTLLM_DSV41_LEGACY_HCMIX")) {
+        bool launched = false;
+        if (x.dataType == DataType::BFLOAT16) {
+            launched = V41LaunchHcMixMulti<__nv_bfloat16>((const __nv_bfloat16*)x.cudaData,
+                (const float*)hcFn.cudaData, (const float*)hcScale.cudaData, (const float*)hcBase.cudaData,
+                hcMult, tokens, dim, sinkhornIters, eps, normEps,
+                (float*)pre.cudaData, (float*)post.cudaData, (float*)comb.cudaData);
+        } else if (x.dataType == DataType::FLOAT16) {
+            launched = V41LaunchHcMixMulti<half>((const half*)x.cudaData,
+                (const float*)hcFn.cudaData, (const float*)hcScale.cudaData, (const float*)hcBase.cudaData,
+                hcMult, tokens, dim, sinkhornIters, eps, normEps,
+                (float*)pre.cudaData, (float*)post.cudaData, (float*)comb.cudaData);
+        } else {
+            launched = V41LaunchHcMixMulti<float>((const float*)x.cudaData,
+                (const float*)hcFn.cudaData, (const float*)hcScale.cudaData, (const float*)hcBase.cudaData,
+                hcMult, tokens, dim, sinkhornIters, eps, normEps,
+                (float*)pre.cudaData, (float*)post.cudaData, (float*)comb.cudaData);
+        }
+        if (launched) {
+            return V41CheckLaunch("HcMix");
+        }
+    }
     if (x.dataType == DataType::BFLOAT16) {
         V41HcMixKernel<__nv_bfloat16><<<tokens, kHcThreads>>>(
             (const __nv_bfloat16*)x.cudaData, (const float*)hcFn.cudaData, (const float*)hcScale.cudaData,
@@ -1715,6 +1903,12 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
                 splits = (int)std::min((long long)maxTiles, (target + base - 1) / base);
                 splits = std::max(1, std::min(splits, 32));
             }
+        }
+        // 部分和缓冲是 [splits, tokens, heads, dim + 2] 的 FP32，prefill 时强行 split 会非常大，
+        // 超过预算就把 split 数减半（正确性不受影响，只是并行度降低）
+        while (splits > 1 &&
+               (size_t)splits * tokens * heads * (kMmaDim + 2) * sizeof(float) > (size_t)512 * 1024 * 1024) {
+            splits /= 2;
         }
         float *partAcc = nullptr, *partMx = nullptr, *partL = nullptr;
         size_t partCount = 0;

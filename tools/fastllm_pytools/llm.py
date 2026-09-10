@@ -70,6 +70,19 @@ except ImportError:
     )
 
 try:
+    from .deepseek_v41_multimodal import (
+        build_deepseek_v41_multimodal_payload,
+        normalize_deepseek_v41_conversation,
+        prepare_deepseek_v41_multimodal_inputs,
+    )
+except ImportError:
+    from deepseek_v41_multimodal import (
+        build_deepseek_v41_multimodal_payload,
+        normalize_deepseek_v41_conversation,
+        prepare_deepseek_v41_multimodal_inputs,
+    )
+
+try:
     import sentencepiece # 先加载sentencepiece，防止libc冲突
 except:
     pass
@@ -1701,6 +1714,26 @@ class model:
         messages.insert(0, {"role": "system", "tools": tools})
         return messages
 
+    def _prepare_deepseek_v41_multimodal(self, conversation, images, tools, enable_thinking):
+        """DeepSeek-V4.1 图文输入：官方 encode_messages 渲染带占位符的 prompt，再展开图像 span。
+        有 HF tokenizer 时与纯文本路径一样用它编码，否则退回 fastllm 原生 tokenizer。"""
+        from ftllm.encoding_dsv41 import encode_messages
+        if self.hf_tokenizer is not None:
+            encode_fn = lambda prompt: encode_hf_prompt(self.hf_tokenizer, prompt)
+        else:
+            encode_fn = lambda prompt: self.encode(prompt)
+        conversation = normalize_deepseek_v41_conversation(copy.deepcopy(conversation), len(images))
+        conversation = self._inject_deepseek_v4_tools(conversation, tools)
+        thinking_mode = "thinking" if enable_thinking else "chat"
+        return prepare_deepseek_v41_multimodal_inputs(
+            conversation = conversation,
+            images = images,
+            model_config = self.config,
+            encode_messages = encode_messages,
+            encode_fn = encode_fn,
+            thinking_mode = thinking_mode,
+        )
+
     def get_prompt(self,
                    query: str,
                    history: List[Tuple[str, str]] = None) -> str:
@@ -1909,6 +1942,12 @@ class model:
                 architecture = self.config["architectures"][0]
             except:
                 architecture = ""
+            if self._is_deepseek_v41():
+                if multimodal_videos:
+                    raise ValueError("DeepSeek-V4.1 does not support video input.")
+                native_inputs = self._prepare_deepseek_v41_multimodal(
+                    conversation, multimodal_images, tools, enable_thinking)
+                return len(native_inputs["input_ids"])
             if architecture == "Gemma4ForConditionalGeneration":
                 if self.hf_tokenizer is None:
                     raise ValueError("Gemma4 multimodal token counting needs a Hugging Face tokenizer.")
@@ -2423,6 +2462,26 @@ class model:
                                                             des.encode(), (ctypes.c_float * len(image))(*image),
                                                             max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
                                                             False, stop_token_len, stop_token_list)
+                return handle
+            elif self._is_deepseek_v41():
+                if (len(multimodal_videos) > 0):
+                    raise ValueError("DeepSeek-V4.1 does not support video input.")
+                if (conversation is None or len(conversation) == 0):
+                    prompt_text = query if self.direct_query else self.get_prompt(query, history)
+                    conversation = [{"role": "user", "content": prompt_text}]
+                native_inputs = self._prepare_deepseek_v41_multimodal(
+                    conversation, multimodal_images, tools, enable_thinking)
+                payload_config, payload = build_deepseek_v41_multimodal_payload(native_inputs)
+                payload_json = json.dumps(payload_config)
+                payload_buffer = ctypes.create_string_buffer(payload) if payload else None
+                input = native_inputs["input_ids"]
+                stop_token_len, stop_token_list = self.stop_token_ctypes(stop_token_ids)
+                handle = fastllm_lib.launch_response_llm_model_multimodal(
+                    self.model, len(input), (ctypes.c_int * len(input))(*input),
+                    payload_json.encode(), payload_buffer,
+                    max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
+                    False, stop_token_len, stop_token_list
+                )
                 return handle
             elif (architecture == "Gemma4ForConditionalGeneration"):
                 tokenizer = self.hf_tokenizer

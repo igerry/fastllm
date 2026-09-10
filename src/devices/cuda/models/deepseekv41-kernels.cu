@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <cstdlib>
 #include <vector>
 
 #include <cuda_bf16.h>
@@ -768,6 +769,361 @@ namespace {
         }
     }
 
+
+    // ---------------- SparseAttention（BF16 mma 版本，SM80+） ----------------
+    //
+    // 数值语义与上面的 V41SparseAttentionKernel 一致（在线 softmax + attn_sink，
+    // 候选顺序为「滑窗 -> 压缩 top-k」），区别只有：
+    //   * QK^T 与 PV 用 mma.sync.m16n8k16（BF16 输入 / FP32 累加）代替 FP32 标量点积；
+    //   * 候选按 kMmaNC 个一组分块，一组只要 4 次 __syncthreads（原来每个候选 1 次）；
+    //   * 一个 block 内 32 个 head 共享同一份候选 KV，Q 也常驻共享内存；
+    //   * 候选维可以再切成 gridDim.z 份（split-K），由 V41SparseMergeKernel 合并部分和，
+    //     用于 decode 时提高并行度。
+    //
+    // 片段布局（PTX ISA 的 m16n8k16 定义）：
+    //   A(16x16): lane l 持有 (row = l/4 [+8], col = (l%4)*2 + {0,1} [+8])
+    //   B(16x8) : lane l 持有 (k = (l%4)*2 + {0,1} [+8], n = l/4)
+    //   C(16x8) : lane l 持有 (row = l/4 [+8], col = (l%4)*2 + {0,1})
+
+    constexpr int kMmaHeads = 32;                       // 每个 block 处理的 head 数
+    constexpr int kMmaNC = 32;                          // 每轮处理的候选数
+    constexpr int kMmaWarps = 8;
+    constexpr int kMmaThreads = kMmaWarps * 32;         // 256
+    constexpr int kMmaDim = 512;                        // V4.1 的 head_dim 固定为 512
+    constexpr int kMmaKvStride = kMmaDim + 8;           // +8 个半字，消除 ldmatrix 的 bank 冲突
+    constexpr int kMmaPStride = kMmaNC + 8;
+    constexpr int kMmaDimSlice = kMmaDim / 4;           // PV 阶段每个 warp 负责 128 维
+    constexpr int kMmaPvTiles = kMmaDimSlice / 8;       // 16 个 n-tile
+
+    struct V41MmaShared {
+        __nv_bfloat16 qs[kMmaHeads][kMmaKvStride];
+        __nv_bfloat16 kvs[kMmaNC][kMmaKvStride];
+        __nv_bfloat16 ps[kMmaHeads][kMmaPStride];
+        float sc[kMmaHeads][kMmaNC];
+        float mx[kMmaHeads];
+        float lsum[kMmaHeads];
+        float alpha[kMmaHeads];
+        int valid[kMmaNC];
+    };
+
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800)
+    __device__ __forceinline__ uint32_t V41SmemAddr(const void *p) {
+        return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+    }
+
+    __device__ __forceinline__ void V41LdmX4(uint32_t (&r)[4], const void *addr) {
+        uint32_t s = V41SmemAddr(addr);
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                     : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(s));
+    }
+
+    __device__ __forceinline__ void V41LdmX2(uint32_t (&r)[2], const void *addr) {
+        uint32_t s = V41SmemAddr(addr);
+        asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+                     : "=r"(r[0]), "=r"(r[1]) : "r"(s));
+    }
+
+    __device__ __forceinline__ void V41LdmX2T(uint32_t (&r)[2], const void *addr) {
+        uint32_t s = V41SmemAddr(addr);
+        asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n"
+                     : "=r"(r[0]), "=r"(r[1]) : "r"(s));
+    }
+
+    __device__ __forceinline__ void V41MmaBf16(float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                     "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                     : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+    }
+#endif
+
+    __global__ void __launch_bounds__(kMmaThreads)
+    V41SparseAttentionMmaKernel(const __nv_bfloat16 *q, const __nv_bfloat16 *chunkKV, const __nv_bfloat16 *ringKV,
+                                const __nv_bfloat16 *compressedKV, const uint8_t *ringKV8, const uint8_t *compressedKV8,
+                                const int32_t *cmpIdx, const float *sink, int seqlen, int heads,
+                                int windowSize, int cap, int topWidth, int startPos, float scale,
+                                __nv_bfloat16 *out, float *partAcc, float *partMx, float *partL) {
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800)
+        extern __shared__ char v41MmaSharedRaw[];
+        V41MmaShared &sh = *reinterpret_cast<V41MmaShared*>(v41MmaSharedRaw);
+
+        const int t = blockIdx.x;                       // b * seqlen + i
+        const int b = t / seqlen, i = t % seqlen;
+        const int pos = startPos + i;
+        const int h0 = blockIdx.y * kMmaHeads;
+        const int warp = threadIdx.x >> 5;
+        const int lane = threadIdx.x & 31;
+
+        for (int v = threadIdx.x; v < kMmaHeads * (kMmaDim / 8); v += kMmaThreads) {
+            int hh = v / (kMmaDim / 8), dv = v % (kMmaDim / 8);
+            *((float4*)&sh.qs[hh][dv * 8]) =
+                *((const float4*)(q + ((uint64_t)t * heads + h0 + hh) * kMmaDim) + dv);
+        }
+        for (int r = threadIdx.x; r < kMmaHeads; r += kMmaThreads) {
+            sh.mx[r] = blockIdx.z == 0 ? sink[h0 + r] : -FLT_MAX;
+            sh.lsum[r] = blockIdx.z == 0 ? 1.0f : 0.0f;
+        }
+
+        const int winStart = max(0, pos - windowSize + 1);
+        const int winCount = pos - winStart + 1;
+        const int cmpCount = cmpIdx == nullptr ? 0 : topWidth;
+        const int32_t *idxRow = cmpIdx == nullptr ? nullptr : cmpIdx + (uint64_t)t * topWidth;
+        const int rowBytes8 = kMmaDim + (kMmaDim >> 5);
+        const int totalCand = winCount + cmpCount;
+        const int tilesTotal = (totalCand + kMmaNC - 1) / kMmaNC;
+        const int tilesPerSplit = (tilesTotal + (int)gridDim.z - 1) / (int)gridDim.z;
+        const int tileBegin = (int)blockIdx.z * tilesPerSplit;
+        const int tileEnd = min(tilesTotal, tileBegin + tilesPerSplit);
+
+        const int pvM = warp >> 2, pvSlice = warp & 3;   // PV: (mTile, 128 维切片)
+        const int qkM = warp >> 2, qkN = warp & 3;       // QK: (mTile, 8 个候选)
+        float acc[kMmaPvTiles][4];
+#pragma unroll
+        for (int n = 0; n < kMmaPvTiles; n++) {
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                acc[n][e] = 0.0f;
+            }
+        }
+        const int qkARow = qkM * 16 + ((lane >> 3) & 1) * 8 + (lane & 7);
+        const int qkAColBlk = (lane >> 4) * 8;
+        const int qkBRow = qkN * 8 + (lane & 7);
+        const int qkBColBlk = ((lane >> 3) & 1) * 8;
+        const int pvARow = pvM * 16 + ((lane >> 3) & 1) * 8 + (lane & 7);
+        const int pvAColBlk = (lane >> 4) * 8;
+        const int pvBRow = lane & 15;
+
+        for (int tile = tileBegin; tile < tileEnd; tile++) {
+            const int tileStart = tile * kMmaNC;
+            __syncthreads();
+            for (int slot = warp; slot < kMmaNC; slot += kMmaWarps) {
+                const int c = tileStart + slot;
+                const __nv_bfloat16 *src = nullptr;
+                const uint8_t *src8 = nullptr;
+                bool ok = c < totalCand;
+                if (ok) {
+                    if (c < winCount) {
+                        int p = winStart + c;
+                        if (p >= startPos) {
+                            src = chunkKV + ((uint64_t)b * seqlen + (p - startPos)) * kMmaDim;
+                        } else if (ringKV8 != nullptr) {
+                            src8 = ringKV8 + ((uint64_t)b * windowSize + (p % windowSize)) * rowBytes8;
+                        } else {
+                            src = ringKV + ((uint64_t)b * windowSize + (p % windowSize)) * kMmaDim;
+                        }
+                    } else {
+                        int idx = idxRow[c - winCount];
+                        if (idx < 0 || idx >= cap) {
+                            ok = false;
+                        } else if (compressedKV8 != nullptr) {
+                            src8 = compressedKV8 + ((uint64_t)b * cap + idx) * rowBytes8;
+                        } else {
+                            src = compressedKV + ((uint64_t)b * cap + idx) * kMmaDim;
+                        }
+                    }
+                }
+                if (!ok) {
+                    for (int v = lane; v < kMmaDim / 8; v += 32) {
+                        *((float4*)&sh.kvs[slot][v * 8]) = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                    }
+                } else if (src8 != nullptr) {
+                    for (int d = lane; d < kMmaDim; d += 32) {
+                        sh.kvs[slot][d] = __float2bfloat16_rn(V41LoadFp8Row(src8, kMmaDim, d));
+                    }
+                } else {
+                    for (int v = lane; v < kMmaDim / 8; v += 32) {
+                        *((float4*)&sh.kvs[slot][v * 8]) = *((const float4*)src + v);
+                    }
+                }
+                if (lane == 0) {
+                    sh.valid[slot] = ok ? 1 : 0;
+                }
+            }
+            __syncthreads();
+
+            {   // QK^T：C[16 head, 8 cand] = Q[16, 512] x KV[8, 512]^T
+                float d0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                float d1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                uint32_t a[4], bb[2];
+#pragma unroll 2
+                for (int k = 0; k < kMmaDim; k += 32) {
+                    V41LdmX4(a, &sh.qs[qkARow][k + qkAColBlk]);
+                    V41LdmX2(bb, &sh.kvs[qkBRow][k + qkBColBlk]);
+                    V41MmaBf16(d0, a, bb);
+                    V41LdmX4(a, &sh.qs[qkARow][k + 16 + qkAColBlk]);
+                    V41LdmX2(bb, &sh.kvs[qkBRow][k + 16 + qkBColBlk]);
+                    V41MmaBf16(d1, a, bb);
+                }
+                const int r = qkM * 16 + (lane >> 2);
+                const int c = qkN * 8 + (lane & 3) * 2;
+                sh.sc[r][c] = d0[0] + d1[0];
+                sh.sc[r][c + 1] = d0[1] + d1[1];
+                sh.sc[r + 8][c] = d0[2] + d1[2];
+                sh.sc[r + 8][c + 1] = d0[3] + d1[3];
+            }
+            __syncthreads();
+
+            {   // 在线 softmax：每个 head 一行，由 8 个线程负责
+                constexpr int perThread = kMmaNC / 8;
+                const int row = threadIdx.x >> 3;
+                const int sub = threadIdx.x & 7;
+                float vals[perThread];
+                bool oks[perThread];
+                float m = -FLT_MAX;
+#pragma unroll
+                for (int c = 0; c < perThread; c++) {
+                    int col = sub * perThread + c;
+                    bool ok = sh.valid[col] != 0;
+                    float v = ok ? sh.sc[row][col] * scale : -FLT_MAX;
+                    oks[c] = ok;
+                    vals[c] = v;
+                    m = fmaxf(m, v);
+                }
+                m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, 1));
+                m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, 2));
+                m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, 4));
+                const float oldMx = sh.mx[row];
+                const float newMx = fmaxf(oldMx, m);
+                float s = 0.0f;
+#pragma unroll
+                for (int c = 0; c < perThread; c++) {
+                    float p = oks[c] ? __expf(vals[c] - newMx) : 0.0f;
+                    s += p;
+                    sh.ps[row][sub * perThread + c] = __float2bfloat16_rn(p);
+                }
+                s += __shfl_xor_sync(0xffffffff, s, 1);
+                s += __shfl_xor_sync(0xffffffff, s, 2);
+                s += __shfl_xor_sync(0xffffffff, s, 4);
+                if (sub == 0) {
+                    float a = __expf(oldMx - newMx);
+                    sh.alpha[row] = a;
+                    sh.mx[row] = newMx;
+                    sh.lsum[row] = sh.lsum[row] * a + s;
+                }
+            }
+            __syncthreads();
+
+            {   // PV：O[16 head, 128 dim] = alpha * O + P[16, 32] x V[32, 128]
+                const float a0 = sh.alpha[pvM * 16 + (lane >> 2)];
+                const float a1 = sh.alpha[pvM * 16 + (lane >> 2) + 8];
+#pragma unroll
+                for (int n = 0; n < kMmaPvTiles; n++) {
+                    acc[n][0] *= a0;
+                    acc[n][1] *= a0;
+                    acc[n][2] *= a1;
+                    acc[n][3] *= a1;
+                }
+#pragma unroll
+                for (int k = 0; k < kMmaNC; k += 16) {
+                    uint32_t a[4];
+                    V41LdmX4(a, &sh.ps[pvARow][k + pvAColBlk]);
+#pragma unroll
+                    for (int n = 0; n < kMmaPvTiles; n++) {
+                        uint32_t bb[2];
+                        V41LdmX2T(bb, &sh.kvs[k + pvBRow][pvSlice * kMmaDimSlice + n * 8]);
+                        V41MmaBf16(acc[n], a, bb);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        const int outRow0 = pvM * 16 + (lane >> 2);
+        const int outRow1 = outRow0 + 8;
+        const int outCol = pvSlice * kMmaDimSlice + (lane & 3) * 2;
+        if (partAcc == nullptr) {
+            const float inv0 = 1.0f / sh.lsum[outRow0];
+            const float inv1 = 1.0f / sh.lsum[outRow1];
+            __nv_bfloat16 *o0 = out + ((uint64_t)t * heads + h0 + outRow0) * kMmaDim;
+            __nv_bfloat16 *o1 = out + ((uint64_t)t * heads + h0 + outRow1) * kMmaDim;
+#pragma unroll
+            for (int n = 0; n < kMmaPvTiles; n++) {
+                int d = outCol + n * 8;
+                o0[d] = __float2bfloat16_rn(acc[n][0] * inv0);
+                o0[d + 1] = __float2bfloat16_rn(acc[n][1] * inv0);
+                o1[d] = __float2bfloat16_rn(acc[n][2] * inv1);
+                o1[d + 1] = __float2bfloat16_rn(acc[n][3] * inv1);
+            }
+        } else {
+            const uint64_t base = ((uint64_t)blockIdx.z * gridDim.x + t) * heads;
+            float *a0 = partAcc + (base + h0 + outRow0) * kMmaDim;
+            float *a1 = partAcc + (base + h0 + outRow1) * kMmaDim;
+#pragma unroll
+            for (int n = 0; n < kMmaPvTiles; n++) {
+                int d = outCol + n * 8;
+                a0[d] = acc[n][0];
+                a0[d + 1] = acc[n][1];
+                a1[d] = acc[n][2];
+                a1[d + 1] = acc[n][3];
+            }
+            if (warp == 0) {
+                for (int r = lane; r < kMmaHeads; r += 32) {
+                    partMx[base + h0 + r] = sh.mx[r];
+                    partL[base + h0 + r] = sh.lsum[r];
+                }
+            }
+        }
+#endif
+    }
+
+    // split-K 的部分和合并（在线 softmax 的标准合并公式）
+    __global__ void V41SparseMergeKernel(const float *partAcc, const float *partMx, const float *partL,
+                                         int tokens, int heads, int splits, __nv_bfloat16 *out) {
+        const int idx = blockIdx.x;                     // t * heads + h
+        const uint64_t stride = (uint64_t)tokens * heads;
+        float mx = -FLT_MAX;
+        for (int s = 0; s < splits; s++) {
+            mx = fmaxf(mx, partMx[(uint64_t)s * stride + idx]);
+        }
+        float denom = 0.0f;
+        for (int s = 0; s < splits; s++) {
+            denom += __expf(partMx[(uint64_t)s * stride + idx] - mx) * partL[(uint64_t)s * stride + idx];
+        }
+        const float inv = 1.0f / denom;
+        for (int d = threadIdx.x; d < kMmaDim; d += blockDim.x) {
+            float v = 0.0f;
+            for (int s = 0; s < splits; s++) {
+                v += __expf(partMx[(uint64_t)s * stride + idx] - mx) *
+                     partAcc[((uint64_t)s * stride + idx) * kMmaDim + d];
+            }
+            out[(uint64_t)idx * kMmaDim + d] = __float2bfloat16_rn(v * inv);
+        }
+    }
+
+    // 设备是否支持 BF16 mma（SM80+），按设备号缓存
+    bool V41MmaSupported() {
+        static int cache[16] = {-1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1};
+        int dev = FastllmCudaGetDevice();
+        if (dev < 0 || dev >= 16) {
+            return false;
+        }
+        if (cache[dev] < 0) {
+            int major = 0;
+            cache[dev] = (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+                          major >= 8) ? 1 : 0;
+        }
+        return cache[dev] == 1;
+    }
+
+    int V41SmCount() {
+        static int cache[16] = {0};
+        int dev = FastllmCudaGetDevice();
+        if (dev < 0 || dev >= 16) {
+            return 1;
+        }
+        if (cache[dev] == 0) {
+            int n = 0;
+            cache[dev] = (cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && n > 0)
+                         ? n : 1;
+        }
+        return cache[dev];
+    }
+
+    bool V41EnvOn(const char *name) {
+        const char *v = getenv(name);
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }
+
     // ---------------- QuantizeKV ----------------
 
     constexpr int kKvQuantThreads = 128;
@@ -1159,6 +1515,64 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
     }
     int cap = hasCmp ? compressedKV->dims[1] : 0;
     int topWidth = hasCmp ? cmpIdx->dims[2] : 0;
+
+    // BF16 mma 快速路径（SM80+，head_dim 512，q 为 BF16）。
+    // FASTLLM_DSV41_LEGACY_ATTN=1 可退回下面的 FP32 标量 kernel 做对比 / 排查。
+    if (q.dataType == DataType::BFLOAT16 && dim == kMmaDim && heads % kMmaHeads == 0 &&
+        V41MmaSupported() && !V41EnvOn("FASTLLM_DSV41_LEGACY_ATTN")) {
+        static bool sharedReady = false;
+        if (!sharedReady) {
+            cudaFuncSetAttribute(V41SparseAttentionMmaKernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 (int)sizeof(V41MmaShared));
+            sharedReady = true;
+        }
+        const int tokens = bsz * seqlen;
+        const int headBlocks = heads / kMmaHeads;
+        const int maxCand = std::min(windowSize, startPos + seqlen) + topWidth;
+        const int maxTiles = std::max(1, (maxCand + kMmaNC - 1) / kMmaNC);
+        int splits = 1;
+        const char *splitEnv = getenv("FASTLLM_DSV41_ATTN_SPLITS");
+        if (splitEnv != nullptr && splitEnv[0] != '\0') {
+            splits = std::max(1, std::min(atoi(splitEnv), maxTiles));
+        } else {
+            // decode（token 数少）时候选维 split-K，把 block 数补到约 4 倍 SM 数
+            const int target = 4 * V41SmCount();
+            const long long base = (long long)tokens * headBlocks;
+            if (base > 0 && base < target && maxTiles > 1) {
+                splits = (int)std::min((long long)maxTiles, (target + base - 1) / base);
+                splits = std::max(1, std::min(splits, 32));
+            }
+        }
+        float *partAcc = nullptr, *partMx = nullptr, *partL = nullptr;
+        size_t partCount = 0;
+        if (splits > 1) {
+            partCount = (size_t)splits * tokens * heads;
+            partAcc = (float*)FastllmCudaMalloc(partCount * (kMmaDim + 2) * sizeof(float));
+            if (partAcc == nullptr) {
+                splits = 1;
+            } else {
+                partMx = partAcc + partCount * kMmaDim;
+                partL = partMx + partCount;
+            }
+        }
+        dim3 grid(tokens, headBlocks, splits);
+        V41SparseAttentionMmaKernel<<<grid, kMmaThreads, sizeof(V41MmaShared)>>>(
+            (const __nv_bfloat16*)q.cudaData, (const __nv_bfloat16*)chunkKV.cudaData,
+            hasRing && !ringFp8 ? (const __nv_bfloat16*)ringKV->cudaData : nullptr,
+            hasCmp && !cmpFp8 ? (const __nv_bfloat16*)compressedKV->cudaData : nullptr,
+            ringFp8 ? (const uint8_t*)ringKV->cudaData : nullptr,
+            cmpFp8 ? (const uint8_t*)compressedKV->cudaData : nullptr,
+            hasCmp ? (const int32_t*)cmpIdx->cudaData : nullptr,
+            (const float*)attnSink.cudaData, seqlen, heads, windowSize, cap, topWidth, startPos,
+            softmaxScale, (__nv_bfloat16*)output.cudaData, partAcc, partMx, partL);
+        if (splits > 1) {
+            V41SparseMergeKernel<<<tokens * heads, 128>>>(partAcc, partMx, partL, tokens, heads, splits,
+                                                          (__nv_bfloat16*)output.cudaData);
+            FastllmCudaFree(partAcc);
+        }
+        return V41CheckLaunch("SparseAttentionMma");
+    }
+
     if (q.dataType == DataType::BFLOAT16) {
         dim3 grid(bsz * seqlen, heads / kAttnHeadsPerBlock);
         V41SparseAttentionKernel<__nv_bfloat16><<<grid, kAttnThreads>>>(

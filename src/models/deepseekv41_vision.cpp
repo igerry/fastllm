@@ -29,14 +29,29 @@
 
 namespace fastllm {
     namespace {
-        int VisionDictInt(const WeightMap &weight, const std::string &key, int fallback) {
-            auto it = weight.dicts.find(key);
-            return it == weight.dicts.end() ? fallback : atoi(it->second.c_str());
+        // 真实 checkpoint 把视觉参数嵌在 config 的 vision_config 里（HF 命名，展平后为
+        // "vision_config.num_hidden_layers" 之类）；测试用的迷你模型写的是扁平的 "vision_xxx"。
+        // 两种都要认，优先 HF 命名。
+        const std::string *VisionDictFind(const WeightMap &weight, const std::string &hfKey,
+                                          const std::string &flatKey) {
+            auto it = weight.dicts.find("vision_config." + hfKey);
+            if (it != weight.dicts.end()) {
+                return &it->second;
+            }
+            it = weight.dicts.find(flatKey);
+            return it == weight.dicts.end() ? nullptr : &it->second;
         }
 
-        float VisionDictFloat(const WeightMap &weight, const std::string &key, float fallback) {
-            auto it = weight.dicts.find(key);
-            return it == weight.dicts.end() ? fallback : (float)atof(it->second.c_str());
+        int VisionDictInt(const WeightMap &weight, const std::string &hfKey,
+                          const std::string &flatKey, int fallback) {
+            const std::string *v = VisionDictFind(weight, hfKey, flatKey);
+            return v == nullptr ? fallback : atoi(v->c_str());
+        }
+
+        float VisionDictFloat(const WeightMap &weight, const std::string &hfKey,
+                              const std::string &flatKey, float fallback) {
+            const std::string *v = VisionDictFind(weight, hfKey, flatKey);
+            return v == nullptr ? fallback : (float)atof(v->c_str());
         }
 
         // 把张量搬到 CPU 并转成 FLOAT32
@@ -114,13 +129,13 @@ namespace fastllm {
     }
 
     void DeepSeekV41Model::InitVisionParams() {
-        vision_n_layers = VisionDictInt(this->weight, "vision_n_layers", 0);
-        vision_dim = VisionDictInt(this->weight, "vision_dim", 1024);
-        vision_n_heads = VisionDictInt(this->weight, "vision_n_heads", 16);
-        vision_inter_dim = VisionDictInt(this->weight, "vision_inter_dim", 2816);
-        vision_patch_size = VisionDictInt(this->weight, "vision_patch_size", 14);
-        vision_downsample_ratio = VisionDictInt(this->weight, "vision_downsample_ratio", 3);
-        vision_rope_theta = VisionDictFloat(this->weight, "vision_rope_theta", 10000.0f);
+        vision_n_layers = VisionDictInt(this->weight, "num_hidden_layers", "vision_n_layers", 0);
+        vision_dim = VisionDictInt(this->weight, "hidden_size", "vision_dim", 1024);
+        vision_n_heads = VisionDictInt(this->weight, "num_attention_heads", "vision_n_heads", 16);
+        vision_inter_dim = VisionDictInt(this->weight, "intermediate_size", "vision_inter_dim", 2816);
+        vision_patch_size = VisionDictInt(this->weight, "patch_size", "vision_patch_size", 14);
+        vision_downsample_ratio = VisionDictInt(this->weight, "downsample_ratio", "vision_downsample_ratio", 3);
+        vision_rope_theta = VisionDictFloat(this->weight, "rope_theta", "vision_rope_theta", 10000.0f);
         vision_norm_eps = 1e-6f;   // vision.py 的 RMSNorm 默认 eps
         if (!VisionEnabled()) {
             return;

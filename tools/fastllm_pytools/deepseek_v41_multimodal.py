@@ -31,21 +31,25 @@ def get_deepseek_v41_vision_config(model_config: Optional[Dict[str, Any]]) -> Di
     cfg = model_config or {}
     vision = cfg.get("vision_config") if isinstance(cfg.get("vision_config"), dict) else {}
 
-    def pick(key, default):
-        if key in cfg:
-            return cfg[key]
-        if key in vision:
-            return vision[key]
+    # 真实 checkpoint 用 HF 命名嵌在 vision_config 里，迷你测试模型用扁平的 vision_xxx，两种都要认
+    def pick(flat_key, hf_key, default):
+        if hf_key is not None and hf_key in vision:
+            return vision[hf_key]
+        if flat_key in cfg:
+            return cfg[flat_key]
+        if flat_key in vision:
+            return vision[flat_key]
         return default
 
+    max_wh_ratio = pick("vision_max_wh_ratio", "max_wh_ratio", None)
     return {
-        "vision_n_layers": int(pick("vision_n_layers", 0)),
-        "patch_size": int(pick("vision_patch_size", 14)),
-        "downsample_ratio": int(pick("vision_downsample_ratio", 3)),
-        "max_n_token": int(pick("vision_max_n_token", 1024)),
-        "min_pixels": int(pick("vision_min_pixels", 544 * 544)),
-        "max_wh_ratio": pick("vision_max_wh_ratio", None),
-        "image_token_id": int(pick("image_token_id", 129264)),
+        "vision_n_layers": int(pick("vision_n_layers", "num_hidden_layers", 0)),
+        "patch_size": int(pick("vision_patch_size", "patch_size", 14)),
+        "downsample_ratio": int(pick("vision_downsample_ratio", "downsample_ratio", 3)),
+        "max_n_token": int(pick("vision_max_n_token", "max_image_tokens", 1024)),
+        "min_pixels": int(pick("vision_min_pixels", "min_pixels", 544 * 544)),
+        "max_wh_ratio": max_wh_ratio,
+        "image_token_id": int(pick("image_token_id", None, 129264)),
     }
 
 

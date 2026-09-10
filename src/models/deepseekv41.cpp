@@ -997,6 +997,8 @@ namespace fastllm {
             // pendingMultimodal 由 ResponseContext 持有，重建时保留；图像嵌入需要重新编码
             state.imagesEncoded = false;
             state.imageSpans.clear();
+            // DSpark：滑窗与待发队列都是相对旧缓存的，一并丢弃
+            state.dspark.reset();
         }
     }
 

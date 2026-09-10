@@ -464,6 +464,198 @@ namespace {
         out[(uint64_t)t * m + j] = total;
     }
 
+
+    // ---------------- mma / ldmatrix 内联汇编封装（SM80+） ----------------
+
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800)
+    __device__ __forceinline__ uint32_t V41SmemAddr(const void *p) {
+        return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+    }
+
+    __device__ __forceinline__ void V41LdmX4(uint32_t (&r)[4], const void *addr) {
+        uint32_t s = V41SmemAddr(addr);
+        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
+                     : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(s));
+    }
+
+    __device__ __forceinline__ void V41LdmX2(uint32_t (&r)[2], const void *addr) {
+        uint32_t s = V41SmemAddr(addr);
+        asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+                     : "=r"(r[0]), "=r"(r[1]) : "r"(s));
+    }
+
+    __device__ __forceinline__ void V41LdmX2T(uint32_t (&r)[2], const void *addr) {
+        uint32_t s = V41SmemAddr(addr);
+        asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n"
+                     : "=r"(r[0]), "=r"(r[1]) : "r"(s));
+    }
+
+    __device__ __forceinline__ void V41MmaBf16(float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+                     "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
+                     : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+    }
+#endif
+
+    // ---------------- IndexerScore（BF16 mma 版本，SM80+） ----------------
+    //
+    // score[t][j] = sum_h relu(q[t][h] · k[j]) * w[t][h]
+    // k 没有 head 维（32 个 indexer head 共享同一份 key），因此 K tile 只装载一次，
+    // 循环 head 时只换 Q tile。一个 block 负责 kIdxBT 个 token x kIdxBJ 个候选。
+    // 因果可见范围之外（j >= (startPos + i + 1) / ratio）的整块直接写 -inf 跳过计算，
+    // prefill 时省掉一半左右的运算。
+
+    constexpr int kIdxBT = 64;                          // 每个 block 的 token 数
+    constexpr int kIdxBJ = 64;                          // 每个 block 的候选数
+    constexpr int kIdxDim = 128;                        // index_head_dim
+    constexpr int kIdxRowStride = kIdxDim + 8;
+    constexpr int kIdxMmaWarps = 8;
+    constexpr int kIdxMmaThreads = kIdxMmaWarps * 32;
+    constexpr int kIdxNPerWarp = kIdxBJ / 16;           // 每个 warp 负责的 n-tile 数（4）
+
+    struct V41IdxShared {
+        __nv_bfloat16 ks[kIdxBJ][kIdxRowStride];
+        __nv_bfloat16 qs[kIdxBT][kIdxRowStride];
+        float ws[kIdxBT];
+    };
+
+    __global__ void __launch_bounds__(kIdxMmaThreads)
+    V41IndexerScoreMmaKernel(const __nv_bfloat16 *q, const float *weights, const __nv_bfloat16 *k,
+                             int seqlen, int heads, int m, int ratio, int startPos, float *out) {
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800)
+        __shared__ V41IdxShared sh;
+        const int j0 = blockIdx.x * kIdxBJ;
+        const int i0 = blockIdx.y * kIdxBT;
+        const int b = blockIdx.z;
+        const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+        const int mTile = warp & 3;                     // 4 个 16 行的 token tile
+        const int nHalf = warp >> 2;                    // 每个 warp 负责 32 列候选
+
+        const int iMax = min(seqlen - 1, i0 + kIdxBT - 1);
+        const int visibleMax = ratio > 0 ? min(m, (startPos + iMax + 1) / ratio) : m;
+        if (j0 >= visibleMax) {
+            // 整块都在可见范围外：写 -inf，后续的 block 打分 / top-k 会按 visible 忽略它
+            for (int idx = threadIdx.x; idx < kIdxBT * kIdxBJ; idx += kIdxMmaThreads) {
+                int ii = idx / kIdxBJ, jj = idx % kIdxBJ;
+                if (i0 + ii < seqlen && j0 + jj < m) {
+                    out[((uint64_t)b * seqlen + i0 + ii) * m + j0 + jj] = -INFINITY;
+                }
+            }
+            return;
+        }
+
+        for (int v = threadIdx.x; v < kIdxBJ * (kIdxDim / 8); v += kIdxMmaThreads) {
+            int jj = v / (kIdxDim / 8), dv = v % (kIdxDim / 8);
+            if (j0 + jj < m) {
+                *((float4*)&sh.ks[jj][dv * 8]) =
+                    *((const float4*)(k + ((uint64_t)b * m + j0 + jj) * kIdxDim) + dv);
+            } else {
+                *((float4*)&sh.ks[jj][dv * 8]) = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+        }
+
+        const int aRow = mTile * 16 + ((lane >> 3) & 1) * 8 + (lane & 7);
+        const int aColBlk = (lane >> 4) * 8;
+        const int bRowBase = nHalf * 32 + ((lane >> 3) & 1) * 8 + (lane & 7);
+        const int bColBlk = (lane >> 4) * 8;
+
+        float acc[kIdxNPerWarp / 2][2][4];
+#pragma unroll
+        for (int n = 0; n < kIdxNPerWarp / 2; n++) {
+#pragma unroll
+            for (int u = 0; u < 2; u++) {
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    acc[n][u][e] = 0.0f;
+                }
+            }
+        }
+
+        for (int h = 0; h < heads; h++) {
+            __syncthreads();
+            for (int v = threadIdx.x; v < kIdxBT * (kIdxDim / 8); v += kIdxMmaThreads) {
+                int ii = v / (kIdxDim / 8), dv = v % (kIdxDim / 8);
+                if (i0 + ii < seqlen) {
+                    *((float4*)&sh.qs[ii][dv * 8]) =
+                        *((const float4*)(q + (((uint64_t)b * seqlen + i0 + ii) * heads + h) * kIdxDim) + dv);
+                } else {
+                    *((float4*)&sh.qs[ii][dv * 8]) = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                }
+            }
+            for (int ii = threadIdx.x; ii < kIdxBT; ii += kIdxMmaThreads) {
+                sh.ws[ii] = i0 + ii < seqlen ? weights[((uint64_t)b * seqlen + i0 + ii) * heads + h] : 0.0f;
+            }
+            __syncthreads();
+
+            float s[kIdxNPerWarp / 2][2][4];
+#pragma unroll
+            for (int n = 0; n < kIdxNPerWarp / 2; n++) {
+#pragma unroll
+                for (int u = 0; u < 2; u++) {
+#pragma unroll
+                    for (int e = 0; e < 4; e++) {
+                        s[n][u][e] = 0.0f;
+                    }
+                }
+            }
+#pragma unroll
+            for (int kk = 0; kk < kIdxDim; kk += 16) {
+                uint32_t a[4];
+                V41LdmX4(a, &sh.qs[aRow][kk + aColBlk]);
+#pragma unroll
+                for (int n = 0; n < kIdxNPerWarp / 2; n++) {
+                    uint32_t rb[4];
+                    V41LdmX4(rb, &sh.ks[bRowBase + n * 16][kk + bColBlk]);
+                    uint32_t b0[2] = {rb[0], rb[2]};
+                    uint32_t b1[2] = {rb[1], rb[3]};
+                    V41MmaBf16(s[n][0], a, b0);
+                    V41MmaBf16(s[n][1], a, b1);
+                }
+            }
+            const float w0 = sh.ws[mTile * 16 + (lane >> 2)];
+            const float w1 = sh.ws[mTile * 16 + (lane >> 2) + 8];
+#pragma unroll
+            for (int n = 0; n < kIdxNPerWarp / 2; n++) {
+#pragma unroll
+                for (int u = 0; u < 2; u++) {
+                    acc[n][u][0] += fmaxf(s[n][u][0], 0.0f) * w0;
+                    acc[n][u][1] += fmaxf(s[n][u][1], 0.0f) * w0;
+                    acc[n][u][2] += fmaxf(s[n][u][2], 0.0f) * w1;
+                    acc[n][u][3] += fmaxf(s[n][u][3], 0.0f) * w1;
+                }
+            }
+        }
+
+        const int row0 = i0 + mTile * 16 + (lane >> 2);
+        const int row1 = row0 + 8;
+        const int colBase = j0 + nHalf * 32 + (lane & 3) * 2;
+#pragma unroll
+        for (int n = 0; n < kIdxNPerWarp / 2; n++) {
+#pragma unroll
+            for (int u = 0; u < 2; u++) {
+                int col = colBase + n * 16 + u * 8;
+                if (col < m) {
+                    if (row0 < seqlen) {
+                        out[((uint64_t)b * seqlen + row0) * m + col] = acc[n][u][0];
+                    }
+                    if (row1 < seqlen) {
+                        out[((uint64_t)b * seqlen + row1) * m + col] = acc[n][u][2];
+                    }
+                }
+                if (col + 1 < m) {
+                    if (row0 < seqlen) {
+                        out[((uint64_t)b * seqlen + row0) * m + col + 1] = acc[n][u][1];
+                    }
+                    if (row1 < seqlen) {
+                        out[((uint64_t)b * seqlen + row1) * m + col + 1] = acc[n][u][3];
+                    }
+                }
+            }
+        }
+#endif
+    }
+
     // ---------------- radix select（k-th largest） ----------------
 
     __device__ __forceinline__ unsigned V41FloatKey(float f) {
@@ -806,36 +998,6 @@ namespace {
         int valid[kMmaNC];
     };
 
-#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800)
-    __device__ __forceinline__ uint32_t V41SmemAddr(const void *p) {
-        return static_cast<uint32_t>(__cvta_generic_to_shared(p));
-    }
-
-    __device__ __forceinline__ void V41LdmX4(uint32_t (&r)[4], const void *addr) {
-        uint32_t s = V41SmemAddr(addr);
-        asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                     : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(s));
-    }
-
-    __device__ __forceinline__ void V41LdmX2(uint32_t (&r)[2], const void *addr) {
-        uint32_t s = V41SmemAddr(addr);
-        asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
-                     : "=r"(r[0]), "=r"(r[1]) : "r"(s));
-    }
-
-    __device__ __forceinline__ void V41LdmX2T(uint32_t (&r)[2], const void *addr) {
-        uint32_t s = V41SmemAddr(addr);
-        asm volatile("ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0, %1}, [%2];\n"
-                     : "=r"(r[0]), "=r"(r[1]) : "r"(s));
-    }
-
-    __device__ __forceinline__ void V41MmaBf16(float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
-        asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
-                     "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};\n"
-                     : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-    }
-#endif
 
     __global__ void __launch_bounds__(kMmaThreads)
     V41SparseAttentionMmaKernel(const __nv_bfloat16 *q, const __nv_bfloat16 *chunkKV, const __nv_bfloat16 *ringKV,
@@ -1386,7 +1548,8 @@ extern "C" bool FastllmCudaDeepSeekV41Compress(const fastllm::Data &kv, const fa
 }
 
 extern "C" bool FastllmCudaDeepSeekV41IndexerScore(const fastllm::Data &q, const fastllm::Data &weights,
-                                                   const fastllm::Data &k, fastllm::Data &output) {
+                                                   const fastllm::Data &k, int ratio, int startPos,
+                                                   fastllm::Data &output) {
     if (!V41OnCuda(q) || !V41OnCuda(weights) || !V41OnCuda(k) || q.dims.size() != 4 || k.dims.size() != 3 ||
         q.dims[3] != 128 || k.dims[2] != 128 || weights.dataType != DataType::FLOAT32 ||
         (q.dataType != DataType::BFLOAT16 && q.dataType != DataType::FLOAT32) ||
@@ -1401,6 +1564,16 @@ extern "C" bool FastllmCudaDeepSeekV41IndexerScore(const fastllm::Data &q, const
     if (m == 0) {
         return true;
     }
+    // BF16 mma 快速路径（SM80+）；FASTLLM_DSV41_LEGACY_INDEXER=1 退回下面的标量 kernel
+    if (q.dataType == DataType::BFLOAT16 && k.dataType == DataType::BFLOAT16 && dim == kIdxDim &&
+        V41MmaSupported() && !V41EnvOn("FASTLLM_DSV41_LEGACY_INDEXER")) {
+        dim3 mmaGrid((m + kIdxBJ - 1) / kIdxBJ, (seqlen + kIdxBT - 1) / kIdxBT, bsz);
+        V41IndexerScoreMmaKernel<<<mmaGrid, kIdxMmaThreads>>>(
+            (const __nv_bfloat16*)q.cudaData, (const float*)weights.cudaData, (const __nv_bfloat16*)k.cudaData,
+            seqlen, heads, m, ratio, startPos, (float*)output.cudaData);
+        return V41CheckLaunch("IndexerScoreMma");
+    }
+
     dim3 grid((m + kIdxThreads - 1) / kIdxThreads, bsz * seqlen);
     size_t shared = (size_t)(heads * dim + heads) * sizeof(float);
     if (q.dataType == DataType::BFLOAT16 && k.dataType == DataType::BFLOAT16) {

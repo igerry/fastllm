@@ -86,6 +86,25 @@ ftllm server /path/to/DeepSeek-V4.1-Flash \
 - 内存需求：Engram 表约 200 GB + 路由专家（FP4）约 270 GB + 加载临时空间；
 - 首次启动会生成 `engram_meta.json`（约 1 分钟）并读入两张 Engram 表。
 
+### 实测（DeepSeek-V4.1-Flash 真实权重，2026-09-11）
+
+主机：EPYC 7C13（128 线程）+ 943 GB 内存 + 2 x RTX 3090 Ti（SM86，24 GB），权重在共享盘上（478 GB，48 个分片）。
+启动参数即上面的推荐配置（`--device cuda --moe_device numa --dtype float16 --chunked_prefill_size 4096 -t 64`）。
+
+| 指标 | 实测 |
+| --- | --- |
+| 加载耗时 | 约 7 分钟（含两张 Engram 表各 101.4 GB 读入内存） |
+| 显存 | 15.9 GB，单卡即可（稠密 FP8 反量化为 float16 后） |
+| 内存 | 524 GB 常驻 |
+| prefill | 2054 token 约 13 秒；33999 token 约 242 秒（约 140–160 token/s） |
+| decode | 单请求 1.7–4.4 token/s（路由专家在 CPU） |
+| 图像 | 448x336 的图 210 个 prompt token，端到端 6 秒 |
+
+decode 速度受限于当前朴素的稀疏注意力与 indexer kernel，以及 CPU 上的 FP4 专家；见文末的未完成项。
+
+行为验证（贪心解码）：中英文常识、算术、代码生成、逻辑推理均正确；34k token 上下文的"大海捞针"命中
+（该长度会激活候选块两级 top-k）；工具调用能正确产出 `tool_calls`；图像输入能正确描述图中的形状与颜色。
+
 ## 多请求与前缀缓存
 
 ### 批量 decode

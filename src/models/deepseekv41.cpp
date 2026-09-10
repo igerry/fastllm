@@ -267,7 +267,10 @@ namespace fastllm {
             if (pastKeyValues.empty()) {
                 return;
             }
-            int paddedLen = ((std::max(totalLen, 1) - 1) / 128 + 1) * 128;
+            // 通用调度器用 expansionDims 判断请求是否已激活，并在 decode 时读取
+            // expansionDims[1]；预留容量必须严格大于逻辑长度，否则 Expansion 不会
+            // 记录 expansionDims，调度器会越界访问。
+            int paddedLen = (std::max(totalLen, 1) / 128 + 1) * 128;
             std::vector<float> zeros((uint64_t)totalLen, 0.0f);
             for (int i = 0; i < std::min(blocks, (int)pastKeyValues.size()); i++) {
                 Data key(DataType::FLOAT32, {1, totalLen, 1}, zeros);

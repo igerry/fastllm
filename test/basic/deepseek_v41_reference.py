@@ -49,6 +49,8 @@ def parse_args():
     parser.add_argument("--index-topk", type=int, default=-1, help="覆盖 index_topk（不重新生成权重）")
     parser.add_argument("--no-fake-quant", action="store_true", help="两侧都关闭 FP8/FP4 伪量化，用于隔离实现误差")
     parser.add_argument("--experts", type=int, default=-1, help="生成时覆盖 n_routed_experts")
+    parser.add_argument("--perf-config", action="store_true",
+                        help="生成接近真实注意力尺寸的配置（64 头、窗口 128、top-k 512）用于测速")
     parser.add_argument("--chunked-prefill", type=int, default=-1, help="fastllm 分块 prefill 大小（测试 startPos>0 的多 token 前向）")
     parser.add_argument("--quant-format", default="bf16", choices=["bf16", "real"],
                         help="real: 按真实 checkpoint 的格式保存（稠密 FP8 32x32 + 路由专家 FP4 + 共享专家 FP8）")
@@ -611,11 +613,13 @@ def run_fastllm(args, prompt, vocab_size):
     if fargs.max_batch <= 0:
         fargs.max_batch = 1
     if fargs.tokens <= 0:
-        fargs.tokens = 256
+        fargs.tokens = 65536
     model = make_normal_llm_model(fargs)
     if args.fastllm_only_load:
         print("fastllm model loaded")
         return [], []
+    import time
+    t0 = time.time()
     input_array = (ctypes.c_int * len(prompt))(*prompt)
     handle = llm.fastllm_lib.launch_response_llm_model(
         model.model, len(prompt), input_array, ctypes.c_int(args.decode + 1), ctypes.c_int(0),
@@ -623,17 +627,30 @@ def run_fastllm(args, prompt, vocab_size):
         ctypes.c_bool(True), ctypes.c_int(0), None)
     logits_list, tokens = [], []
     buf = (ctypes.c_float * vocab_size)()
+    first = None
     while True:
         token_id = llm.fastllm_lib.fetch_response_logits_llm_model(model.model, handle, buf)
         if token_id < 0:
             break
+        if first is None:
+            first = time.time()
         tokens.append(int(token_id))
         logits_list.append(np.ctypeslib.as_array(buf).copy())
+    end = time.time()
+    if first is not None:
+        print("fastllm timing: prefill %d tokens in %.2fs, decode %d tokens in %.2fs (%.2f tok/s)" % (
+            len(prompt), first - t0, max(0, len(tokens) - 1), end - first,
+            (len(tokens) - 1) / max(1e-6, end - first)))
     return logits_list, tokens
 
 
 def main():
     args = parse_args()
+    if args.perf_config:
+        TINY.update(dict(n_layers=4, n_heads=64, o_groups=8, window_size=128, index_topk=512,
+                         compress_ratios=(0, 2, 1, 1), kv_source_layers=(1, 2), index_source_layers=(1, 2, 3),
+                         candidate_source_layer=2, candidate_topk_blocks=2048, candidate_block_size=8,
+                         index_n_heads=32, engram_layer_ids=(1,)))
     if args.experts > 0:
         TINY["n_routed_experts"] = args.experts
     if args.activated > 0:
@@ -668,7 +685,7 @@ def main():
 
     text = ("DeepSeek-V4.1-Flash is the first model of a new architecture family. It combines sliding window "
             "attention, cross-layer compressed KV sharing, a two-level sparse indexer, engram n-gram memory and "
-            "hyper-connections. 这是一个用于对齐测试的中英文混合提示词，包含数字 12345 与符号 !@#。") * 4
+            "hyper-connections. 这是一个用于对齐测试的中英文混合提示词，包含数字 12345 与符号 !@#。") * max(4, args.prefill // 60 + 1)
     prompt = tokenizer.encode(text)[: args.prefill]
     print("prompt tokens:", len(prompt))
 

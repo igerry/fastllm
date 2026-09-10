@@ -74,6 +74,11 @@ ftllm server /path/to/DeepSeek-V4.1-Flash \
 ```
 
 - 没有 FP8 tensor core 的 GPU（如 SM86）请使用 `--dtype float16`，稠密 FP8 权重会在加载时按 32x32 块 scale 反量化；
+- `--kv_cache_dtype fp8_e4m3` 让滑窗 KV 与压缩 KV 以 FP8 E4M3 + UE8M0 块 scale（每 32 个一组）存储，
+  每行 528 B（BF16 为 1024 B）。滑窗 KV 本身就在 FP8 网格上，存储无损；压缩 KV 为 FP4 网格，FP8 存储带来
+  不超过 2^-4 的相对舍入（迷你模型上开启伪量化时，与 BF16 存储的逐步 cos 相当）。默认仍为 BF16；
+- `ftllm` launcher 的自动配置按 config 计算 V4.1 的常驻内存下界（FP4 专家约 289 GB + Engram 表约 203 GB +
+  稠密部分），权重文件不全时也不会低估；主机内存不足以放下专家与 Engram 表时会退到 `moe_device=disk`；
 - 单路 CPU 机器可用 `--moe_device cpu`；
 - 内存需求：Engram 表约 200 GB + 路由专家（FP4）约 270 GB + 加载临时空间；
 - 首次启动会生成 `engram_meta.json`（约 1 分钟）并读入两张 Engram 表。
@@ -139,3 +144,4 @@ PYTHONPATH=build/tools python test/basic/deepseek_v41_reference.py \
 | `FASTLLM_DSV41_DISABLE_FAKE_QUANT` | 关闭 FP8 / FP4 伪量化（仅用于对齐调试） |
 | `FASTLLM_DSV41_DISABLE_CUDA_ROUTE` | 路由退回 CPU 参考实现 |
 | `FASTLLM_DSV41_DUMP_DIR` | 把每层中间张量写到该目录（对齐调试） |
+| `FASTLLM_DSV41_DISABLE_PREFIX_CACHE` 等 | 前缀缓存相关，见"多请求与前缀缓存" |

@@ -30,7 +30,9 @@
 
 #include "deepseekv4.h"
 
+#include <atomic>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -60,6 +62,52 @@ namespace fastllm {
         Data embeds;                      // CPU FLOAT32 [length, dim]
     };
 
+    // ==================== DSpark 投机解码 ====================
+    //
+    // mtp.0/1/2 是三个与主干同构的草稿层（compress_ratio 0，纯滑窗注意力，128 专家 top-3）。
+    // 它们的滑窗 KV 不来自草稿 token 自身，而来自目标模型 dspark_target_layer_ids 各层
+    // attention 输入（对 hc 份取均值）拼接后经 main_proj / main_norm 得到的 main_x，
+    // 因此每个已提交位置在草稿侧只有一行 KV。一次 proposal 用 noise token 填满
+    // block_size 个位置，逐位置产出候选 token（markov head 做 bigram 修正）与置信度。
+    //
+    // 草稿模型只影响接受率，不影响输出：所有候选都由目标模型逐个贪心比对，
+    // 第一个不匹配处截断，因此开启 DSpark 与关闭时的贪心输出完全一致。
+
+    // 草稿层的每层缓存
+    struct DeepSeekV41DsparkLayerCache {
+        Data windowKV;                // [1, windowSize, headDim] BF16 环形缓冲，row = pos % windowSize
+    };
+
+    struct DeepSeekV41DsparkState {
+        std::vector<DeepSeekV41DsparkLayerCache> layers;
+        int committed = 0;            // 已写入草稿滑窗的位置数（== 目标模型的 totalLen）
+        int filled = 0;               // 滑窗中连续有效的位置数（前缀缓存恢复后从 0 开始重新累积）
+        bool disabled = false;        // 该请求不适合投机（非贪心 / 图文 / 出错）
+        // 下一轮的候选：drafts[j] 是位置 committed + 1 + j 的候选 token，
+        // 只有下一次前向的起始位置为 committed 且首个 token 为 anchor 时才可用
+        std::vector<int> drafts;
+        std::vector<float> confidence;
+        int anchor = -1;
+        int anchorPos = -1;
+        // 已经校验通过、等待调度器逐个取走的 token：(期望的输入 token, 应返回的 token)
+        std::deque<std::pair<int, int> > pending;
+        uint64_t rounds = 0, proposed = 0, accepted = 0;
+    };
+
+    // 一次"校验前向"里需要额外记录的信息：延后的滑窗写入、压缩缓存的回滚点、
+    // 目标层的 main hidden，以及所有位置的贪心 token
+    struct DeepSeekV41SpecScratch {
+        bool captureMain = false;     // 采集 dspark_target_layer_ids 各层的 main hidden
+        bool deferWindow = false;     // 滑窗写入延后到接受长度确定之后
+        bool wantAllGreedy = false;   // head 对本片段的每个位置都出贪心 token
+        std::vector<Data> mainHidden;         // [目标层数]，每个 [1, seqlen, dim]
+        std::vector<Data> windowKV;           // [block_cnt]，本次前向的滑窗 KV（延后写入）
+        std::vector<Data> rawKV, rawScore;    // kv source 层：压缩器的原始输入流（含旧 rawTail）
+        std::vector<int> prevRawTail;         // kv source 层：前向之前的 rawTail 行数
+        std::vector<int> prevBlocks;          // kv source 层：前向之前的压缩块数
+        std::vector<int> greedy;              // wantAllGreedy 时每个位置的贪心 token
+    };
+
     struct DeepSeekV41RequestState {
         std::vector<DeepSeekV41LayerCache> layers;
         std::vector<int> engramHistory;   // 每个已处理 token 的压缩 id（图像 token 为 -1）
@@ -69,6 +117,8 @@ namespace fastllm {
         const std::map <std::string, std::vector <Data*> > *pendingMultimodal = nullptr;
         bool imagesEncoded = false;
         std::vector<DeepSeekV41ImageSpan> imageSpans;
+        // DSpark 草稿状态（首次 decode 时创建），随请求一起释放
+        std::shared_ptr<DeepSeekV41DsparkState> dspark;
     };
 
     // 前缀缓存的一条记录：某段 token 序列处理完后的完整请求状态（张量放在 CPU）
@@ -101,6 +151,8 @@ namespace fastllm {
         int startPos = 0;
         int seqlen = 0;
         int offset = 0;
+        // 非空时本片段处于 DSpark 校验 / 采集模式（见 DeepSeekV41SpecScratch）
+        DeepSeekV41SpecScratch *spec = nullptr;
     };
 
     // Engram 哈希元数据（由 tokenizer 归一化派生，Python 侧生成 JSON，此处加载）
@@ -126,6 +178,9 @@ namespace fastllm {
                 GetTensorMap(const std::vector<std::string> &tensorNames) override;
 
         void OnModelWeightsLoaded() override;
+
+        // V4.1 的 mtp.* 由本类自行解析（结构与 DeepSeek-V4 Flash 的内置 DSpark 不同）
+        bool UsesEmbeddedV4Dspark() const override { return false; }
 
         int Forward(
                 const Data &inputIds,
@@ -270,6 +325,20 @@ namespace fastllm {
                 std::vector<std::vector<float>*> *retLogits,
                 std::vector<std::pair<Data*, Data*> > &samplingPastKeyValues);
 
+        // ForwardSegments 的 DSpark 包装：打开 main hidden 采集，单片段且 allowSpeculate
+        // 时把候选拼进输入做一次校验，返回后按接受长度提交 / 回滚，并生成下一轮候选。
+        // DSpark 关闭（或请求不支持）时等价于直接调用 ForwardSegments。
+        std::vector<int> ForwardSegmentsWithDspark(
+                std::vector<DeepSeekV41Segment> &segments,
+                const Data &inputIds,
+                const Data *inputEmbeds,
+                const std::vector<int> *imageMask,
+                const std::vector<GenerationConfig> &generationConfigs,
+                const LastTokensManager &lastTokens,
+                std::vector<std::vector<float>*> *retLogits,
+                std::vector<std::pair<Data*, Data*> > &samplingPastKeyValues,
+                bool allowSpeculate);
+
         // 单序列前向：构造单个片段调用 ForwardSegments。inputEmbeds 非空时代替 embedding 查表，
         // imageMask 非空时（长度 seqlen，1 = 图像 token）Engram 置 -1 且路由改用 gate.bias_vl；
         // 两者为空且请求带多模态输入时，在此按位置编码 / 写入图像嵌入。
@@ -282,6 +351,48 @@ namespace fastllm {
                 std::vector <std::vector <float>*> *logits,
                 const Data *inputEmbeds,
                 const std::vector<int> *imageMask);
+
+        // -------- DSpark 投机解码（src/models/deepseekv41_dspark.cpp）--------
+        bool v41DsparkEnabled = false;
+        int v41DsparkTokens = 0;              // 每轮最多校验的 draft token 数（<= block size）
+        int v41DsparkBlockSize = 0;           // checkpoint 训练时的 block size
+        int v41DsparkLayers = 0;              // mtp.* 的层数（num_nextn_predict_layers）
+        int v41DsparkNoiseTokenId = -1;
+        int v41DsparkMarkovRank = 0;
+        int v41DsparkExperts = 0;             // dspark_n_routed_experts
+        int v41DsparkTopk = 0;                // dspark_num_experts_per_tok
+        float v41DsparkConfidenceThreshold = 0.0f;
+        std::vector<int> v41DsparkTargetLayerIds;
+        std::vector<char> v41IsDsparkTarget;  // [block_cnt]
+        std::vector<std::vector<Data*> > v41DsparkMoeWeights, v41DsparkMoeBiass;
+        std::atomic<long long> v41DsparkRounds{0};
+        std::atomic<long long> v41DsparkProposedTokens{0};
+        std::atomic<long long> v41DsparkAcceptedTokens{0};
+        std::atomic<long long> v41DsparkVerifyRounds{0};
+
+        void InitDsparkParams();
+        bool DsparkTensorNeeded(const std::string &name) const;
+        // 请求是否可以做投机解码（贪心、无 logits 输出、无工具约束、非图文）
+        bool DsparkSupportsRequest(const GenerationConfig &config,
+                                   const DeepSeekV41RequestState &state) const;
+        std::shared_ptr<DeepSeekV41DsparkState> GetOrCreateDsparkState(
+                DeepSeekV41RequestState &state, int startPos);
+        // 若队首的候选与本次输入一致，直接返回已经校验过的 token（不做前向），否则返回 -1
+        int DsparkTakePending(DeepSeekV41RequestState &state, const Data &inputIds, int seqlen);
+        // 若 state 有可用的候选，把 inputIds 扩展成 [anchor, draft...]，返回 draft 个数
+        int DsparkBuildVerifyInput(DeepSeekV41RequestState &state, const Data &inputIds,
+                                   int startPos, Data &verifyIds, std::vector<int> &drafts);
+        // 把本次前向的前 accept 个位置提交进各层缓存，其余回滚
+        void DsparkCommitPrefix(DeepSeekV41RequestState &state, DeepSeekV41SpecScratch &scratch,
+                                int startPos, int accept, int forwarded);
+        // 用 main hidden 更新草稿滑窗，并为下一轮生成候选
+        void DsparkAdvance(DeepSeekV41RequestState &state, DeepSeekV41SpecScratch &scratch,
+                           int startPos, int committed, int anchorToken);
+        // 三层草稿前向 + markov head + confidence head
+        void DsparkRunDraft(DeepSeekV41DsparkState &dspark, int anchorToken,
+                            std::vector<int> &tokens, std::vector<float> &confidence);
+        void DsparkBuildMoeWeights();
+        void DsparkReportStats();
 
         void LoadEngramMeta();
         void BuildEngramPrimes();

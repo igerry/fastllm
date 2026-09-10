@@ -233,6 +233,11 @@ namespace fastllm {
                               {{"windowSize", windowSize}, {"startPos", startPos}});
         }
 
+        // BF16 KV 行 -> FP8 E4M3 + UE8M0（每 32 个一组）的 INT8 行，用于 FP8 KV 缓存存储
+        void V41QuantizeKV(const Data &input, Data &output) {
+            V41Executor().Run("DeepSeekV41QuantizeKV", {{"input", (Data*)&input}, {"output", &output}}, {}, {});
+        }
+
         void V41WindowStore(const Data &chunkKV, Data &ring, int startPos, int windowSize) {
             V41Executor().Run("DeepSeekV41WindowStore", {
                 {"chunk", (Data*)&chunkKV}, {"ring", &ring}
@@ -1501,6 +1506,8 @@ namespace fastllm {
         }
         const bool single = numSegments == 1;
         const int seqlen = total;   // 拼接后的 token 总数
+        // --kv_cache_dtype fp8_e4m3：滑窗 KV 与压缩 KV 以 FP8 + UE8M0 块 scale 存储（默认 BF16）
+        const bool fp8KV = this->kvCacheDataType == DataType::FP8_E4M3;
 
         // ---- Engram 历史 ----
         std::vector<int> tokenIds = V41ReadTokenIds(inputIds);
@@ -1736,7 +1743,13 @@ namespace fastllm {
                                 V41AppendRows(cache.indexK, kIdx);
                             }
                             V41RotaryQuant(latent, rope, blockStart * ratio, ratio, false, 3, 16);
-                            V41AppendRows(cache.compressedKV, latent);
+                            if (fp8KV) {
+                                Data latent8;
+                                V41QuantizeKV(latent, latent8);
+                                V41AppendRows(cache.compressedKV, latent8);
+                            } else {
+                                V41AppendRows(cache.compressedKV, latent);
+                            }
                             cache.compressedBlocks += blocks;
                         }
                         const int rem = n - full;
@@ -1803,7 +1816,13 @@ namespace fastllm {
                         V41DumpTensor(cache.windowKV, tag + "_ring" + dumpSuffix);
                     }
                 }
-                V41WindowStore(*kvSeg, cache.windowKV, startPos, window_size);
+                if (fp8KV) {
+                    Data kvSeg8;
+                    V41QuantizeKV(*kvSeg, kvSeg8);
+                    V41WindowStore(kvSeg8, cache.windowKV, startPos, window_size);
+                } else {
+                    V41WindowStore(*kvSeg, cache.windowKV, startPos, window_size);
+                }
                 V41RotaryQuant(*attnOutSeg, rope, startPos, 1, true, 0, 32);
                 cache.totalLen += segLen;
             }
@@ -1992,12 +2011,14 @@ namespace fastllm {
         // （压缩 KV + indexer key，均为 BF16；滑窗缓存长度固定，不计入），
         // 折算成 kvCacheDataType 的元素数供调度器估算上下文预算。
         long long bytesPerToken = 0;
+        const long long kvRowBytes = this->kvCacheDataType == DataType::FP8_E4M3 ?
+                                     (long long)head_dim_full + head_dim_full / 32 : (long long)head_dim_full * 2;
         for (int layer = 0; layer < block_cnt; layer++) {
             if (!isKvSource[layer]) {
                 continue;
             }
             int ratio = std::max(1, compress_ratios[layer]);
-            bytesPerToken += (long long)head_dim_full * 2 / ratio;
+            bytesPerToken += kvRowBytes / ratio;
             if (isIndexSource[layer]) {
                 bytesPerToken += (long long)index_head_dim * 2 / ratio;
             }

@@ -1302,6 +1302,7 @@ class model:
                         self.hf_tokenizer.chat_template = chat_template
                         self.force_chat_template = True
                 skip_tokenizer = self._has_hf_chat_template()
+                self._prepare_deepseek_v41_engram_meta(path)
                 if model_json != "":
                     self.model = fastllm_lib.create_llm_model_fromhf_with_config(
                         path.encode(), fastllm_data_type_dict[dtype], int4g_groupcnt,
@@ -1557,7 +1558,42 @@ class model:
             enable_thinking=enable_thinking,
         )
 
+    def _prepare_deepseek_v41_engram_meta(self, path: str) -> None:
+        """DeepSeek-V4.1 的 Engram 哈希依赖 tokenizer 归一化派生的 token 映射，
+        C++ 侧在加载时读取 engram_meta.json；这里在模型创建前保证它存在。"""
+        config_path = os.path.join(path, "config.json")
+        if not os.path.isfile(config_path):
+            return
+        try:
+            with open(config_path, "r", encoding="utf-8") as f:
+                config = json.load(f)
+        except Exception:
+            return
+        model_type = str(config.get("model_type", ""))
+        if model_type not in ("deepseek_v41", "deepseek_v41_text"):
+            return
+        if os.environ.get("FASTLLM_DSV41_ENGRAM_META"):
+            return
+        try:
+            from ftllm.deepseek_v41_engram import ensure_engram_meta
+            meta_path = ensure_engram_meta(path)
+            os.environ["FASTLLM_DSV41_ENGRAM_META"] = meta_path
+        except Exception as e:
+            print("[ftllm] warning: failed to prepare DeepSeek-V4.1 engram meta:", e)
+
+    def _is_deepseek_v41(self) -> bool:
+        if self._get_architecture() == "DeepseekV41ForCausalLM":
+            return True
+        try:
+            mt = self.config.get("model_type", "") if isinstance(getattr(self, "config", None), dict) else ""
+            return str(mt) in ("deepseek_v41", "deepseek_v41_text")
+        except Exception:
+            return False
+
     def _is_deepseek_v4(self) -> bool:
+        """DeepSeek-V4 系列（含 V4.1）：共用 encoding 风格的 prompt 渲染与工具调用处理。"""
+        if self._is_deepseek_v41():
+            return True
         if self._get_architecture() == "DeepseekV4ForCausalLM":
             return True
         try:
@@ -1565,6 +1601,14 @@ class model:
             return str(mt) == "deepseek_v4"
         except Exception:
             return False
+
+    def _deepseek_encode_messages(self):
+        """返回与当前模型版本匹配的官方 encode_messages（V4.1 的 DSML 标签与 V4 不同）。"""
+        if self._is_deepseek_v41():
+            from ftllm.encoding_dsv41 import encode_messages
+        else:
+            encode_messages = self._deepseek_encode_messages()
+        return encode_messages
 
     def _uses_hf_deepseek_v4_tokenizer(self) -> bool:
         """Use the checkpoint tokenizer after rendering the official V4 prompt.
@@ -1666,7 +1710,7 @@ class model:
 
         # DeepSeek-V4 系列模型未提供 Jinja chat_template，使用官方 encoding_dsv4 编码
         if (self._is_deepseek_v4() and not self.force_chat_template):
-            from ftllm.encoding_dsv4 import encode_messages
+            encode_messages = self._deepseek_encode_messages()
             thinking_mode = "thinking" if self.enable_thinking else "chat"
             return encode_messages(self._build_messages(query, history), thinking_mode=thinking_mode)
 
@@ -1928,7 +1972,7 @@ class model:
         except:
             architecture = ""
         if self._uses_hf_deepseek_v4_tokenizer():
-            from ftllm.encoding_dsv4 import encode_messages
+            encode_messages = self._deepseek_encode_messages()
             thinking_mode = "thinking" if enable_thinking else "chat"
             rendered_conversation = self._inject_deepseek_v4_tools(
                 copy.deepcopy(conversation), tools)
@@ -2031,7 +2075,7 @@ class model:
             return len(input_ids)
         else:
             if self._is_deepseek_v4() and not self.force_chat_template:
-                from ftllm.encoding_dsv4 import encode_messages
+                encode_messages = self._deepseek_encode_messages()
                 thinking_mode = "thinking" if enable_thinking else "chat"
                 prompt = encode_messages(conversation, thinking_mode=thinking_mode)
             elif self._is_qwen35():
@@ -2193,7 +2237,7 @@ class model:
                 prompt = ""
                 if (conversation != None and len(conversation) != 0):
                     if self._uses_hf_deepseek_v4_tokenizer():
-                        from ftllm.encoding_dsv4 import encode_messages
+                        encode_messages = self._deepseek_encode_messages()
                         thinking_mode = (
                             "thinking" if self.enable_thinking else "chat")
                         prompt = encode_messages(
@@ -2236,7 +2280,7 @@ class model:
                     prompt = self._render_qwen35_text_prompt(
                         conversation, add_generation_prompt)
                 elif self._is_deepseek_v4() and not self.force_chat_template:
-                    from ftllm.encoding_dsv4 import encode_messages
+                    encode_messages = self._deepseek_encode_messages()
                     thinking_mode = "thinking" if self.enable_thinking else "chat"
                     prompt = encode_messages(conversation, thinking_mode=thinking_mode)
                 else:
@@ -2533,7 +2577,7 @@ class model:
                     input = pending_text_input_token_cache["input_ids"]
                 elif (conversation != None and len(conversation) != 0):
                     if self._uses_hf_deepseek_v4_tokenizer():
-                        from ftllm.encoding_dsv4 import encode_messages
+                        encode_messages = self._deepseek_encode_messages()
                         thinking_mode = (
                             "thinking" if enable_thinking else "chat")
                         rendered_conversation = self._inject_deepseek_v4_tools(
@@ -2591,7 +2635,7 @@ class model:
                     prompt = self._render_qwen35_text_prompt(
                         conversation, add_generation_prompt, enable_thinking)
                 elif self._is_deepseek_v4() and not self.force_chat_template:
-                    from ftllm.encoding_dsv4 import encode_messages
+                    encode_messages = self._deepseek_encode_messages()
                     thinking_mode = "thinking" if enable_thinking else "chat"
                     conversation = self._inject_deepseek_v4_tools(conversation, tools)
                     prompt = encode_messages(conversation, thinking_mode=thinking_mode)

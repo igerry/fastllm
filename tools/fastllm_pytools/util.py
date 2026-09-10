@@ -721,6 +721,7 @@ def _is_moe_architecture(architecture: str, model_type: str = "", text_model_typ
         "DeepseekV3ForCausalLM",
         "DeepseekV2ForCausalLM",
         "DeepseekV4ForCausalLM",
+        "DeepseekV41ForCausalLM",
         "Qwen3MoeForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
         "MiniMaxM1ForCausalLM",
@@ -740,11 +741,11 @@ def _is_moe_architecture(architecture: str, model_type: str = "", text_model_typ
         "Dots3NoteForCausalLM",
         "Glm5NextForConditionalGeneration",
     ] or model_type in [
-        "deepseek_v4", "glm_moe_dsa", "qwen3_5_moe", "hy_v3", "laguna",
+        "deepseek_v4", "deepseek_v41", "glm_moe_dsa", "qwen3_5_moe", "hy_v3", "laguna",
         "kimi_k3", "dots3_note", "glm5_next", "glm5_next_text", "qwen4_exp",
         "qwen3_8_flash_next",
     ] or text_model_type in [
-        "qwen3_5_moe_text", "glm5_next_text", "qwen4_exp_text",
+        "deepseek_v41_text", "qwen3_5_moe_text", "glm5_next_text", "qwen4_exp_text",
         "qwen3_8_flash_next_text",
     ])
 

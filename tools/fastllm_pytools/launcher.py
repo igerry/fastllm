@@ -123,6 +123,8 @@ MOE_MODEL_TYPES = frozenset({
     "deepseek_v2",
     "deepseek_v3",
     "deepseek_v4",
+    "deepseek_v41",
+    "deepseek_v41_text",
     "dots3_note",
     "glm5_next",
     "glm5_next_text",

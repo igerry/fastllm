@@ -1,5 +1,6 @@
 import ctypes
 import concurrent.futures
+import functools
 import math
 import os
 import glob
@@ -1602,12 +1603,19 @@ class model:
         except Exception:
             return False
 
-    def _deepseek_encode_messages(self):
-        """返回与当前模型版本匹配的官方 encode_messages（V4.1 的 DSML 标签与 V4 不同）。"""
+    def _deepseek_encode_messages(self, reasoning_effort = None):
+        """返回与当前模型版本匹配的官方 encode_messages（V4.1 的 DSML 标签与 V4 不同）。
+
+        V4.1 额外支持数值 reasoning effort（1-100 或 low/high/max），由服务端
+        透传进来；V4 的 encode_messages 没有这个参数，忽略即可。
+        """
         if self._is_deepseek_v41():
             from ftllm.encoding_dsv41 import encode_messages
-        else:
-            encode_messages = self._deepseek_encode_messages()
+            if reasoning_effort is not None:
+                return functools.partial(
+                    encode_messages, reasoning_effort = reasoning_effort)
+            return encode_messages
+        from ftllm.encoding_dsv4 import encode_messages
         return encode_messages
 
     def _uses_hf_deepseek_v4_tokenizer(self) -> bool:
@@ -1972,7 +1980,7 @@ class model:
         except:
             architecture = ""
         if self._uses_hf_deepseek_v4_tokenizer():
-            encode_messages = self._deepseek_encode_messages()
+            encode_messages = self._deepseek_encode_messages(thinking_effort)
             thinking_mode = "thinking" if enable_thinking else "chat"
             rendered_conversation = self._inject_deepseek_v4_tools(
                 copy.deepcopy(conversation), tools)
@@ -2577,7 +2585,8 @@ class model:
                     input = pending_text_input_token_cache["input_ids"]
                 elif (conversation != None and len(conversation) != 0):
                     if self._uses_hf_deepseek_v4_tokenizer():
-                        encode_messages = self._deepseek_encode_messages()
+                        encode_messages = self._deepseek_encode_messages(
+                            thinking_effort)
                         thinking_mode = (
                             "thinking" if enable_thinking else "chat")
                         rendered_conversation = self._inject_deepseek_v4_tools(
@@ -2635,7 +2644,8 @@ class model:
                     prompt = self._render_qwen35_text_prompt(
                         conversation, add_generation_prompt, enable_thinking)
                 elif self._is_deepseek_v4() and not self.force_chat_template:
-                    encode_messages = self._deepseek_encode_messages()
+                    encode_messages = self._deepseek_encode_messages(
+                        thinking_effort)
                     thinking_mode = "thinking" if enable_thinking else "chat"
                     conversation = self._inject_deepseek_v4_tools(conversation, tools)
                     prompt = encode_messages(conversation, thinking_mode=thinking_mode)

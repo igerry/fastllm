@@ -55,6 +55,31 @@ namespace fastllm {
         std::vector<DeepSeekV41LayerCache> layers;
         std::vector<int> engramHistory;   // 每个已处理 token 的压缩 id（图像 token 为 -1）
         int totalLen = 0;
+        int restoredLen = 0;              // 由前缀缓存恢复的 token 数（0 表示全新请求）
+    };
+
+    // 前缀缓存的一条记录：某段 token 序列处理完后的完整请求状态（张量放在 CPU）
+    struct DeepSeekV41HistoryMemory {
+        std::vector<int> tokens;          // 已经进入模型的 token（长度 == totalLen）
+        int totalLen = 0;
+        std::vector<DeepSeekV41LayerCache> layers;
+        std::vector<int> engramHistory;
+        long long flushTime = 0;
+        int recordTimes = 0;
+    };
+
+    struct DeepSeekV41HistoryCacheManager {
+        std::mutex locker;
+        int maxRecordNum = 8;
+        long long flushTime = 0;
+        // Data 没有深拷贝赋值，记录一律通过 shared_ptr 持有，避免隐式拷贝造成别名
+        std::map<std::vector<int>, std::shared_ptr<DeepSeekV41HistoryMemory> > memorys;
+
+        void Record(const std::shared_ptr<DeepSeekV41HistoryMemory> &memory);
+        // 按公共前缀长度从长到短列出候选（相同长度时记录更短的在前，更容易满足截断约束）；
+        // 可截断性由模型侧检查
+        std::vector<std::pair<std::shared_ptr<DeepSeekV41HistoryMemory>, int> > GetCandidates(
+                const std::vector<int> &inputTokens);
     };
 
     // 一次前向中的一个序列片段：属于哪个请求、从哪个位置开始、多少个 token、在拼接输入中的偏移
@@ -163,12 +188,22 @@ namespace fastllm {
         std::mutex v41StateMutex;
         std::map<const void*, std::shared_ptr<DeepSeekV41RequestState> > v41States;
         std::map<const void*, std::shared_ptr<DeepSeekV41RequestState> > v41StatesByFirstKey;
+        std::shared_ptr<DeepSeekV41RequestState> v41PendingRestoredState;   // TryRestoreHistoryCache 产生，
+                                                                             // OnResponseContextCreated 接管
+        DeepSeekV41HistoryCacheManager v41HistoryCache;
 
         std::shared_ptr<DeepSeekV41RequestState> GetOrCreateState(
                 std::vector<std::pair<Data, Data> > &pastKeyValues, bool reset);
         std::shared_ptr<DeepSeekV41RequestState> GetStateByFirstKey(const Data *firstKey);
         void RegisterState(const void *vectorKey, const void *firstKey,
                            const std::shared_ptr<DeepSeekV41RequestState> &state);
+
+        // 前缀缓存：把请求状态快照到 CPU / 从快照恢复前 hitLen 个 token 的状态
+        std::shared_ptr<DeepSeekV41HistoryMemory> SnapshotState(const DeepSeekV41RequestState &state,
+                                                                const std::vector<int> &allTokens);
+        std::shared_ptr<DeepSeekV41RequestState> RestoreState(const DeepSeekV41HistoryMemory &memory, int hitLen);
+        // 检查快照能否截断到 len 个 token（滑窗环形缓存与压缩尾块的约束）
+        bool CanTruncateHistory(const DeepSeekV41HistoryMemory &memory, int len) const;
 
         // 实际的前向：多个序列片段拼接成一个 token 流，Linear / MoE / Engram 查表按整批执行，
         // RoPE、压缩、indexer、稀疏注意力按片段分别执行。

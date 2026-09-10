@@ -933,6 +933,7 @@ namespace fastllm {
             state.layers.resize(blockCnt);
             state.engramHistory.clear();
             state.totalLen = 0;
+            state.restoredLen = 0;
         }
     }
 
@@ -981,12 +982,17 @@ namespace fastllm {
         const void *firstKey = context->pastKeyValues.empty() ? nullptr : (const void*)&context->pastKeyValues[0].first;
         std::lock_guard<std::mutex> guard(v41StateMutex);
         std::shared_ptr<DeepSeekV41RequestState> state;
-        auto existing = v41States.find(key);
-        if (existing != v41States.end()) {
-            state = existing->second;
+        if (v41PendingRestoredState) {
+            state = v41PendingRestoredState;
+            v41PendingRestoredState.reset();
         } else {
-            state = std::make_shared<DeepSeekV41RequestState>();
-            state->layers.resize(block_cnt);
+            auto existing = v41States.find(key);
+            if (existing != v41States.end()) {
+                state = existing->second;
+            } else {
+                state = std::make_shared<DeepSeekV41RequestState>();
+                state->layers.resize(block_cnt);
+            }
         }
         RegisterState(key, firstKey, state);
     }
@@ -1002,17 +1008,298 @@ namespace fastllm {
         }
     }
 
+    // ==================== 前缀缓存 ====================
+
+    namespace {
+        bool V41PrefixCacheDisabled() {
+            static const bool disabled = V41EnvFlag("FASTLLM_DSV41_DISABLE_PREFIX_CACHE");
+            return disabled;
+        }
+
+        bool V41PrefixCacheDebug() {
+            static const bool debug = V41EnvFlag("FASTLLM_DSV41_PREFIX_CACHE_DEBUG");
+            return debug;
+        }
+
+        int V41EnvInt(const char *name, int fallback) {
+            const char *v = std::getenv(name);
+            if (v == nullptr || v[0] == '\0') {
+                return fallback;
+            }
+            return atoi(v);
+        }
+
+        // 快照：深拷贝到 CPU（保留 expansion 容量，restore 后可继续追加）
+        void V41SnapshotTensor(Data &dst, const Data &src) {
+            if (src.dims.size() == 0 || src.Count(0) == 0) {
+                return;
+            }
+            dst.CopyFrom(src);
+            dst.ToDevice(DataDevice::CPU);
+        }
+
+        // 恢复：CPU -> CPU 深拷贝，随后由执行器在首次使用时搬到计算设备
+        void V41RestoreTensor(Data &dst, const Data &src) {
+            if (src.dims.size() == 0 || src.Count(0) == 0) {
+                return;
+            }
+            dst.CopyFrom(src);
+            dst.SetKVCache();
+        }
+    }
+
+    void DeepSeekV41HistoryCacheManager::Record(const std::shared_ptr<DeepSeekV41HistoryMemory> &memory) {
+        if (!memory || memory->totalLen <= 0 || (int)memory->tokens.size() != memory->totalLen) {
+            return;
+        }
+        std::lock_guard<std::mutex> guard(this->locker);
+        int commonMax = V41EnvInt("FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS", this->maxRecordNum);
+        this->maxRecordNum = std::max(1, V41EnvInt("FASTLLM_DSV41_PREFIX_CACHE_MAX_RECORDS", commonMax));
+        auto old = this->memorys.find(memory->tokens);
+        if (old != this->memorys.end()) {
+            memory->recordTimes = old->second->recordTimes + 1;
+            memory->flushTime = ++this->flushTime;
+            old->second = memory;
+            return;
+        }
+        while ((int)this->memorys.size() >= this->maxRecordNum) {
+            auto eraseIt = this->memorys.end();
+            long long minFlushTime = (1LL << 60);
+            for (auto it = this->memorys.begin(); it != this->memorys.end(); ++it) {
+                if (it->second->flushTime < minFlushTime) {
+                    minFlushTime = it->second->flushTime;
+                    eraseIt = it;
+                }
+            }
+            if (eraseIt == this->memorys.end()) {
+                break;
+            }
+            this->memorys.erase(eraseIt);
+        }
+        memory->recordTimes = 1;
+        memory->flushTime = ++this->flushTime;
+        this->memorys[memory->tokens] = memory;
+    }
+
+    std::vector<std::pair<std::shared_ptr<DeepSeekV41HistoryMemory>, int> >
+    DeepSeekV41HistoryCacheManager::GetCandidates(const std::vector<int> &inputTokens) {
+        std::vector<std::pair<std::shared_ptr<DeepSeekV41HistoryMemory>, int> > candidates;
+        std::lock_guard<std::mutex> guard(this->locker);
+        // 至少留一个 token 给本次前向
+        const int maxLen = (int)inputTokens.size() - 1;
+        for (auto &it : this->memorys) {
+            const std::vector<int> &tokens = it.first;
+            int limit = std::min(maxLen, (int)tokens.size());
+            int len = 0;
+            while (len < limit && tokens[len] == inputTokens[len]) {
+                len++;
+            }
+            if (len > 0) {
+                candidates.push_back({it.second, len});
+            }
+        }
+        std::stable_sort(candidates.begin(), candidates.end(),
+                         [](const std::pair<std::shared_ptr<DeepSeekV41HistoryMemory>, int> &a,
+                            const std::pair<std::shared_ptr<DeepSeekV41HistoryMemory>, int> &b) {
+                             if (a.second != b.second) {
+                                 return a.second > b.second;
+                             }
+                             return a.first->totalLen < b.first->totalLen;
+                         });
+        return candidates;
+    }
+
+    bool DeepSeekV41Model::CanTruncateHistory(const DeepSeekV41HistoryMemory &memory, int len) const {
+        const int total = memory.totalLen;
+        if (len <= 0 || len > total) {
+            return false;
+        }
+        // 滑窗环形缓存只保留最后 window_size 个位置；截断到 len 后需要 [len - W + 1, len) 仍然完整
+        if (std::max(0, len - window_size + 1) < std::max(0, total - window_size)) {
+            return false;
+        }
+        // 压缩 KV：凑不满一组的原始尾块只在 len == total 时可用
+        for (int layer : kv_source_layer_ids) {
+            int ratio = compress_ratios[layer];
+            if (ratio > 1 && len % ratio != 0 && len != total) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    std::shared_ptr<DeepSeekV41HistoryMemory> DeepSeekV41Model::SnapshotState(
+            const DeepSeekV41RequestState &state, const std::vector<int> &allTokens) {
+        const int totalLen = state.totalLen;
+        if (totalLen <= 0 || (int)allTokens.size() < totalLen || (int)state.layers.size() != block_cnt) {
+            return nullptr;
+        }
+        if (!engram_layer_ids.empty() && (int)state.engramHistory.size() < totalLen) {
+            return nullptr;
+        }
+        auto memory = std::make_shared<DeepSeekV41HistoryMemory>();
+        memory->totalLen = totalLen;
+        memory->tokens.assign(allTokens.begin(), allTokens.begin() + totalLen);
+        memory->engramHistory.assign(state.engramHistory.begin(),
+                                     state.engramHistory.begin() + std::min((int)state.engramHistory.size(), totalLen));
+        memory->layers.resize(block_cnt);
+        for (int layer = 0; layer < block_cnt; layer++) {
+            const DeepSeekV41LayerCache &src = state.layers[layer];
+            DeepSeekV41LayerCache &dst = memory->layers[layer];
+            if (src.totalLen != totalLen) {
+                return nullptr;
+            }
+            dst.totalLen = src.totalLen;
+            dst.compressedBlocks = src.compressedBlocks;
+            dst.rawTail = src.rawTail;
+            V41SnapshotTensor(dst.windowKV, src.windowKV);
+            if (isKvSource[layer]) {
+                V41SnapshotTensor(dst.compressedKV, src.compressedKV);
+                V41SnapshotTensor(dst.indexK, src.indexK);
+                if (src.rawTail > 0) {
+                    V41SnapshotTensor(dst.rawTailKV, src.rawTailKV);
+                    V41SnapshotTensor(dst.rawTailScore, src.rawTailScore);
+                }
+            }
+        }
+        return memory;
+    }
+
+    std::shared_ptr<DeepSeekV41RequestState> DeepSeekV41Model::RestoreState(
+            const DeepSeekV41HistoryMemory &memory, int len) {
+        auto state = std::make_shared<DeepSeekV41RequestState>();
+        state->layers.resize(block_cnt);
+        state->totalLen = len;
+        state->restoredLen = len;
+        if (!engram_layer_ids.empty()) {
+            state->engramHistory.assign(memory.engramHistory.begin(), memory.engramHistory.begin() + len);
+        }
+        const bool exact = len == memory.totalLen;
+        for (int layer = 0; layer < block_cnt; layer++) {
+            const DeepSeekV41LayerCache &src = memory.layers[layer];
+            DeepSeekV41LayerCache &dst = state->layers[layer];
+            dst.totalLen = len;
+            // 环形缓存整体恢复；位置 >= len 的行不会被读取，之后会被新 token 覆盖
+            V41RestoreTensor(dst.windowKV, src.windowKV);
+            if (!isKvSource[layer]) {
+                continue;
+            }
+            const int ratio = compress_ratios[layer];
+            const int blocks = len / ratio;
+            dst.compressedBlocks = blocks;
+            if (blocks > 0) {
+                V41RestoreTensor(dst.compressedKV, src.compressedKV);
+                if (dst.compressedKV.dims.size() == 3 && dst.compressedKV.dims[1] > blocks) {
+                    dst.compressedKV.Resize({dst.compressedKV.dims[0], blocks, dst.compressedKV.dims[2]});
+                }
+                if (isIndexSource[layer]) {
+                    V41RestoreTensor(dst.indexK, src.indexK);
+                    if (dst.indexK.dims.size() == 3 && dst.indexK.dims[1] > blocks) {
+                        dst.indexK.Resize({dst.indexK.dims[0], blocks, dst.indexK.dims[2]});
+                    }
+                }
+            }
+            if (exact && src.rawTail > 0) {
+                dst.rawTail = src.rawTail;
+                V41RestoreTensor(dst.rawTailKV, src.rawTailKV);
+                V41RestoreTensor(dst.rawTailScore, src.rawTailScore);
+            } else {
+                dst.rawTail = 0;
+            }
+        }
+        return state;
+    }
+
     void DeepSeekV41Model::TryRecordResponseContext(ResponseContext *context) {
-        (void)context;
+        if (context == nullptr || !this->saveHistoryChat || V41PrefixCacheDisabled()) {
+            return;
+        }
+        std::shared_ptr<DeepSeekV41RequestState> state;
+        {
+            std::lock_guard<std::mutex> guard(v41StateMutex);
+            auto it = v41States.find((const void*)&context->pastKeyValues);
+            if (it != v41States.end()) {
+                state = it->second;
+            }
+        }
+        if (!state || state->totalLen <= 0 || context->allTokens.empty()) {
+            return;
+        }
+        auto memory = SnapshotState(*state, context->allTokens);
+        if (!memory) {
+            if (V41PrefixCacheDebug()) {
+                printf("[fastllm-dsv41-prefix-cache] skip record: total_len=%d all_tokens=%d\n",
+                       state->totalLen, (int)context->allTokens.size());
+                fflush(stdout);
+            }
+            return;
+        }
+        v41HistoryCache.Record(memory);
+        if (V41PrefixCacheDebug()) {
+            printf("[fastllm-dsv41-prefix-cache] record tokens=%d records=%d\n",
+                   memory->totalLen, (int)v41HistoryCache.memorys.size());
+            fflush(stdout);
+        }
     }
 
     bool DeepSeekV41Model::TryRestoreHistoryCache(std::vector<int> &inputTokens, int &cacheLen) {
-        (void)inputTokens;
         cacheLen = 0;
-        return false;
+        if (!this->saveHistoryChat || V41PrefixCacheDisabled()) {
+            return false;
+        }
+        const int minTokens = std::max(1, V41EnvInt("FASTLLM_DSV41_PREFIX_CACHE_MIN_TOKENS", 16));
+        if ((int)inputTokens.size() <= minTokens) {
+            return false;
+        }
+        auto candidates = v41HistoryCache.GetCandidates(inputTokens);
+        std::shared_ptr<DeepSeekV41HistoryMemory> memory;
+        int hitLen = 0, len = 0;
+        for (auto &candidate : candidates) {
+            if (candidate.second < minTokens) {
+                break;
+            }
+            // 截断约束（滑窗 / 压缩尾块）最多需要回退几个 token
+            int cur = candidate.second;
+            for (int step = 0; step < 4 && cur >= minTokens && !CanTruncateHistory(*candidate.first, cur); step++) {
+                cur--;
+            }
+            if (cur >= minTokens && CanTruncateHistory(*candidate.first, cur)) {
+                memory = candidate.first;
+                hitLen = candidate.second;
+                len = cur;
+                break;
+            }
+        }
+        if (!memory) {
+            if (V41PrefixCacheDebug()) {
+                printf("[fastllm-dsv41-prefix-cache] miss input_tokens=%d candidates=%d best_lcp=%d\n",
+                       (int)inputTokens.size(), (int)candidates.size(),
+                       candidates.empty() ? 0 : candidates[0].second);
+                fflush(stdout);
+            }
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> guard(v41HistoryCache.locker);
+            memory->flushTime = ++v41HistoryCache.flushTime;
+        }
+        auto state = RestoreState(*memory, len);
+        {
+            std::lock_guard<std::mutex> guard(v41StateMutex);
+            v41PendingRestoredState = state;
+        }
+        inputTokens.erase(inputTokens.begin(), inputTokens.begin() + len);
+        cacheLen = len;
+        if (V41PrefixCacheDebug()) {
+            printf("[fastllm-dsv41-prefix-cache] hit len=%d (lcp=%d record=%d) remaining=%d\n",
+                   len, hitLen, memory->totalLen, (int)inputTokens.size());
+            fflush(stdout);
+        }
+        return true;
     }
 
     void DeepSeekV41Model::TryRecordHistoryCache(const std::vector<int> &allTokens) {
+        // 状态与 ResponseContext 绑定，记录在 TryRecordResponseContext 中完成
         (void)allTokens;
     }
 

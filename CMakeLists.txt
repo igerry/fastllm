@@ -858,6 +858,12 @@ if (UNIT_TEST)
         add_test(NAME qwen4HyperMix COMMAND qwen4HyperMixRegression)
         set_tests_properties(qwen4HyperMix PROPERTIES LABELS cuda TIMEOUT 180 SKIP_RETURN_CODE 77)
 
+        add_executable(deepseekV41OpsRegression test/ops/deepseekV41OpsRegression.cpp)
+        target_link_libraries(deepseekV41OpsRegression fastllm)
+        target_include_directories(deepseekV41OpsRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+        add_test(NAME deepseekV41Ops COMMAND deepseekV41OpsRegression)
+        set_tests_properties(deepseekV41Ops PROPERTIES LABELS cuda TIMEOUT 300 SKIP_RETURN_CODE 77)
+
         add_executable(ncclOddTpRegression test/ops/ncclOddTpRegression.cu)
         target_link_libraries(ncclOddTpRegression fastllm)
         target_include_directories(ncclOddTpRegression PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})

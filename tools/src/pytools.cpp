@@ -1015,7 +1015,7 @@ extern "C" {
             fastllm::Data *mmTokenTypeIdsData = new fastllm::Data();
             mmTokenTypeIdsData->CopyFrom(fastllm::Data(fastllm::DataType::FLOAT32, mmTypeShape, mmTokenTypeIds));
             (*multimodalInput)["mm_token_type_ids"].push_back(mmTokenTypeIdsData);
-        } else if (mode == "qwen35") {
+        } else if (mode == "qwen35" || mode == "deepseek_v41") {
             if (multimodal_config["tensors"].is_array()) {
                 for (auto &tensorNode : multimodal_config["tensors"].array_items()) {
                     addTypedPayloadTensor(

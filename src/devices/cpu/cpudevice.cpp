@@ -402,6 +402,7 @@ namespace fastllm {
         this->ops["DeepSeekV41IndexerTopK"] = (BaseOperator*)(new CpuDeepSeekV41IndexerTopKOp());
         this->ops["DeepSeekV41SparseAttention"] = (BaseOperator*)(new CpuDeepSeekV41SparseAttentionOp());
         this->ops["DeepSeekV41WindowStore"] = (BaseOperator*)(new CpuDeepSeekV41WindowStoreOp());
+        this->ops["DeepSeekV41QuantizeKV"] = (BaseOperator*)(new CpuDeepSeekV41QuantizeKVOp());
         this->ops["Cat"] = (BaseOperator*)(new CpuCatOp());
         this->ops["Pad"] = (BaseOperator*)(new CpuPadOp());
         this->ops["CatDirect"] = (BaseOperator*)(new CpuCatDirectOp());

@@ -4600,6 +4600,7 @@ namespace fastllm {
         this->ops["DeepSeekV41IndexerTopK"] = (BaseOperator*)(new CudaDeepSeekV41IndexerTopKOp());
         this->ops["DeepSeekV41SparseAttention"] = (BaseOperator*)(new CudaDeepSeekV41SparseAttentionOp());
         this->ops["DeepSeekV41WindowStore"] = (BaseOperator*)(new CudaDeepSeekV41WindowStoreOp());
+        this->ops["DeepSeekV41QuantizeKV"] = (BaseOperator*)(new CudaDeepSeekV41QuantizeKVOp());
         this->ops["Cat"] = (BaseOperator*)(new CudaCatOp());
         this->ops["Pad"] = (BaseOperator*)(new CudaPadOp());
         this->ops["CatDirect"] = (BaseOperator*)(new CudaCatDirectOp());
@@ -6976,6 +6977,21 @@ namespace fastllm {
                                                CudaV41Int(intParams, "startPos", 0),
                                                CudaV41Int(intParams, "windowSize", 128))) {
             ErrorInFastLLM("DeepSeekV41WindowStore CUDA error: kernel rejected input.\n");
+        }
+    }
+
+    bool CudaDeepSeekV41QuantizeKVOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
+                                             const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        return input.dims.size() == 3 && input.dims[2] % 32 == 0 &&
+               (input.dataType == DataType::BFLOAT16 || input.dataType == DataType::FLOAT32 ||
+                input.dataType == DataType::FLOAT16);
+    }
+
+    void CudaDeepSeekV41QuantizeKVOp::Run(const std::string &opType, const fastllm::DataDict &datas,
+                                          const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
+        if (!FastllmCudaDeepSeekV41QuantizeKV(*(datas.find("input")->second), *(datas.find("output")->second))) {
+            ErrorInFastLLM("DeepSeekV41QuantizeKV CUDA error: kernel rejected input.\n");
         }
     }
 

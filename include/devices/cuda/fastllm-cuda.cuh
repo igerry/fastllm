@@ -834,6 +834,7 @@ bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, const fastllm
                                            int windowSize, int startPos, float softmaxScale,
                                            fastllm::Data &output);
 bool FastllmCudaDeepSeekV41WindowStore(const fastllm::Data &chunk, fastllm::Data &ring, int startPos, int windowSize);
+bool FastllmCudaDeepSeekV41QuantizeKV(const fastllm::Data &input, fastllm::Data &output);
 
 bool FastllmCudaDeepSeekV4HcPre(const fastllm::Data &x, fastllm::Data &hcFn,
                                 fastllm::Data &hcScale, fastllm::Data &hcBase,

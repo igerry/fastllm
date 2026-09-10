@@ -569,6 +569,12 @@ namespace fastllm {
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 
+    // BF16/FP32 [b, s, d] -> FP8 E4M3 + UE8M0（每 32 个一组）的 INT8 [b, s, d + d / 32]
+    class CpuDeepSeekV41QuantizeKVOp : BaseOperator {
+        void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+    };
+
     class CpuCatDirectOp : BaseOperator {
         protected:
             void  Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);

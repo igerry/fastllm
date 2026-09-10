@@ -257,6 +257,116 @@ namespace fastllm {
         }
     }
 
+    // ---------------- FP8 KV 存储 ----------------
+    // 行布局：[dim 个 FP8 E4M3 字节][dim / 32 个 UE8M0 scale 字节]，值 = fp8 * 2^(scale - 127)
+
+    inline float V41DecodeFp8E4M3(uint8_t c) {
+        int e = (c >> 3) & 0xF, m = c & 7;
+        float v;
+        if (e == 0) {
+            v = std::ldexp((float)m, -9);
+        } else if (e == 15 && m == 7) {
+            v = std::numeric_limits<float>::quiet_NaN();
+        } else {
+            v = std::ldexp(1.0f + (float)m / 8.0f, e - 7);
+        }
+        return (c & 0x80) ? -v : v;
+    }
+
+    // r 必须已经在 E4M3 网格上（V41FP8RoundTrip 的输出）
+    inline uint8_t V41EncodeFp8E4M3(float r) {
+        if (std::isnan(r)) {
+            return 0x7F;
+        }
+        uint8_t sign = std::signbit(r) ? 0x80 : 0;
+        float a = std::fabs(r);
+        if (a == 0.0f) {
+            return sign;
+        }
+        if (a >= 448.0f) {
+            return sign | 0x7E;
+        }
+        if (a < std::ldexp(1.0f, -6)) {
+            int m = (int)std::lround(std::ldexp(a, 9));
+            return sign | (uint8_t)std::min(m, 7);
+        }
+        int e;
+        float f = std::frexp(a, &e);          // a = f * 2^e, f in [0.5, 1)
+        int E = e - 1;
+        int m = (int)std::lround((2.0f * f - 1.0f) * 8.0f);
+        if (m == 8) {
+            m = 0;
+            E++;
+        }
+        if (E > 8 || (E == 8 && m > 6)) {
+            return sign | 0x7E;
+        }
+        return sign | (uint8_t)(((E + 7) << 3) | m);
+    }
+
+    inline int V41Fp8RowBytes(int dim) {
+        return dim + dim / 32;
+    }
+
+    // 把 [rows, dim] 的 float 行量化成 FP8 + UE8M0（每 32 个一组，与 act_quant 的 scale 规则一致）
+    void V41QuantizeFp8Row(const float *row, int dim, uint8_t *dst) {
+        uint8_t *scales = dst + dim;
+        for (int start = 0; start < dim; start += 32) {
+            float amax = 0.0f;
+            for (int i = start; i < start + 32; i++) {
+                amax = std::max(amax, std::fabs(row[i]));
+            }
+            float scale = V41Pow2Ceil(std::max(amax, 1e-4f) * (1.0f / 448.0f));
+            int e;
+            std::frexp(scale, &e);            // scale = 0.5 * 2^e = 2^(e - 1)
+            scales[start / 32] = (uint8_t)(e - 1 + 127);
+            for (int i = start; i < start + 32; i++) {
+                float q = std::max(-448.0f, std::min(448.0f, row[i] / scale));
+                dst[i] = V41EncodeFp8E4M3(V41FP8RoundTrip(q));
+            }
+        }
+    }
+
+    void V41DequantFp8Rows(const Data &data, int dim, std::vector<float> &out) {
+        const int rowBytes = V41Fp8RowBytes(dim);
+        uint64_t rows = data.Count(0) / rowBytes;
+        out.resize(rows * dim);
+        for (uint64_t r = 0; r < rows; r++) {
+            const uint8_t *src = data.cpuData + r * rowBytes;
+            const uint8_t *scales = src + dim;
+            float *dst = out.data() + r * dim;
+            for (int d = 0; d < dim; d++) {
+                dst[d] = V41DecodeFp8E4M3(src[d]) * std::ldexp(1.0f, (int)scales[d / 32] - 127);
+            }
+        }
+    }
+
+    void CpuDeepSeekV41QuantizeKVOp::Reshape(const std::string &opType, const DataDict &datas,
+                                             const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        AssertInFastLLM(input.dims.size() == 3 && input.dims[2] % 32 == 0 && V41IsFloatType(input.dataType),
+                        "DeepSeekV41QuantizeKV error: input should be float [b, s, d] with d % 32 == 0.\n");
+        output.dataType = DataType::INT8;
+        output.Resize({input.dims[0], input.dims[1], V41Fp8RowBytes(input.dims[2])});
+    }
+
+    void CpuDeepSeekV41QuantizeKVOp::Run(const std::string &opType, const DataDict &datas,
+                                         const FloatDict &floatParams, const IntDict &intParams) {
+        Data &input = *(datas.find("input")->second);
+        Data &output = *(datas.find("output")->second);
+        output.Allocate();
+        const int dim = input.dims[2];
+        const int rows = input.dims[0] * input.dims[1];
+        std::vector<float> values;
+        V41ReadFloat(input, values);
+        V41ParallelFor(rows, [&](int st, int end) {
+            for (int r = st; r < end; r++) {
+                V41QuantizeFp8Row(values.data() + (uint64_t)r * dim, dim, output.cpuData + (uint64_t)r * V41Fp8RowBytes(dim));
+            }
+        });
+    }
+
     // ---------------- HcMix ----------------
 
     void CpuDeepSeekV41HcMixOp::Reshape(const std::string &opType, const DataDict &datas,
@@ -833,20 +943,32 @@ namespace fastllm {
         int ringRows = hasRing ? ringKV->dims[1] : 0;
         int cap = hasCompressed ? compressedKV->dims[1] : 0;
         int topWidth = hasCompressed ? cmpIdx->dims[2] : 0;
-        AssertInFastLLM(!hasRing || (ringKV->dims[0] == bsz && ringKV->dims[2] == dim && ringRows == windowSize),
+        // 缓存行可以是 BF16/FP32 [.., dim]，也可以是 FP8 + UE8M0 的 INT8 [.., dim + dim / 32]
+        bool ringFp8 = hasRing && ringKV->dataType == DataType::INT8;
+        bool compFp8 = hasCompressed && compressedKV->dataType == DataType::INT8;
+        AssertInFastLLM(!hasRing || (ringKV->dims[0] == bsz && ringRows == windowSize &&
+                                     ringKV->dims[2] == (ringFp8 ? V41Fp8RowBytes(dim) : dim)),
                         "DeepSeekV41SparseAttention error: ring shape mismatch.\n");
         AssertInFastLLM(!hasCompressed || (cmpIdx->dataType == DataType::INT32 && cmpIdx->dims.size() == 3 &&
                                            cmpIdx->dims[0] == bsz && cmpIdx->dims[1] == seqlen &&
-                                           compressedKV->dims[2] == dim),
+                                           compressedKV->dims[2] == (compFp8 ? V41Fp8RowBytes(dim) : dim)),
                         "DeepSeekV41SparseAttention error: compressed shape mismatch.\n");
         std::vector<float> qv, chunk, ring, comp, sink;
         V41ReadFloat(q, qv);
         V41ReadFloat(chunkKV, chunk);
         if (hasRing) {
-            V41ReadFloat(*ringKV, ring);
+            if (ringFp8) {
+                V41DequantFp8Rows(*ringKV, dim, ring);
+            } else {
+                V41ReadFloat(*ringKV, ring);
+            }
         }
         if (hasCompressed) {
-            V41ReadFloat(*compressedKV, comp);
+            if (compFp8) {
+                V41DequantFp8Rows(*compressedKV, dim, comp);
+            } else {
+                V41ReadFloat(*compressedKV, comp);
+            }
         }
         V41ReadFloat(attnSink, sink);
         output.Allocate();

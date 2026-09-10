@@ -35,6 +35,21 @@ def _load_text_config(model_dir: str) -> Dict[str, Any]:
     return text if isinstance(text, dict) else config
 
 
+class _TokenizerBackend:
+    """只依赖 ``tokenizers``（不引入 transformers / torch，避免与已加载的 fastllm 动态库冲突）。"""
+
+    def __init__(self, tokenizer_dir: str):
+        from tokenizers import Tokenizer
+
+        path = os.path.join(tokenizer_dir, "tokenizer.json")
+        if not os.path.isfile(path):
+            raise FileNotFoundError("tokenizer.json not found in " + tokenizer_dir)
+        self.backend_tokenizer = Tokenizer.from_file(path)
+
+    def __len__(self) -> int:
+        return self.backend_tokenizer.get_vocab_size(with_added_tokens=True)
+
+
 def build_compressed_token_map(tokenizer) -> Tuple[List[int], int]:
     from tokenizers import Regex, normalizers
 
@@ -83,8 +98,6 @@ def compute_hash_multipliers(layer_ids: List[int], max_ngram_size: int, tokenize
 
 
 def build_engram_meta(model_dir: str, tokenizer_dir: str = None) -> Dict[str, Any]:
-    from transformers import AutoTokenizer
-
     text = _load_text_config(model_dir)
     layer_ids = list(text.get("engram_layer_ids", []))
     if not layer_ids:
@@ -93,7 +106,7 @@ def build_engram_meta(model_dir: str, tokenizer_dir: str = None) -> Dict[str, An
     pad_token_id = int(text.get("engram_pad_token_id", 2))
     expected_compressed = int(text.get("engram_compressed_vocab_size", 0))
 
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir or model_dir, trust_remote_code=True)
+    tokenizer = _TokenizerBackend(tokenizer_dir or model_dir)
     token_map, compressed_vocab = build_compressed_token_map(tokenizer)
     if expected_compressed and compressed_vocab != expected_compressed:
         raise ValueError(

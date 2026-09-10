@@ -1077,7 +1077,10 @@ namespace fastllm {
         // 新请求从位置 0 开始：已用过的状态要重建，尚未使用的状态（可能带有图文请求的多模态输入）保留
         auto state = GetOrCreateState(pastKeyValues, false);
         if (startPos == 0 && state->totalLen > 0) {
+            // 同一个 pastKeyValues 被复用于新的请求：重建缓存，但保留多模态输入（图像需要重新编码）
+            const std::map <std::string, std::vector <Data*> > *pending = state->pendingMultimodal;
             state = GetOrCreateState(pastKeyValues, true);
+            state->pendingMultimodal = pending;
         }
         AssertInFastLLM(state->totalLen == startPos,
                         "DeepSeekV41Model: position mismatch (cache has " + std::to_string(state->totalLen) +

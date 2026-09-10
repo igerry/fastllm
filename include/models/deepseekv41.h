@@ -57,6 +57,14 @@ namespace fastllm {
         int totalLen = 0;
     };
 
+    // 一次前向中的一个序列片段：属于哪个请求、从哪个位置开始、多少个 token、在拼接输入中的偏移
+    struct DeepSeekV41Segment {
+        std::shared_ptr<DeepSeekV41RequestState> state;
+        int startPos = 0;
+        int seqlen = 0;
+        int offset = 0;
+    };
+
     // Engram 哈希元数据（由 tokenizer 归一化派生，Python 侧生成 JSON，此处加载）
     struct DeepSeekV41EngramMeta {
         bool loaded = false;
@@ -150,11 +158,31 @@ namespace fastllm {
         std::vector<std::shared_ptr<void> > engramTables;   // 每个 engram 层一张表（实现见 cpp）
 
         // -------- 请求状态 --------
+        // 状态同时按 &pastKeyValues（单请求 Forward）与 &pastKeyValues[0].first（调度器的多请求
+        // ForwardBatch 只传每层 Data 指针）两把 key 索引；两者指向同一个 shared_ptr。
         std::mutex v41StateMutex;
         std::map<const void*, std::shared_ptr<DeepSeekV41RequestState> > v41States;
+        std::map<const void*, std::shared_ptr<DeepSeekV41RequestState> > v41StatesByFirstKey;
 
         std::shared_ptr<DeepSeekV41RequestState> GetOrCreateState(
                 std::vector<std::pair<Data, Data> > &pastKeyValues, bool reset);
+        std::shared_ptr<DeepSeekV41RequestState> GetStateByFirstKey(const Data *firstKey);
+        void RegisterState(const void *vectorKey, const void *firstKey,
+                           const std::shared_ptr<DeepSeekV41RequestState> &state);
+
+        // 实际的前向：多个序列片段拼接成一个 token 流，Linear / MoE / Engram 查表按整批执行，
+        // RoPE、压缩、indexer、稀疏注意力按片段分别执行。
+        // inputEmbeds 非空时直接作为嵌入（[1, tokens, dim]，供视觉输入使用）；
+        // imageMask 非空时标记每个 token 是否为图像 token（Engram 历史置 -1）。
+        std::vector<int> ForwardSegments(
+                std::vector<DeepSeekV41Segment> &segments,
+                const Data &inputIds,
+                const Data *inputEmbeds,
+                const std::vector<int> *imageMask,
+                const std::vector<GenerationConfig> &generationConfigs,
+                const LastTokensManager &lastTokens,
+                std::vector<std::vector<float>*> *retLogits,
+                std::vector<std::pair<Data*, Data*> > &samplingPastKeyValues);
 
         void LoadEngramMeta();
         void BuildEngramPrimes();
@@ -167,8 +195,9 @@ namespace fastllm {
         // 从 FP8 表中取行，输出 BF16 [tokens, cols * headDim]
         void GatherEngramRows(int layer, const std::vector<int64_t> &rows, int tokens, Data &output);
 
-        void RunEngram(int layer, int engramLayerIndex, const std::vector<int> &history,
-                       int startPos, int seqlen, Data &hiddenStates);
+        // 对一批片段做 Engram：各片段分别算哈希行号，查表 / wkv / 门控按整批执行
+        void RunEngram(int layer, int engramLayerIndex, const std::vector<DeepSeekV41Segment> &segments,
+                       Data &hiddenStates);
     };
 }
 

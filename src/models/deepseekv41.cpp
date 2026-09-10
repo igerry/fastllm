@@ -261,35 +261,6 @@ namespace fastllm {
             CatDirect(cache, rows, 1);
         }
 
-        // 与 V4 相同的占位 KV，用于让通用调度器统计上下文长度
-        void V41UpdateStubPastKeyValues(std::vector<std::pair<Data, Data> > &pastKeyValues,
-                                        int totalLen, int blocks) {
-            if (pastKeyValues.empty()) {
-                return;
-            }
-            // 通用调度器用 expansionDims 判断请求是否已激活，并在 decode 时读取
-            // expansionDims[1]；预留容量必须严格大于逻辑长度，否则 Expansion 不会
-            // 记录 expansionDims，调度器会越界访问。
-            int paddedLen = (std::max(totalLen, 1) / 128 + 1) * 128;
-            std::vector<float> zeros((uint64_t)totalLen, 0.0f);
-            for (int i = 0; i < std::min(blocks, (int)pastKeyValues.size()); i++) {
-                Data key(DataType::FLOAT32, {1, totalLen, 1}, zeros);
-                Data value(DataType::FLOAT32, {1, totalLen, 1}, zeros);
-                key.SetKVCache();
-                value.SetKVCache();
-                key.Expansion({1, paddedLen, 1});
-                value.Expansion({1, paddedLen, 1});
-                pastKeyValues[i].first.FreeSpace();
-                pastKeyValues[i].second.FreeSpace();
-                pastKeyValues[i].first = Data();
-                pastKeyValues[i].second = Data();
-                pastKeyValues[i].first.CopyFrom(key);
-                pastKeyValues[i].second.CopyFrom(value);
-                pastKeyValues[i].first.SetKVCache();
-                pastKeyValues[i].second.SetKVCache();
-            }
-        }
-
         // 调试：把张量以 float32 原始字节写到文件（FASTLLM_DSV41_DUMP_DIR）
         void V41DumpTensor(const Data &data, const std::string &name) {
             const char *dir = std::getenv("FASTLLM_DSV41_DUMP_DIR");
@@ -496,7 +467,7 @@ namespace fastllm {
     DeepSeekV41Model::DeepSeekV41Model() {
         this->model_type = "deepseek_v41";
         this->model_struct = "deepseek_v41";
-        this->canDoBatchForward = false;
+        this->canDoBatchForward = true;      // 多请求 decode 共享一次前向（见 ForwardSegments）
         this->canDoConcurrentForward = true;
         this->defaultChunkedPrefillSize = 4096;
 
@@ -914,29 +885,40 @@ namespace fastllm {
         }
     }
 
-    void DeepSeekV41Model::RunEngram(int layer, int engramLayerIndex, const std::vector<int> &history,
-                                     int startPos, int seqlen, Data &hiddenStates) {
+    void DeepSeekV41Model::RunEngram(int layer, int engramLayerIndex, const std::vector<DeepSeekV41Segment> &segments,
+                                     Data &hiddenStates) {
         AssertInFastLLM(engramMeta.loaded,
                         "DeepSeekV41: engram meta is not loaded. Generate engram_meta.json with "
                         "`python -m ftllm.deepseek_v41_engram <model_dir>` or set FASTLLM_DSV41_ENGRAM_META.");
         std::string pre = "layers." + std::to_string(layer) + ".engram";
+        int total = 0;
+        for (auto &seg : segments) {
+            total += seg.seqlen;
+        }
+        const int cols = (engram_max_ngram_size - 1) * engram_n_heads;
         std::vector<int64_t> rows;
-        ComputeEngramHashes(engramLayerIndex, history, startPos, seqlen, rows);
+        rows.reserve((size_t)total * cols);
+        std::vector<float> maskValues(total, 1.0f);
+        bool hasDead = false;
+        for (auto &seg : segments) {
+            const std::vector<int> &history = seg.state->engramHistory;
+            std::vector<int64_t> segRows;
+            ComputeEngramHashes(engramLayerIndex, history, seg.startPos, seg.seqlen, segRows);
+            rows.insert(rows.end(), segRows.begin(), segRows.end());
+            for (int i = 0; i < seg.seqlen; i++) {
+                if (history[seg.startPos + i] < 0) {
+                    maskValues[seg.offset + i] = 0.0f;
+                    hasDead = true;
+                }
+            }
+        }
         Data gathered;
-        GatherEngramRows(layer, rows, seqlen, gathered);
+        GatherEngramRows(layer, rows, total, gathered);
         Data kv;
         Linear(gathered, weight[pre + ".wkv.weight"], Data(), kv);
         Data mask;
-        bool hasDead = false;
-        std::vector<float> maskValues(seqlen, 1.0f);
-        for (int i = 0; i < seqlen; i++) {
-            if (history[startPos + i] < 0) {
-                maskValues[i] = 0.0f;
-                hasDead = true;
-            }
-        }
         if (hasDead) {
-            mask.CopyFrom(Data(DataType::FLOAT32, {1, seqlen}, maskValues));
+            mask.CopyFrom(Data(DataType::FLOAT32, {1, total}, maskValues));
         }
         V41EngramApply(hiddenStates, kv, weight[pre + ".q_weight"], weight[pre + ".k_weight"],
                        hasDead ? &mask : nullptr, rms_norm_eps);
@@ -944,22 +926,69 @@ namespace fastllm {
 
     // ==================== 请求状态 ====================
 
+    namespace {
+        // 原地清空请求状态（layers 里的 Data 没有深拷贝赋值，只能重建）
+        void V41ResetState(DeepSeekV41RequestState &state, int blockCnt) {
+            state.layers.clear();
+            state.layers.resize(blockCnt);
+            state.engramHistory.clear();
+            state.totalLen = 0;
+        }
+    }
+
+    void DeepSeekV41Model::RegisterState(const void *vectorKey, const void *firstKey,
+                                         const std::shared_ptr<DeepSeekV41RequestState> &state) {
+        if (vectorKey != nullptr) {
+            v41States[vectorKey] = state;
+        }
+        if (firstKey != nullptr) {
+            v41StatesByFirstKey[firstKey] = state;
+        }
+    }
+
     std::shared_ptr<DeepSeekV41RequestState> DeepSeekV41Model::GetOrCreateState(
             std::vector<std::pair<Data, Data> > &pastKeyValues, bool reset) {
         const void *key = (const void*)&pastKeyValues;
+        const void *firstKey = pastKeyValues.empty() ? nullptr : (const void*)&pastKeyValues[0].first;
         std::lock_guard<std::mutex> guard(v41StateMutex);
         auto it = v41States.find(key);
-        if (it != v41States.end() && !reset) {
+        if (it != v41States.end()) {
+            if (reset) {
+                V41ResetState(*it->second, block_cnt);
+            }
+            if (firstKey != nullptr) {
+                v41StatesByFirstKey[firstKey] = it->second;
+            }
             return it->second;
         }
         auto state = std::make_shared<DeepSeekV41RequestState>();
         state->layers.resize(block_cnt);
-        v41States[key] = state;
+        RegisterState(key, firstKey, state);
         return state;
     }
 
+    std::shared_ptr<DeepSeekV41RequestState> DeepSeekV41Model::GetStateByFirstKey(const Data *firstKey) {
+        std::lock_guard<std::mutex> guard(v41StateMutex);
+        auto it = v41StatesByFirstKey.find((const void*)firstKey);
+        return it == v41StatesByFirstKey.end() ? nullptr : it->second;
+    }
+
     void DeepSeekV41Model::OnResponseContextCreated(ResponseContext *context) {
-        (void)context;
+        if (context == nullptr) {
+            return;
+        }
+        const void *key = (const void*)&context->pastKeyValues;
+        const void *firstKey = context->pastKeyValues.empty() ? nullptr : (const void*)&context->pastKeyValues[0].first;
+        std::lock_guard<std::mutex> guard(v41StateMutex);
+        std::shared_ptr<DeepSeekV41RequestState> state;
+        auto existing = v41States.find(key);
+        if (existing != v41States.end()) {
+            state = existing->second;
+        } else {
+            state = std::make_shared<DeepSeekV41RequestState>();
+            state->layers.resize(block_cnt);
+        }
+        RegisterState(key, firstKey, state);
     }
 
     void DeepSeekV41Model::OnResponseContextRemoved(ResponseContext *context) {
@@ -968,6 +997,9 @@ namespace fastllm {
         }
         std::lock_guard<std::mutex> guard(v41StateMutex);
         v41States.erase((const void*)&context->pastKeyValues);
+        if (!context->pastKeyValues.empty()) {
+            v41StatesByFirstKey.erase((const void*)&context->pastKeyValues[0].first);
+        }
     }
 
     void DeepSeekV41Model::TryRecordResponseContext(ResponseContext *context) {
@@ -986,6 +1018,36 @@ namespace fastllm {
 
     // ==================== 前向 ====================
 
+    namespace {
+        // 只更新调度器读取的第 0 层占位 KV（kvCacheId == 0）
+        void V41UpdateStubKV(Data &key, Data &value, int totalLen) {
+            int paddedLen = (std::max(totalLen, 1) / 128 + 1) * 128;
+            std::vector<float> zeros((uint64_t)totalLen, 0.0f);
+            Data stubKey(DataType::FLOAT32, {1, totalLen, 1}, zeros);
+            Data stubValue(DataType::FLOAT32, {1, totalLen, 1}, zeros);
+            stubKey.SetKVCache();
+            stubValue.SetKVCache();
+            stubKey.Expansion({1, paddedLen, 1});
+            stubValue.Expansion({1, paddedLen, 1});
+            key.FreeSpace();
+            value.FreeSpace();
+            key = Data();
+            value = Data();
+            key.CopyFrom(stubKey);
+            value.CopyFrom(stubValue);
+            key.SetKVCache();
+            value.SetKVCache();
+        }
+
+        int V41FirstPosition(const Data *positionIds) {
+            if (positionIds == nullptr || positionIds->dims.size() == 0 || positionIds->Count(0) == 0) {
+                return 0;
+            }
+            auto pids = V41ReadTokenIds(*positionIds);
+            return pids.empty() ? 0 : pids[0];
+        }
+    }
+
     int DeepSeekV41Model::Forward(const Data &inputIds, const Data &attentionMask, const Data &positionIds,
                                   std::vector<std::pair<Data, Data> > &pastKeyValues,
                                   const GenerationConfig &generationConfig,
@@ -995,21 +1057,6 @@ namespace fastllm {
         batchLogits.push_back(retLogits);
         return ForwardBatch(1, inputIds, attentionMask, positionIds, pastKeyValues,
                             generationConfig, lastTokens, &batchLogits)[0];
-    }
-
-    std::vector<int> DeepSeekV41Model::ForwardBatch(int batch, const Data &inputIds,
-                                                    const std::vector<Data*> &attentionMask,
-                                                    const std::vector<Data*> &positionIds,
-                                                    const std::vector<int> &seqLens,
-                                                    std::vector<std::pair<Data*, Data*> > &pastKeyValues,
-                                                    const std::vector<GenerationConfig> &generationConfigs,
-                                                    const LastTokensManager &lastTokens,
-                                                    std::vector<std::vector<float>*> *retLogits) {
-        (void)attentionMask; (void)positionIds; (void)seqLens; (void)pastKeyValues;
-        (void)generationConfigs; (void)lastTokens; (void)retLogits; (void)batch; (void)inputIds;
-        ErrorInFastLLM("DeepSeekV41Model: multi-request batched forward is not supported yet "
-                       "(canDoBatchForward is false, the scheduler should call Forward per request).");
-        return {};
     }
 
     std::vector<int> DeepSeekV41Model::ForwardBatch(int batch, const Data &inputIds, const Data &attentionMask,
@@ -1022,24 +1069,170 @@ namespace fastllm {
         AssertInFastLLM(batch == 1 && inputIds.dims.size() == 2 && inputIds.dims[0] == 1,
                         "DeepSeekV41Model::ForwardBatch only supports one sequence per call.");
         const int seqlen = inputIds.dims[1];
-        int startPos = 0;
-        if (positionIds.dims.size() >= 1 && positionIds.Count(0) > 0) {
-            auto pids = V41ReadTokenIds(positionIds);
-            startPos = pids.empty() ? 0 : pids[0];
-        }
+        const int startPos = V41FirstPosition(&positionIds);
         auto state = GetOrCreateState(pastKeyValues, startPos == 0);
         AssertInFastLLM(state->totalLen == startPos,
                         "DeepSeekV41Model: position mismatch (cache has " + std::to_string(state->totalLen) +
                         " tokens, request starts at " + std::to_string(startPos) + ").");
-        std::vector<int> tokenIds = V41ReadTokenIds(inputIds);
-        if (!engram_layer_ids.empty()) {
-            for (int tok : tokenIds) {
-                int compressed = -1;
-                if (tok != image_token_id && engramMeta.loaded && tok >= 0 &&
-                    tok < (int)engramMeta.tokenMap.size()) {
-                    compressed = engramMeta.tokenMap[tok];
+
+        std::vector<DeepSeekV41Segment> segments(1);
+        segments[0].state = state;
+        segments[0].startPos = startPos;
+        segments[0].seqlen = seqlen;
+        segments[0].offset = 0;
+        std::vector<GenerationConfig> generationConfigs(1, generationConfig);
+        std::vector<std::pair<Data*, Data*> > samplingPastKeyValues;
+        for (auto &kvPair : pastKeyValues) {
+            samplingPastKeyValues.push_back(std::make_pair(&kvPair.first, &kvPair.second));
+        }
+        std::vector<int> ret = ForwardSegments(segments, inputIds, nullptr, nullptr, generationConfigs,
+                                               lastTokens, retLogits, samplingPastKeyValues);
+        if (!pastKeyValues.empty()) {
+            V41UpdateStubKV(pastKeyValues[0].first, pastKeyValues[0].second, state->totalLen);
+        }
+        return ret;
+    }
+
+    std::vector<int> DeepSeekV41Model::ForwardBatch(int batch, const Data &inputIds,
+                                                    const std::vector<Data*> &attentionMask,
+                                                    const std::vector<Data*> &positionIds,
+                                                    const std::vector<int> &seqLens,
+                                                    std::vector<std::pair<Data*, Data*> > &pastKeyValues,
+                                                    const std::vector<GenerationConfig> &generationConfigs,
+                                                    const LastTokensManager &lastTokens,
+                                                    std::vector<std::vector<float>*> *retLogits) {
+        (void)attentionMask;
+        AssertInFastLLM(batch >= 1 && (int)seqLens.size() == batch && (int)positionIds.size() == batch &&
+                        (int)pastKeyValues.size() == batch * block_cnt &&
+                        (int)generationConfigs.size() == batch,
+                        "DeepSeekV41Model::ForwardBatch: inconsistent batch arguments.");
+        int total = 0;
+        for (int len : seqLens) {
+            total += len;
+        }
+        AssertInFastLLM(inputIds.Count(0) == (uint64_t)total,
+                        "DeepSeekV41Model::ForwardBatch: inputIds length does not match seqLens.");
+
+        std::vector<DeepSeekV41Segment> segments(batch);
+        int offset = 0;
+        for (int i = 0; i < batch; i++) {
+            const int startPos = V41FirstPosition(positionIds[i]);
+            auto state = GetStateByFirstKey(pastKeyValues[(size_t)i * block_cnt].first);
+            if (!state) {
+                AssertInFastLLM(startPos == 0,
+                                "DeepSeekV41Model::ForwardBatch: request state is missing for a continuing request.");
+                state = std::make_shared<DeepSeekV41RequestState>();
+                state->layers.resize(block_cnt);
+                std::lock_guard<std::mutex> guard(v41StateMutex);
+                RegisterState(nullptr, (const void*)pastKeyValues[(size_t)i * block_cnt].first, state);
+            } else if (startPos == 0 && state->totalLen != 0) {
+                V41ResetState(*state, block_cnt);
+            }
+            AssertInFastLLM(state->totalLen == startPos,
+                            "DeepSeekV41Model: position mismatch in batch (cache has " +
+                            std::to_string(state->totalLen) + " tokens, request starts at " +
+                            std::to_string(startPos) + ").");
+            segments[i].state = state;
+            segments[i].startPos = startPos;
+            segments[i].seqlen = seqLens[i];
+            segments[i].offset = offset;
+            offset += seqLens[i];
+        }
+
+        std::vector<int> ret;
+        if (batch > 1) {
+            static bool announced = false;
+            if (!announced) {
+                announced = true;
+                printf("[Fastllm] DeepSeek-V4.1: batched forward active (batch = %d).\n", batch);
+                fflush(stdout);
+            }
+        }
+        // 含长 prefill 片段的混合批次退回为逐个前向，避免一次前向的激活内存过大
+        bool splitBatch = false;
+        if (batch > 1) {
+            const int chunkLimit = std::max(1, GetChunkedPrefillSize());
+            for (auto &seg : segments) {
+                if (seg.seqlen > chunkLimit) {
+                    splitBatch = true;
                 }
-                state->engramHistory.push_back(compressed);
+            }
+        }
+        if (splitBatch) {
+            Data cpuIds;
+            cpuIds.CopyFrom(inputIds);
+            cpuIds.ToDevice(DataDevice::CPU);
+            for (int i = 0; i < batch; i++) {
+                std::vector<DeepSeekV41Segment> one(1);
+                one[0] = segments[i];
+                one[0].offset = 0;
+                Data curIds;
+                Split(cpuIds, 1, segments[i].offset, segments[i].offset + segments[i].seqlen, curIds);
+                std::vector<GenerationConfig> curConfigs(1, generationConfigs[i]);
+                LastTokensManager curTokens;
+                if ((int)lastTokens.units.size() > i) {
+                    curTokens.units.push_back(lastTokens.units[i]);
+                }
+                std::vector<std::vector<float>*> curLogits;
+                if (retLogits != nullptr && (int)retLogits->size() > i) {
+                    curLogits.push_back((*retLogits)[i]);
+                }
+                std::vector<std::pair<Data*, Data*> > curPastKeyValues(
+                        pastKeyValues.begin() + (size_t)i * block_cnt,
+                        pastKeyValues.begin() + (size_t)(i + 1) * block_cnt);
+                auto cur = ForwardSegments(one, curIds, nullptr, nullptr, curConfigs, curTokens,
+                                           retLogits != nullptr ? &curLogits : nullptr, curPastKeyValues);
+                ret.push_back(cur[0]);
+            }
+        } else {
+            ret = ForwardSegments(segments, inputIds, nullptr, nullptr, generationConfigs, lastTokens,
+                                  retLogits, pastKeyValues);
+        }
+        for (int i = 0; i < batch; i++) {
+            V41UpdateStubKV(*pastKeyValues[(size_t)i * block_cnt].first, *pastKeyValues[(size_t)i * block_cnt].second,
+                            segments[i].state->totalLen);
+        }
+        return ret;
+    }
+
+    std::vector<int> DeepSeekV41Model::ForwardSegments(std::vector<DeepSeekV41Segment> &segments,
+                                                       const Data &inputIds,
+                                                       const Data *inputEmbeds,
+                                                       const std::vector<int> *imageMask,
+                                                       const std::vector<GenerationConfig> &generationConfigsIn,
+                                                       const LastTokensManager &lastTokens,
+                                                       std::vector<std::vector<float>*> *retLogits,
+                                                       std::vector<std::pair<Data*, Data*> > &samplingPastKeyValues) {
+        const int numSegments = (int)segments.size();
+        AssertInFastLLM(numSegments >= 1 && (int)generationConfigsIn.size() == numSegments,
+                        "DeepSeekV41Model::ForwardSegments: bad segments.");
+        int total = 0;
+        for (auto &seg : segments) {
+            AssertInFastLLM(seg.state && seg.seqlen > 0 && seg.offset == total && seg.state->totalLen == seg.startPos,
+                            "DeepSeekV41Model::ForwardSegments: inconsistent segment.");
+            total += seg.seqlen;
+        }
+        const bool single = numSegments == 1;
+        const int seqlen = total;   // 拼接后的 token 总数
+
+        // ---- Engram 历史 ----
+        std::vector<int> tokenIds = V41ReadTokenIds(inputIds);
+        AssertInFastLLM((int)tokenIds.size() == total, "DeepSeekV41Model::ForwardSegments: inputIds length mismatch.");
+        if (!engram_layer_ids.empty()) {
+            for (auto &seg : segments) {
+                AssertInFastLLM((int)seg.state->engramHistory.size() == seg.startPos,
+                                "DeepSeekV41: engram history is out of sync with the cache.");
+                for (int i = 0; i < seg.seqlen; i++) {
+                    int tok = tokenIds[seg.offset + i];
+                    int compressed = -1;
+                    bool isImage = tok == image_token_id ||
+                                   (imageMask != nullptr && (int)imageMask->size() > seg.offset + i &&
+                                    (*imageMask)[seg.offset + i] != 0);
+                    if (!isImage && engramMeta.loaded && tok >= 0 && tok < (int)engramMeta.tokenMap.size()) {
+                        compressed = engramMeta.tokenMap[tok];
+                    }
+                    seg.state->engramHistory.push_back(compressed);
+                }
             }
         }
 
@@ -1080,15 +1273,23 @@ namespace fastllm {
         Data hiddenStates, hiddenTemp;
         {
             Data embedOut;
-            Embedding(inputIds, weight["embed.weight"], embedOut);
-            ToDataType(embedOut, DataType::BFLOAT16);
+            if (inputEmbeds != nullptr) {
+                AssertInFastLLM(inputEmbeds->Count(0) == (uint64_t)seqlen * dim,
+                                "DeepSeekV41Model::ForwardSegments: inputEmbeds shape mismatch.");
+                embedOut.CopyFrom(*inputEmbeds);
+                ToDataType(embedOut, DataType::BFLOAT16);
+            } else {
+                Embedding(inputIds, weight["embed.weight"], embedOut);
+                ToDataType(embedOut, DataType::BFLOAT16);
+            }
             embedOut.Reshape({1, seqlen, 1, dim});
             Repeat(embedOut, 2, hc_mult, hiddenStates);
         }
         Data *curHidden = &hiddenStates;
         Data *nextHidden = &hiddenTemp;
-        const bool dumpDebug = std::getenv("FASTLLM_DSV41_DUMP_DIR") != nullptr;
-        const std::string dumpSuffix = startPos == 0 ? std::string("") : "_p" + std::to_string(startPos);
+        const bool dumpDebug = single && std::getenv("FASTLLM_DSV41_DUMP_DIR") != nullptr;
+        const int startPos0 = segments[0].startPos;
+        const std::string dumpSuffix = startPos0 == 0 ? std::string("") : "_p" + std::to_string(startPos0);
         if (dumpDebug) {
             V41DumpTensor(hiddenStates, "fl_embed" + dumpSuffix);
         }
@@ -1102,31 +1303,51 @@ namespace fastllm {
             preMix.CopyFrom(Data(DataType::FLOAT32, {1, seqlen, hc_mult}, values));
         }
 
-        // 本次前向内跨层共享的 indexer 结果
-        Data sharedTopK;
-        Data candidateMask;
-        bool hasCandidates = false;
+        // 片段切片：单片段时直接使用整批张量，多片段时按 offset 拷贝出来
+        auto sliceOf = [&](Data &full, int i, Data &tmp) -> Data* {
+            if (single) {
+                return &full;
+            }
+            Split(full, 1, segments[i].offset, segments[i].offset + segments[i].seqlen, tmp);
+            return &tmp;
+        };
+        // 按 axis=1 拼接多个片段（两块临时缓冲交替使用，避免输出与输入别名）
+        auto catSegments = [&](std::vector<Data> &parts, Data *tmp) -> Data* {
+            Data *acc = &parts[0];
+            int t = 0;
+            for (size_t i = 1; i < parts.size(); i++) {
+                Cat(*acc, parts[i], 1, tmp[t]);
+                acc = &tmp[t];
+                t ^= 1;
+            }
+            return acc;
+        };
+
+        // 本次前向内跨层共享的 indexer 结果（按片段）
+        std::vector<Data> segTopK(numSegments), segCandidate(numSegments);
+        std::vector<char> segHasCandidates(numSegments, 0);
 
         Data attnPre, attnPost, attnComb, ffnPre, ffnPost, ffnComb;
         Data x, attnInput, qr, qNorm, q, kv, attnOut, woAOut, attnProj;
         Data ffnInput, ffnOut, expertIndex, expertScore;
         Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp;
+        std::vector<Data> segQ(numSegments), segKV(numSegments), segAttnOut(numSegments);
+        Data catTmp[2];
 
         for (int layer = 0; layer < block_cnt; layer++) {
             ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
             std::string pre = "layers." + std::to_string(layer);
             const int ratio = compress_ratios[layer];
             const V41RopeParams &rope = ratio > 0 ? compressRope : windowRope;
-            DeepSeekV41LayerCache &cache = state->layers[layer];
 
             // ---- Engram ----
             for (size_t l = 0; l < engram_layer_ids.size(); l++) {
                 if (engram_layer_ids[l] == layer) {
-                    RunEngram(layer, (int)l, state->engramHistory, startPos, seqlen, *curHidden);
+                    RunEngram(layer, (int)l, segments, *curHidden);
                 }
             }
 
-            // ---- attention ----
+            // ---- attention（整批部分）----
             V41HcMix(*curHidden, weight[pre + ".hc_attn_fn"], weight[pre + ".hc_attn_scale"],
                      weight[pre + ".hc_attn_base"], hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
                      attnPre, attnPost, attnComb);
@@ -1137,155 +1358,187 @@ namespace fastllm {
             V41RMSNormBF16(qr, weight[pre + ".attn.q_norm.weight"], rms_norm_eps, qNorm);
             Linear(qNorm, weight[pre + ".attn.wq_b.weight"], Data(), q);
             q.Reshape({1, seqlen, num_attention_heads, headDim});
-            V41RotaryQuant(q, rope, startPos, 1, false, 0, 32);
 
             Linear(attnInput, weight[pre + ".attn.wkv.weight"], Data(), kv);
             V41RMSNormBF16(kv, weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, kv);
             kv.Reshape({1, seqlen, headDim});
-            V41RotaryQuant(kv, rope, startPos, 1, false, 1, 32);
 
-            Data *compressedKV = nullptr;
-            Data *cmpIdx = nullptr;
-            if (ratio > 0) {
-                const int src = kvSourceOf[layer];
-                DeepSeekV41LayerCache &srcCache = state->layers[src];
-                if (isKvSource[layer]) {
-                    std::string cpre = pre + ".attn.compressor";
-                    Data xFloat, rawKV, rawScore, allKV, allScore;
-                    ToDataType(attnInput, xFloat, DataType::FLOAT32);
-                    Linear(xFloat, weight[cpre + ".wkv.weight"], Data(), rawKV);
-                    ToDataType(rawKV, DataType::FLOAT32);
-                    if (ratio > 1) {
-                        Linear(xFloat, weight[cpre + ".wgate.weight"], Data(), rawScore);
-                        ToDataType(rawScore, DataType::FLOAT32);
-                    }
-                    Data *kvAll = &rawKV, *scoreAll = &rawScore;
-                    if (cache.rawTail > 0) {
-                        Cat(cache.rawTailKV, rawKV, 1, allKV);
-                        kvAll = &allKV;
-                        if (ratio > 1) {
-                            Cat(cache.rawTailScore, rawScore, 1, allScore);
-                            scoreAll = &allScore;
-                        }
-                    }
-                    const int n = kvAll->dims[1];
-                    const int full = n - n % ratio;
-                    const int blocks = full / ratio;
-                    if (blocks > 0) {
-                        Data kvPart, scorePart, latent;
-                        Data *kvPartPtr = kvAll, *scorePartPtr = ratio > 1 ? scoreAll : nullptr;
-                        if (full != n) {
-                            Split(*kvAll, 1, 0, full, kvPart);
-                            kvPartPtr = &kvPart;
+            // kv source 层：compressor 的投影按整批算，分组 / 追加按片段做
+            Data rawKVAll, rawScoreAll;
+            // index source 层：indexer 的 q / 权重投影按整批算
+            Data qIdxAll, idxWeightsAll;
+            bool needIndexer = false;
+            if (ratio > 0 && isKvSource[layer]) {
+                std::string cpre = pre + ".attn.compressor";
+                Data xFloat;
+                ToDataType(attnInput, xFloat, DataType::FLOAT32);
+                Linear(xFloat, weight[cpre + ".wkv.weight"], Data(), rawKVAll);
+                ToDataType(rawKVAll, DataType::FLOAT32);
+                if (ratio > 1) {
+                    Linear(xFloat, weight[cpre + ".wgate.weight"], Data(), rawScoreAll);
+                    ToDataType(rawScoreAll, DataType::FLOAT32);
+                }
+            }
+            if (ratio > 0 && isIndexSource[layer]) {
+                std::string ipre = pre + ".attn.indexer";
+                Linear(qNorm, weight[ipre + ".wq_b.weight"], Data(), qIdxAll);
+                qIdxAll.Reshape({1, seqlen, index_n_heads, index_head_dim});
+                Data idxWeights;
+                Linear(attnInput, weight[ipre + ".weights_proj.weight"], Data(), idxWeights);
+                ToDataType(idxWeights, DataType::FLOAT32);
+                Mul(idxWeights, (1.0f / std::sqrt((float)index_head_dim)) * (1.0f / std::sqrt((float)index_n_heads)),
+                    idxWeightsAll);
+                needIndexer = true;
+            }
+
+            // ---- attention（按片段）----
+            for (int s = 0; s < numSegments; s++) {
+                DeepSeekV41Segment &seg = segments[s];
+                DeepSeekV41LayerCache &cache = seg.state->layers[layer];
+                const int startPos = seg.startPos;
+                const int segLen = seg.seqlen;
+
+                Data *qSeg = sliceOf(q, s, segQ[s]);
+                V41RotaryQuant(*qSeg, rope, startPos, 1, false, 0, 32);
+                Data *kvSeg = sliceOf(kv, s, segKV[s]);
+                V41RotaryQuant(*kvSeg, rope, startPos, 1, false, 1, 32);
+
+                Data *compressedKV = nullptr;
+                Data *cmpIdx = nullptr;
+                if (ratio > 0) {
+                    const int src = kvSourceOf[layer];
+                    DeepSeekV41LayerCache &srcCache = seg.state->layers[src];
+                    if (isKvSource[layer]) {
+                        std::string cpre = pre + ".attn.compressor";
+                        Data rawKVSeg, rawScoreSeg, allKV, allScore;
+                        Data *rawKV = sliceOf(rawKVAll, s, rawKVSeg);
+                        Data *rawScore = ratio > 1 ? sliceOf(rawScoreAll, s, rawScoreSeg) : nullptr;
+                        Data *kvAll = rawKV, *scoreAll = rawScore;
+                        if (cache.rawTail > 0) {
+                            Cat(cache.rawTailKV, *rawKV, 1, allKV);
+                            kvAll = &allKV;
                             if (ratio > 1) {
-                                Split(*scoreAll, 1, 0, full, scorePart);
-                                scorePartPtr = &scorePart;
+                                Cat(cache.rawTailScore, *rawScore, 1, allScore);
+                                scoreAll = &allScore;
                             }
                         }
-                        V41Compress(*kvPartPtr, scorePartPtr, weight[cpre + ".norm.weight"], ratio, rms_norm_eps, latent);
-                        const int blockStart = cache.compressedBlocks;
-                        // indexer key 由 pre-RoPE latent 派生
-                        if (isIndexSource[layer]) {
-                            std::string ipre = pre + ".attn.indexer";
-                            Data kIdx;
-                            Linear(latent, weight[ipre + ".wk.weight"], Data(), kIdx);
-                            V41RMSNormBF16(kIdx, weight[ipre + ".k_norm.weight"], rms_norm_eps, kIdx);
-                            kIdx.Reshape({1, blocks, index_head_dim});
-                            V41RotaryQuant(kIdx, rope, blockStart * ratio, ratio, false, 2, 32);
-                            V41AppendRows(cache.indexK, kIdx);
+                        const int n = kvAll->dims[1];
+                        const int full = n - n % ratio;
+                        const int blocks = full / ratio;
+                        if (blocks > 0) {
+                            Data kvPart, scorePart, latent;
+                            Data *kvPartPtr = kvAll, *scorePartPtr = ratio > 1 ? scoreAll : nullptr;
+                            if (full != n) {
+                                Split(*kvAll, 1, 0, full, kvPart);
+                                kvPartPtr = &kvPart;
+                                if (ratio > 1) {
+                                    Split(*scoreAll, 1, 0, full, scorePart);
+                                    scorePartPtr = &scorePart;
+                                }
+                            }
+                            V41Compress(*kvPartPtr, scorePartPtr, weight[cpre + ".norm.weight"], ratio, rms_norm_eps, latent);
+                            const int blockStart = cache.compressedBlocks;
+                            // indexer key 由 pre-RoPE latent 派生
+                            if (isIndexSource[layer]) {
+                                std::string ipre = pre + ".attn.indexer";
+                                Data kIdx;
+                                Linear(latent, weight[ipre + ".wk.weight"], Data(), kIdx);
+                                V41RMSNormBF16(kIdx, weight[ipre + ".k_norm.weight"], rms_norm_eps, kIdx);
+                                kIdx.Reshape({1, blocks, index_head_dim});
+                                V41RotaryQuant(kIdx, rope, blockStart * ratio, ratio, false, 2, 32);
+                                V41AppendRows(cache.indexK, kIdx);
+                            }
+                            V41RotaryQuant(latent, rope, blockStart * ratio, ratio, false, 3, 16);
+                            V41AppendRows(cache.compressedKV, latent);
+                            cache.compressedBlocks += blocks;
                         }
-                        V41RotaryQuant(latent, rope, blockStart * ratio, ratio, false, 3, 16);
-                        V41AppendRows(cache.compressedKV, latent);
-                        cache.compressedBlocks += blocks;
+                        const int rem = n - full;
+                        if (rem > 0) {
+                            Data tailKV, tailScore;
+                            Split(*kvAll, 1, full, n, tailKV);
+                            cache.rawTailKV.CopyFrom(tailKV);
+                            if (ratio > 1) {
+                                Split(*scoreAll, 1, full, n, tailScore);
+                                cache.rawTailScore.CopyFrom(tailScore);
+                            }
+                        }
+                        cache.rawTail = rem;
                     }
-                    const int rem = n - full;
-                    if (rem > 0) {
-                        Data tailKV, tailScore;
-                        Split(*kvAll, 1, full, n, tailKV);
-                        cache.rawTailKV.CopyFrom(tailKV);
-                        if (ratio > 1) {
-                            Split(*scoreAll, 1, full, n, tailScore);
-                            cache.rawTailScore.CopyFrom(tailScore);
-                        }
-                    }
-                    cache.rawTail = rem;
-                }
-                AssertInFastLLM(srcCache.compressedBlocks == (startPos + seqlen) / ratio,
-                                "DeepSeekV41: compressed cache is out of sync at layer " + std::to_string(layer));
-                if (srcCache.compressedBlocks > 0) {
-                    compressedKV = &srcCache.compressedKV;
-                    if (isIndexSource[layer]) {
-                        std::string ipre = pre + ".attn.indexer";
-                        Data qIdx, idxWeights, idxWeightsScaled, score;
-                        Linear(qNorm, weight[ipre + ".wq_b.weight"], Data(), qIdx);
-                        qIdx.Reshape({1, seqlen, index_n_heads, index_head_dim});
-                        V41RotaryQuant(qIdx, rope, startPos, 1, false, 2, 32);
-                        Linear(attnInput, weight[ipre + ".weights_proj.weight"], Data(), idxWeights);
-                        ToDataType(idxWeights, DataType::FLOAT32);
-                        Mul(idxWeights, (1.0f / std::sqrt((float)index_head_dim)) * (1.0f / std::sqrt((float)index_n_heads)),
-                            idxWeightsScaled);
-                        V41IndexerScore(qIdx, idxWeightsScaled, srcCache.indexK, score);
-                        if (dumpDebug) {
-                            V41DumpTensor(qIdx, "fl_layer" + std::to_string(layer) + "_idxq" + dumpSuffix);
-                            V41DumpTensor(idxWeightsScaled, "fl_layer" + std::to_string(layer) + "_idxw" + dumpSuffix);
-                            V41DumpTensor(score, "fl_layer" + std::to_string(layer) + "_score" + dumpSuffix);
-                        }
-                        if (layer == candidate_source_layer_id && candidate_block_size > 0 && candidate_topk_blocks > 0) {
-                            V41CandidateBlocks(score, candidate_block_size, candidate_topk_blocks, ratio, startPos,
-                                               candidateMask);
-                            hasCandidates = true;
+                    AssertInFastLLM(srcCache.compressedBlocks == (startPos + segLen) / ratio,
+                                    "DeepSeekV41: compressed cache is out of sync at layer " + std::to_string(layer));
+                    if (srcCache.compressedBlocks > 0) {
+                        compressedKV = &srcCache.compressedKV;
+                        if (needIndexer) {
+                            Data qIdxSeg, idxWeightsSeg, score;
+                            Data *qIdx = sliceOf(qIdxAll, s, qIdxSeg);
+                            V41RotaryQuant(*qIdx, rope, startPos, 1, false, 2, 32);
+                            Data *idxWeightsScaled = sliceOf(idxWeightsAll, s, idxWeightsSeg);
+                            V41IndexerScore(*qIdx, *idxWeightsScaled, srcCache.indexK, score);
                             if (dumpDebug) {
-                                V41DumpTensor(candidateMask, "fl_layer" + std::to_string(layer) + "_cand" + dumpSuffix);
+                                V41DumpTensor(*qIdx, "fl_layer" + std::to_string(layer) + "_idxq" + dumpSuffix);
+                                V41DumpTensor(*idxWeightsScaled, "fl_layer" + std::to_string(layer) + "_idxw" + dumpSuffix);
+                                V41DumpTensor(score, "fl_layer" + std::to_string(layer) + "_score" + dumpSuffix);
                             }
+                            if (layer == candidate_source_layer_id && candidate_block_size > 0 && candidate_topk_blocks > 0) {
+                                V41CandidateBlocks(score, candidate_block_size, candidate_topk_blocks, ratio, startPos,
+                                                   segCandidate[s]);
+                                segHasCandidates[s] = 1;
+                                if (dumpDebug) {
+                                    V41DumpTensor(segCandidate[s], "fl_layer" + std::to_string(layer) + "_cand" + dumpSuffix);
+                                }
+                            }
+                            const bool useCandidates = segHasCandidates[s] && candidate_source_layer_id >= 0 &&
+                                                       candidate_source_layer_id < layer;
+                            V41IndexerTopK(score, useCandidates ? &segCandidate[s] : nullptr, indexTopK, ratio, startPos,
+                                           std::max(1, candidate_block_size), segTopK[s]);
                         }
-                        const bool useCandidates = hasCandidates && candidate_source_layer_id >= 0 &&
-                                                   candidate_source_layer_id < layer;
-                        V41IndexerTopK(score, useCandidates ? &candidateMask : nullptr, indexTopK, ratio, startPos,
-                                       std::max(1, candidate_block_size), sharedTopK);
-                    }
-                    if (sharedTopK.dims.size() == 3) {
-                        cmpIdx = &sharedTopK;
+                        if (segTopK[s].dims.size() == 3) {
+                            cmpIdx = &segTopK[s];
+                        }
                     }
                 }
+
+                Data *attnOutSeg = single ? &attnOut : &segAttnOut[s];
+                V41SparseAttention(*qSeg, *kvSeg, startPos > 0 ? &cache.windowKV : nullptr, compressedKV, cmpIdx,
+                                   weight[pre + ".attn.attn_sink"], window_size, startPos, softmaxScale, *attnOutSeg);
+                if (dumpDebug) {
+                    std::string tag = "fl_layer" + std::to_string(layer);
+                    V41DumpTensor(*qSeg, tag + "_q" + dumpSuffix);
+                    V41DumpTensor(*kvSeg, tag + "_kv" + dumpSuffix);
+                    V41DumpTensor(*attnOutSeg, tag + "_attn_o_raw" + dumpSuffix);
+                    if (compressedKV != nullptr) {
+                        V41DumpTensor(*compressedKV, tag + "_ckv" + dumpSuffix);
+                    }
+                    if (ratio > 0 && isKvSource[layer]) {
+                        V41DumpTensor(cache.indexK, tag + "_idxk" + dumpSuffix);
+                    }
+                    if (startPos > 0) {
+                        V41DumpTensor(cache.windowKV, tag + "_ring" + dumpSuffix);
+                    }
+                }
+                V41WindowStore(*kvSeg, cache.windowKV, startPos, window_size);
+                V41RotaryQuant(*attnOutSeg, rope, startPos, 1, true, 0, 32);
+                cache.totalLen += segLen;
             }
 
-            V41SparseAttention(q, kv, startPos > 0 ? &cache.windowKV : nullptr, compressedKV, cmpIdx,
-                               weight[pre + ".attn.attn_sink"], window_size, startPos, softmaxScale, attnOut);
-            if (dumpDebug) {
-                std::string tag = "fl_layer" + std::to_string(layer);
-                V41DumpTensor(q, tag + "_q" + dumpSuffix);
-                V41DumpTensor(kv, tag + "_kv" + dumpSuffix);
-                V41DumpTensor(attnOut, tag + "_attn_o_raw" + dumpSuffix);
-                if (compressedKV != nullptr) {
-                    V41DumpTensor(*compressedKV, tag + "_ckv" + dumpSuffix);
-                }
-                if (ratio > 0 && isKvSource[layer]) {
-                    V41DumpTensor(cache.indexK, tag + "_idxk" + dumpSuffix);
-                }
-                if (startPos > 0) {
-                    V41DumpTensor(cache.windowKV, tag + "_ring" + dumpSuffix);
-                }
-            }
-            V41WindowStore(kv, cache.windowKV, startPos, window_size);
-            V41RotaryQuant(attnOut, rope, startPos, 1, true, 0, 32);
-            DeepSeekV4WoA(attnOut, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
+            Data *attnOutAll = single ? &attnOut : catSegments(segAttnOut, catTmp);
+            DeepSeekV4WoA(*attnOutAll, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
             Linear(woAOut, weight[pre + ".attn.wo_b.weight"], Data(), attnProj);
             if (dumpDebug) {
                 V41DumpTensor(attnInput, "fl_layer" + std::to_string(layer) + "_attn_in" + dumpSuffix);
-                V41DumpTensor(attnOut, "fl_layer" + std::to_string(layer) + "_attn_o" + dumpSuffix);
+                V41DumpTensor(*attnOutAll, "fl_layer" + std::to_string(layer) + "_attn_o" + dumpSuffix);
                 V41DumpTensor(attnProj, "fl_layer" + std::to_string(layer) + "_attn" + dumpSuffix);
-                if (cmpIdx != nullptr) {
-                    V41DumpTensor(*cmpIdx, "fl_layer" + std::to_string(layer) + "_topk" + dumpSuffix);
+                if (segTopK[0].dims.size() == 3) {
+                    V41DumpTensor(segTopK[0], "fl_layer" + std::to_string(layer) + "_topk" + dumpSuffix);
                 }
             }
             DeepSeekV4HcPost(attnProj, *curHidden, attnPost, attnComb, *nextHidden);
             std::swap(curHidden, nextHidden);
-            cache.totalLen += seqlen;
             if (dumpDebug) {
                 V41DumpTensor(*curHidden, "fl_layer" + std::to_string(layer) + "_hidden_attn" + dumpSuffix);
             }
 
-            // ---- FFN (MoE) ----
+            // ---- FFN (MoE)：整批 ----
             V41HcMix(*curHidden, weight[pre + ".hc_ffn_fn"], weight[pre + ".hc_ffn_scale"],
                      weight[pre + ".hc_ffn_base"], hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
                      ffnPre, ffnPost, ffnComb);
@@ -1397,34 +1650,38 @@ namespace fastllm {
             }
         }
 
-        // ---- head（只取最后一个 token）----
+        // ---- head（每个片段只取最后一个 token）----
         Data headInput;
-        if (seqlen > 1) {
-            Data lastHidden, lastPre;
-            Split(*curHidden, 1, seqlen - 1, seqlen, lastHidden);
-            Split(preMix, 1, seqlen - 1, seqlen, lastPre);
-            V41HcApplyPre(lastHidden, lastPre, headInput);
-        } else {
+        if (single && seqlen == 1) {
             V41HcApplyPre(*curHidden, preMix, headInput);
+        } else {
+            std::vector<Data> lastHidden(numSegments), lastPre(numSegments);
+            for (int s = 0; s < numSegments; s++) {
+                int end = segments[s].offset + segments[s].seqlen;
+                Split(*curHidden, 1, end - 1, end, lastHidden[s]);
+                Split(preMix, 1, end - 1, end, lastPre[s]);
+            }
+            Data hiddenTmp[2], preTmp[2];
+            Data *hiddenAll = catSegments(lastHidden, hiddenTmp);
+            Data *preAll = catSegments(lastPre, preTmp);
+            V41HcApplyPre(*hiddenAll, *preAll, headInput);
         }
 
         std::vector<int> ret;
-        std::vector<int> samplingSeqLens(1, 1);
-        std::vector<GenerationConfig> generationConfigs(1, generationConfig);
-        if (generationConfigs[0].do_sample && generationConfigs[0].top_k <= 1 &&
-            generationConfigs[0].temperature > 1e-6f) {
-            generationConfigs[0].top_k = 5;
-        }
-        std::vector<std::pair<Data*, Data*> > samplingPastKeyValues;
-        for (auto &kvPair : pastKeyValues) {
-            samplingPastKeyValues.push_back(std::make_pair(&kvPair.first, &kvPair.second));
+        std::vector<int> samplingSeqLens(numSegments, 1);
+        std::vector<GenerationConfig> generationConfigs = generationConfigsIn;
+        for (auto &config : generationConfigs) {
+            if (config.do_sample && config.top_k <= 1 && config.temperature > 1e-6f) {
+                config.top_k = 5;
+            }
         }
         LLMSamplingBlock(this, &headInput, &weight["norm.weight"], &weight["head.weight"],
-                         rms_norm_eps, 1, true, samplingSeqLens, samplingPastKeyValues,
+                         rms_norm_eps, numSegments, true, samplingSeqLens, samplingPastKeyValues,
                          generationConfigs, lastTokens, retLogits, ret);
 
-        state->totalLen += seqlen;
-        V41UpdateStubPastKeyValues(pastKeyValues, state->totalLen, block_cnt);
+        for (auto &seg : segments) {
+            seg.state->totalLen += seg.seqlen;
+        }
         return ret;
     }
 
@@ -1441,17 +1698,25 @@ namespace fastllm {
         {
             std::lock_guard<std::mutex> guard(v41StateMutex);
             v41States.erase((const void*)&pastKeyValues);
+            v41StatesByFirstKey.erase((const void*)&pastKeyValues[0].first);
         }
         this->kvCacheId = 0;
-        elementsInKVCachePerToken = 0;
-        for (int i = 0; i < block_cnt; i++) {
-            if (pastKeyValues[i].first.dims.size() < 3) {
+        // 占位 KV 不反映真实占用；按模型几何估算每个 token 的长期缓存字节数
+        // （压缩 KV + indexer key，均为 BF16；滑窗缓存长度固定，不计入），
+        // 折算成 kvCacheDataType 的元素数供调度器估算上下文预算。
+        long long bytesPerToken = 0;
+        for (int layer = 0; layer < block_cnt; layer++) {
+            if (!isKvSource[layer]) {
                 continue;
             }
-            elementsInKVCachePerToken +=
-                (long long)pastKeyValues[i].first.dims[0] * pastKeyValues[i].first.dims[2] +
-                (long long)pastKeyValues[i].second.dims[0] * pastKeyValues[i].second.dims[2];
+            int ratio = std::max(1, compress_ratios[layer]);
+            bytesPerToken += (long long)head_dim_full * 2 / ratio;
+            if (isIndexSource[layer]) {
+                bytesPerToken += (long long)index_head_dim * 2 / ratio;
+            }
         }
+        long long unitBytes = std::max(1LL, (long long)GetDataBytes(this->kvCacheDataType, 1, 1));
+        elementsInKVCachePerToken = std::max(1LL, (bytesPerToken + unitBytes - 1) / unitBytes);
         printf("finish.\n");
     }
 }

@@ -30,7 +30,10 @@
 
 已实现并通过数值对齐测试：
 
-- 文本推理（单请求 prefill + decode，含分块 prefill），CUDA 与 CPU 两套算子路径；
+- 文本推理（prefill + decode，含分块 prefill），CUDA 与 CPU 两套算子路径；
+- 多请求批量 decode：多个请求的 token 拼成一个序列共享一次前向（Linear / MoE / Engram 查表按整批执行，
+  注意力与压缩 KV 按请求分别执行），见下文"多请求与前缀缓存"；
+- 前缀缓存 / 多轮对话复用（`--cache_history true`）；
 - 跨层共享压缩 KV（ratio 1 / 2）、两级 indexer top-k、Engram、Hyper-Connections、sqrt-softplus 路由；
 - 与官方实现一致的 FP8 / FP4 伪量化（窗口 KV、压缩 KV、indexer q/k）；
 - 真实 checkpoint 的权重格式（FP8 32x32、FP4 路由专家、FP8 + UE8M0 的 Engram 表）。
@@ -39,8 +42,7 @@
 
 - DSpark 投机解码（`mtp.*` 权重不加载）；
 - 视觉输入（`vision.*`、`aligner.*` 不加载；`gate.bias_vl` 与 Engram 的图像掩码已预留）；
-- 多请求批量 decode（当前由通用调度器按请求逐个前向）；
-- 前缀缓存、CUDA Graph、张量并行等 V4 已有的性能特性。
+- CUDA Graph、张量并行等 V4 已有的性能特性。
 
 ## Engram 元数据
 
@@ -75,6 +77,40 @@ ftllm server /path/to/DeepSeek-V4.1-Flash \
 - 单路 CPU 机器可用 `--moe_device cpu`；
 - 内存需求：Engram 表约 200 GB + 路由专家（FP4）约 270 GB + 加载临时空间；
 - 首次启动会生成 `engram_meta.json`（约 1 分钟）并读入两张 Engram 表。
+
+## 多请求与前缀缓存
+
+### 批量 decode
+
+`DeepSeekV41Model::ForwardSegments` 把若干"片段"（请求状态 + 起始位置 + token 数）拼成一个 token 流：
+embedding、Hyper-Connections、各 Linear、路由、MoE 与 Engram 查表按整批执行，RoPE、压缩 KV 追加、
+indexer top-k、稀疏注意力与滑窗写入按片段分别执行。通用调度器的多请求 `ForwardBatch` 直接走这条路径，
+单请求 `Forward` 是它的单片段特例；含长 prefill 片段的混合批次退回为逐个前向。
+
+每个请求的缓存（`DeepSeekV41RequestState`）与 `ResponseContext` 绑定，请求结束或 abort 时释放。
+在迷你模型上，8 并发 decode 与逐个请求相比，token 序列的差异仅来自 GEMM 按 batch 选核带来的
+BF16 舍入（同一请求换不同的批次伙伴 / 批内位置，logits 逐 bit 一致）；单卡 3090Ti 上迷你模型的
+decode 吞吐从 209 tok/s（1 并发）提高到 573 tok/s（8 并发）。
+
+### 前缀缓存
+
+启动时加 `--cache_history true`。请求结束时把每层 `windowKV`、`compressedKV`、`indexK`、`rawTail`
+与 Engram 历史快照到 CPU 内存（LRU，默认保留 8 条），新请求按最长公共前缀查找并恢复，只对新增 token
+做 prefill。多轮对话中只要客户端原样回传上一轮的回复，通常就是精确命中。
+
+恢复长度受模型结构约束：滑窗缓存是只保留最后 `window_size` 个位置的环形缓冲，因此只能恢复到记录
+长度 T 或 T-1（记录不超过 `window_size` 时可以任意截断）；ratio-2 压缩层凑不满一组的原始尾块只在
+精确命中时可用，其它情况要求恢复长度为偶数。不满足约束的候选会被跳过（退回完整 prefill）。
+
+| 变量 | 作用 |
+| --- | --- |
+| `FASTLLM_DSV41_DISABLE_PREFIX_CACHE` | 关闭前缀缓存 |
+| `FASTLLM_DSV41_PREFIX_CACHE_DEBUG` | 打印命中 / 记录日志 |
+| `FASTLLM_DSV41_PREFIX_CACHE_MIN_TOKENS` | 最短命中长度（默认 16） |
+| `FASTLLM_DSV41_PREFIX_CACHE_MAX_RECORDS` | 最多保留的记录数（默认 8，也可用 `FASTLLM_PREFIX_CACHE_SNAPSHOT_MAX_RECORDS`） |
+
+迷你模型上精确命中与 T-1 截断命中后的贪心输出与不中断的原请求逐 bit 一致；800 token 提示词的
+首 token 延迟从 39–54 ms 降到 6 ms。
 
 ## 数值验证
 

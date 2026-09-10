@@ -30,7 +30,7 @@ from .launcher_harness import HarnessRuntime
 from .launcher_opencode import OpenCodeRuntime
 from .launcher_codex import CodexRuntime
 from .launcher_claude import ClaudeRuntime
-from .launcher_mtp import detect_mtp_support
+from .launcher_mtp import detect_mtp_support, _dspark_config
 from .startup_progress import PROGRESS_PREFIX
 from .ui_hardware import detect_hardware
 from .ui_plugins import BUNDLED_PLUGINS, PluginRegistry, install_plugin_routes, mount_studio_assets
@@ -1861,8 +1861,15 @@ def recommend_launch_config(
             build = normalized_hardware["build"]
             if (config["device"] in ("cuda", "tp")
                     and build.get("USE_CUDA") is not False and not build.get("USE_ROCM")):
-                config["mtp"] = "3"
-                config["speculative_algorithm"] = "mtp"
+                model_config = _read_model_config_for_recommendation(expanded_path)
+                dspark_source, dspark_block = _dspark_config(model_config or {})
+                if dspark_block > 0:
+                    # DeepSeek-V4 / V4.1 的草稿层就在 checkpoint 里，按训练 block 校验
+                    config["draft_tokens"] = str(dspark_block)
+                    config["speculative_algorithm"] = "dspark"
+                else:
+                    config["mtp"] = "3"
+                    config["speculative_algorithm"] = "mtp"
             else:
                 speculative_reason = "cuda_required"
 

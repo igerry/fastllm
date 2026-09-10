@@ -1523,10 +1523,12 @@ class FastLLmCompletion:
       model_type = self.model.get_type()
       chat_template = getattr(tokenizer, "chat_template", None)
       force_type = getattr(self.model, "tool_call_parser", "auto")
+      deepseek_v4_family = {
+          "deepseek_v4", "deepseek_v41", "deepseek_v41_text"}
       allow_without_chat_template = (
-          model_type == "deepseek_v4" or
+          model_type in deepseek_v4_family or
           model_type == "kimi_k3" or
-          force_type in ("deepseek_v4", "kimi_k3")
+          force_type in (*deepseek_v4_family, "kimi_k3")
       )
       if tokenizer is None and allow_without_chat_template:
           tokenizer = _EmptyToolTokenizer()

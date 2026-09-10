@@ -272,13 +272,27 @@ extern "C" {
 
     static bool is_supported_tool_call_constraint_format(
             const std::string &format) {
-        return format == "deepseek_v4_dsml" || format == "dots_xml";
+        return format == "deepseek_v4_dsml" ||
+               format == "deepseek_v41_dsml" || format == "dots_xml";
     }
 
     static std::vector<std::string> default_tool_call_name_prefixes(
             const std::string &format, bool parameter) {
         if (format == "dots_xml") {
             return {parameter ? "<parameter name=\"" : "<invoke name=\""};
+        }
+        if (format == "deepseek_v41_dsml") {
+            // V4.1 renames every DSML tag with a leading space.
+            if (parameter) {
+                return {
+                    "<｜DSML｜ parameter name=\"",
+                    "<\\DSML\\ parameter name=\"",
+                };
+            }
+            return {
+                "<｜DSML｜ invoke name=\"",
+                "<\\DSML\\ invoke name=\"",
+            };
         }
         if (parameter) {
             return {

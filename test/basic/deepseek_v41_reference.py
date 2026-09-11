@@ -56,6 +56,9 @@ def parse_args():
     parser.add_argument("--quant-format", default="bf16", choices=["bf16", "real"],
                         help="real: 按真实 checkpoint 的格式保存（稠密 FP8 32x32 + 路由专家 FP4 + 共享专家 FP8）")
     parser.add_argument("--activated", type=int, default=-1, help="生成时覆盖 n_activated_experts")
+    parser.add_argument("--dim", type=int, default=-1, help="生成时覆盖 hidden_size（MoE 测速用）")
+    parser.add_argument("--moe-inter-dim", type=int, default=-1,
+                        help="生成时覆盖 moe_intermediate_size（MoE 测速用）")
     parser.add_argument("--candidate-topk-blocks", type=int, default=-1, help="覆盖 candidate_topk_blocks")
     return parser.parse_args()
 
@@ -654,6 +657,10 @@ def main():
                          compress_ratios=(0, 2, 1, 1), kv_source_layers=(1, 2), index_source_layers=(1, 2, 3),
                          candidate_source_layer=2, candidate_topk_blocks=2048, candidate_block_size=8,
                          index_n_heads=32, engram_layer_ids=(1,)))
+    if args.dim > 0:
+        TINY["dim"] = args.dim
+    if args.moe_inter_dim > 0:
+        TINY["moe_inter_dim"] = args.moe_inter_dim
     if args.experts > 0:
         TINY["n_routed_experts"] = args.experts
     if args.activated > 0:

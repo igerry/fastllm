@@ -70,6 +70,28 @@ Engram 表（两层，各约 100 GB）不经过通用加载器，而是由模型
 以 FP8 + UE8M0 scale 原样保存；查表在 CPU 完成，`wkv` 投影与门控在 GPU 完成。
 设置 `FASTLLM_DSV41_ENGRAM_MMAP=1` 可改为 mmap（首次访问慢，节省常驻内存）。
 
+### Engram 的分段计时与几个开关
+
+查表发生在模型代码里而不是算子里，`FASTLLM_PRINT_PROFILE` 看不到它，需要单独计时：
+
+```bash
+FASTLLM_DSV41_ENGRAM_PROFILE=1 FASTLLM_CUDA_SYNC=1 ftllm server ...
+```
+
+会按 decode / prefill 分桶打印四段的平均耗时：`hash`（算行号）、`gather`（读表 +
+FP8→BF16）、`wkv`（投影）、`apply`（门控写回）。后两段在 GPU 上异步下发，
+不加 `FASTLLM_CUDA_SYNC=1` 只能量到 kernel launch 的时间。`=2` 额外逐次打印，
+`FASTLLM_DSV41_ENGRAM_PROFILE_EVERY=N` 控制中途汇总的频率（默认 64 次，0 表示只在退出时打印）。
+
+下面几个开关默认关闭，打开后数值不变（`ENGRAM_WKV_FP8` 除外，见下）：
+
+| 开关 | 作用 |
+|---|---|
+| `FASTLLM_DSV41_ENGRAM_POOL=1` | 查表改用 fastllm 的常驻线程池，替掉每次调用现场 create/join 最多 32 个 `std::thread` 的写法。输出逐位相同，prefill 收益最明显。 |
+| `FASTLLM_DSV41_ENGRAM_PREFETCH=1` | 跨层预取。n-gram 哈希只依赖 token 历史，两个 Engram 层（默认层 1 与层 14）的行号在进入第 0 层之前就已经全部确定，所以可以在前一个 Engram 层计算时用后台线程把下一层的行号算好、并把要用的表行摸进 cache。后台线程只看历史窗口的快照，不引用请求状态。 |
+| `FASTLLM_DSV41_ENGRAM_MADVISE=random / hugepage / both` | 表是纯随机访问：`random` 打 `MADV_RANDOM` 关掉内核预读（mmap 模式下最有用）；`hugepage` 让常驻表改用匿名 mmap + `MADV_HUGEPAGE` 分配（100 GB 用 4 KB 页要 2500 万个 PTE，随机查表几乎每次 TLB miss），顺带省掉 `std::vector` 的 100 GB 清零，加载也更快。 |
+| `FASTLLM_DSV41_ENGRAM_WKV_FP8=1` | `layers.{1,14}.engram.wkv.weight` 在真实权重里本来就是 F8_E4M3 + UE8M0 块 scale（`[25600, 6144]`，block 32x32），默认会被解量化成启动 dtype（float16），每层 157 MB 变 314 MB。打开后按原样保留 FP8，**不做任何重量化**——权重数值就是 checkpoint 里的那份，比解成 float16 还少一次舍入；省下每层 157 MB 显存与同样多的每步带宽。只有伴随的 `.scale` 张量存在时才切换，权重是 BF16 的迷你模型不受影响。 |
+
 ## 启动
 
 以 2 x 24 GB GPU + 大内存主机为例（专家与 Engram 表放在 CPU 内存）：
@@ -656,6 +678,11 @@ indexer 分数矩阵的分块效果（65536 token prefill，扣掉同卡其它�
 | `FASTLLM_DSV41_INDEX_CHUNK` | 直接指定 indexer 的 token 分块大小（覆盖上面的预算推算） |
 | `FASTLLM_DSV41_ENGRAM_META` | Engram 元数据 JSON 路径 |
 | `FASTLLM_DSV41_ENGRAM_MMAP` | 以 mmap 方式访问 Engram 表 |
+| `FASTLLM_DSV41_ENGRAM_PROFILE` | Engram 查表 / 转换 / 投影分段计时（见 "Engram 元数据"） |
+| `FASTLLM_DSV41_ENGRAM_POOL` | Engram 查表改用常驻线程池 |
+| `FASTLLM_DSV41_ENGRAM_PREFETCH` | 跨层预取下一个 Engram 层的行号与表行 |
+| `FASTLLM_DSV41_ENGRAM_MADVISE` | Engram 表的内存访问提示（random / hugepage / both） |
+| `FASTLLM_DSV41_ENGRAM_WKV_FP8` | `engram.wkv` 保留 checkpoint 里的 FP8 精度，不解量化 |
 | `FASTLLM_DSV41_DISABLE_FAKE_QUANT` | 关闭 FP8 / FP4 伪量化（仅用于对齐调试） |
 | `FASTLLM_DSV41_DISABLE_CUDA_ROUTE` | 路由退回 CPU 参考实现 |
 | `FASTLLM_DSV41_DUMP_DIR` | 把每层中间张量写到该目录（对齐调试） |

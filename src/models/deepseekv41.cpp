@@ -821,6 +821,7 @@ namespace fastllm {
             int64_t rows = 0;
             int dim = 0;
             int scaleBlock = 32;
+            bool fileMapped = false;            // 表是文件 mmap（缺页可能要读盘）还是常驻内存
             const uint8_t *data = nullptr;      // FP8 E4M3, [rows, dim]
             const uint8_t *scale = nullptr;     // UE8M0, [rows, dim / scaleBlock]
             std::vector<uint8_t> dataStorage;
@@ -1406,6 +1407,7 @@ namespace fastllm {
                                          table->mmapData, table->mmapDataLen, table->data) &&
                          V41MapFileRange(scaleInfo.fileName, scaleInfo.offset, scaleInfo.bytes,
                                          table->mmapScale, table->mmapScaleLen, table->scale);
+                table->fileMapped = mapped;
             }
             if (!mapped) {
                 // 常驻：默认用 std::vector；开了 hugepage 提示时改用匿名 mmap，
@@ -1537,8 +1539,14 @@ namespace fastllm {
         }
 
         // 把要用到的表行摸一遍（每 64 字节一次），把页表项与 cache line 提前拉进来。
-        // mmap 模式下这一步会把缺页代价挪到后台线程；常驻模式下主要是省 TLB / DRAM 延迟。
+        // mmap 模式下这一步把缺页代价挪到后台线程，多大的批都值得做；
+        // 常驻模式下靠的是 cache/TLB 命中，一旦要摸的数据超过末级缓存，等真正查表时
+        // 早就被挤出去了，白白多跑一遍内存带宽——所以给一个预算，超了就只算行号不摸表。
         void V41TouchEngramRows(const V41EngramTable &table, const std::vector<int64_t> &rows) {
+            const uint64_t budget = 32ULL << 20;
+            if (!table.fileMapped && rows.size() * (uint64_t)table.dim > budget) {
+                return;
+            }
             const int dim = table.dim;
             const int scaleCols = dim / std::max(1, table.scaleBlock);
             volatile uint64_t sink = 0;

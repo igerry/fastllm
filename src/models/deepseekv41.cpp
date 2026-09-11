@@ -2687,6 +2687,9 @@ namespace fastllm {
         Data cpuMoeInput, cpuMoeIndex, cpuMoeScore;
     };
 
+    // 每层的分段数：pre / post / route / sharedExpert
+    static constexpr int kV41GraphSegmentsPerLayer = 4;
+
     // 回放时被跳过的 host 侧形状变更。捕获时记下，回放时原样补上。
     struct DeepSeekV41GraphSegmentMeta {
         std::vector<int> qDims, kvDims, qIdxDims;
@@ -2724,7 +2727,7 @@ namespace fastllm {
         int V41DecodeCudaGraphReplayMask() {
             static const int mask = []() -> int {
                 const char *env = std::getenv("FASTLLM_DSV41_CUDA_GRAPH_REPLAY_MASK");
-                return env != nullptr && env[0] != 0 ? atoi(env) : 7;
+                return env != nullptr && env[0] != 0 ? atoi(env) : 15;
             }();
             return mask;
         }
@@ -2762,6 +2765,9 @@ namespace fastllm {
         struct DeepSeekV41GraphSegment : DeepSeekV41GraphSegmentMeta {
             std::vector<void*> graphs;
             std::vector<void*> execs;
+            // 这一段本来就进不了图（例如专家数超过 CUDA 路由 kernel 的上限、
+            // 只能走 CPU 参考路由），占位保持段号对齐，捕获与回放时都逐算子执行。
+            bool passthrough = false;
         };
 
         struct DeepSeekV41CudaGraphState {
@@ -3143,6 +3149,7 @@ namespace fastllm {
                                         "|" + std::to_string((int)tpAttention) +
                                         "|" + std::to_string((int)tpSharedExpert) +
                                         "|" + std::to_string((int)this->kvCacheDataType) +
+                                        "|" + std::to_string(num_experts) +
                                         "|" + std::to_string((int)GetCudaSharedExpert()) + "|";
                 for (int device : tpDevices) {
                     signature += std::to_string(device) + ",";
@@ -3167,7 +3174,7 @@ namespace fastllm {
                     ws = graphState->workspace.get();
                     graphActive = true;
                     if (graphState->captured &&
-                        (int)graphState->segments.size() == 3 * block_cnt) {
+                        (int)graphState->segments.size() == kV41GraphSegmentsPerLayer * block_cnt) {
                         graphReplay = true;
                     } else if (graphState->warmupRounds >= V41DecodeCudaGraphWarmupRounds()) {
                         graphCapture = true;
@@ -3190,9 +3197,22 @@ namespace fastllm {
             }
             const int oriDevice = FastllmCudaGetDevice();
             for (int device : graphState->devices) {
+                FastllmCudaSetDevice(device);
+                // 捕获被判废后运行时的 last-error 会一直粘着，回退到逐算子之前必须清掉，
+                // 否则第一个算子的 cudaGetLastError 会误判为 kernel 失败。
+                FastllmCudaClearLastError();
                 FastllmCudaSyncDevice(device);
+                FastllmCudaClearLastError();
             }
             FastllmCudaSetDevice(oriDevice);
+            if (graphState->tensorParallel && graphState->devices.size() > 1) {
+                // 常驻 worker 线程有各自的 last-error，也要在它们自己的线程上清
+                MultiCudaRunDeviceCallbacks(graphState->devices, [](int rank, int device) {
+                    (void)rank;
+                    FastllmCudaSetDevice(device);
+                    FastllmCudaClearLastError();
+                });
+            }
             graphState->DestroyCapturedGraph();
             graphState->disabled = true;
             fprintf(stderr, "[Fastllm] DeepSeek-V4.1 decode CUDA graph disabled at %s: %s\n",
@@ -3444,14 +3464,25 @@ namespace fastllm {
         }
 #endif
 
+        // CUDA 路由能不能进图：FastllmCudaDeepSeekV4RouteScoreTransform 的 kernel 只支持
+        // <= 256 个专家（真实模型是 384），超了就整段走 CPU 参考路由，里面有同步 D2H。
+        // FASTLLM_DSV41_CUDA_GRAPH_FORCE_ROUTE_CAPTURE=1：排查用，强行把不可捕获的路由
+        // 也当成可捕获，用来验证"捕获中撞上非法的同步 D2H 也只是丢图回退、不会崩"。
+        const bool cudaRouteCapturable =
+            V41EnvFlag("FASTLLM_DSV41_CUDA_GRAPH_FORCE_ROUTE_CAPTURE") ||
+            (!hasImageTokens && num_experts <= 256 &&
+             !V41EnvFlag("FASTLLM_DSV41_DISABLE_CUDA_ROUTE"));
+
         // 分段调度：捕获 / 回放 / 逐算子。record 保存回放时被跳过的 host 侧形状变更，
         // restore 在回放时把它们补回来。任何一步失败都就地退回逐算子并永久关掉图。
-        auto V41RunGraphSegment = [&](const std::function<void()> &body, int index,
+        auto V41RunGraphSegment = [&](const std::function<void()> &body, int index, bool capturable,
                                       const std::function<void(DeepSeekV41GraphSegmentMeta&)> &record,
                                       const std::function<void(const DeepSeekV41GraphSegmentMeta&)> &restore) {
 #ifdef USE_CUDA
             if (graphReplay) {
-                if ((V41DecodeCudaGraphReplayMask() & (1 << (index % 3))) == 0) {
+                if ((V41DecodeCudaGraphReplayMask() & (1 << (index % kV41GraphSegmentsPerLayer))) == 0 ||
+                    (index < (int)graphState->segments.size() &&
+                     graphState->segments[index].passthrough)) {
                     body();
                     return;
                 }
@@ -3465,6 +3496,15 @@ namespace fastllm {
                 return;
             }
             if (graphCapture) {
+                if (!capturable) {
+                    // 占位段：逐算子跑，但要占住段号，回放时也走同一条路
+                    body();
+                    DeepSeekV41GraphSegment placeholder;
+                    placeholder.passthrough = true;
+                    graphState->segments.push_back(placeholder);
+                    record(graphState->segments.back());
+                    return;
+                }
                 if (index != V41DecodeCudaGraphFailAt() &&
                     V41CaptureGraphSegment(*graphState, body)) {
                     record(graphState->segments.back());
@@ -3481,6 +3521,7 @@ namespace fastllm {
             }
 #else
             (void)index;
+            (void)capturable;
             (void)record;
             (void)restore;
 #endif
@@ -3580,7 +3621,7 @@ namespace fastllm {
                     idxWeightsAll);
             }
             };   // runAttentionPre
-            V41RunGraphSegment(runAttentionPre, 3 * layer,
+            V41RunGraphSegment(runAttentionPre, kV41GraphSegmentsPerLayer * layer, true,
                 [&](DeepSeekV41GraphSegmentMeta &meta) {
                     meta.qDims = q.dims;
                     meta.kvDims = kv.dims;
@@ -3870,7 +3911,7 @@ namespace fastllm {
             ffnDims = ffnInput.dims;
             ffnInput.Reshape({seqlen, dim});
             };   // runAttentionPost
-            V41RunGraphSegment(runAttentionPost, 3 * layer + 1,
+            V41RunGraphSegment(runAttentionPost, kV41GraphSegmentsPerLayer * layer + 1, true,
                 [&](DeepSeekV41GraphSegmentMeta &meta) {
                     meta.ffnDims = ffnDims;
                     meta.ffnInputDims = ffnInput.dims;
@@ -3886,7 +3927,7 @@ namespace fastllm {
                     }
                 });
 
-            auto runRouteAndSharedExpert = [&]() {
+            auto runRoute = [&]() {
             // 路由：sqrt(softplus(logits / gate_temp))，bias 只参与选择
             {
                 std::string gpre = pre + ".ffn.gate";
@@ -3979,18 +4020,11 @@ namespace fastllm {
                 }
             }
 
-            if (hasSharedExpertOut) {
-                if (tpSharedExpert) {
-                    sharedGateupIt->second.tpLinearType = TP_LINEAR_ROW;
-                    sharedGateupIt->second.tpPackType = TP_PACK_GATEUP;
-                    sharedDownIt->second.tpLinearType = TP_LINEAR_COLUMN;
-                }
-                Data &ww1 = ws->sharedSwiglu, &ww3 = ws->sharedGateup;
-                LinearSwigluBlock(&ffnInput, &sharedGateupIt->second, GetEmptyData(), &ww3, &ww1);
-                Linear(ww1, sharedDownIt->second, *GetEmptyData(), sharedExpertOut);
-            }
-            };   // runRouteAndSharedExpert
-            V41RunGraphSegment(runRouteAndSharedExpert, 3 * layer + 2,
+            };   // runRoute
+            // 专家数超过 CUDA 路由 kernel 的 256 上限时（真实模型是 384），路由整段只能
+            // 走 CPU 参考实现：里面的 logits.ToDevice(CPU) 是同步 D2H，捕获期间非法。
+            // 这种情况下把这一段标成占位段逐算子执行，而不是让捕获在半路炸掉。
+            V41RunGraphSegment(runRoute, kV41GraphSegmentsPerLayer * layer + 2, cudaRouteCapturable,
                 [&](DeepSeekV41GraphSegmentMeta &meta) {
                     meta.expertIndexDims = expertIndex.dims;
                     meta.expertScoreDims = expertScore.dims;
@@ -4003,6 +4037,22 @@ namespace fastllm {
                         expertScore.Reshape(meta.expertScoreDims);
                     }
                 });
+
+            auto runSharedExpert = [&]() {
+            if (hasSharedExpertOut) {
+                if (tpSharedExpert) {
+                    sharedGateupIt->second.tpLinearType = TP_LINEAR_ROW;
+                    sharedGateupIt->second.tpPackType = TP_PACK_GATEUP;
+                    sharedDownIt->second.tpLinearType = TP_LINEAR_COLUMN;
+                }
+                Data &ww1 = ws->sharedSwiglu, &ww3 = ws->sharedGateup;
+                LinearSwigluBlock(&ffnInput, &sharedGateupIt->second, GetEmptyData(), &ww3, &ww1);
+                Linear(ww1, sharedDownIt->second, *GetEmptyData(), sharedExpertOut);
+            }
+            };   // runSharedExpert
+            V41RunGraphSegment(runSharedExpert, kV41GraphSegmentsPerLayer * layer + 3, hasSharedExpertOut,
+                [](DeepSeekV41GraphSegmentMeta &) {},
+                [](const DeepSeekV41GraphSegmentMeta &) {});
 
             {
                 this->ApplyMoeDeviceMapForLayer(layer);
@@ -4089,7 +4139,7 @@ namespace fastllm {
         if (graphState) {
             if (graphCapture) {
                 bool ok = !graphState->captureFailed &&
-                          (int)graphState->segments.size() == 3 * block_cnt &&
+                          (int)graphState->segments.size() == kV41GraphSegmentsPerLayer * block_cnt &&
                           !FastllmCudaGetThreadError() && !FastllmCudaGetGraphError();
                 if (ok && graphPoolOpen) {
                     ok = FastllmCudaGraphMemoryPoolEnd(graphState->reservedPointers);

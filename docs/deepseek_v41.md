@@ -188,6 +188,50 @@ prefill 接近减半；decode 变慢，因为 multicuda 的 eager 调度对**每
 真实模型每层的 GPU 计算是它的十几倍，两者大致相抵。**长上下文 / prefill 为主的负载开 `--tp 2`，
 纯 decode 负载建议先测再决定**；要让 decode 也稳定获益需要接入 CUDA Graph（V4 已有，V4.1 还没做）。
 
+## 按层切分（流水线 / 模型分片）
+
+```bash
+ftllm server /path/to/DeepSeek-V4.1-Flash --device "{'cuda:0':1,'cuda:1':1}" --moe_device numa
+```
+
+用普通的 device map 就能把层平均分到两张卡上（`SelectDeviceFromMap` 按权重划分层区间），
+V4.1 的 `ForwardSegments` 每层都会 `ApplyDeviceMap`，隐藏状态在 stage 边界由执行器自动搬运。
+每卡只保存自己那一半的层权重，**每卡显存约减半**；单请求延迟基本不变（两张卡是串行执行的，
+不是真正的流水线——调度器没有 micro-batch，所以并发请求也不会形成 stage 级重叠）。
+
+### 切分点必须落在 kv source 层的边界上
+
+V4.1 的压缩 KV 是跨层共享的：`kv_source_layer_ids` 的层算出的 cache 会被之后若干层直接读。
+如果 source 层和消费层落在不同卡上，执行器会在每次访问时把整段压缩 KV 搬到另一张卡，
+下一步 source 层追加时再搬回来——每个 token 都要来回搬整段缓存。
+
+真实模型（40 层）的 source 布局正好让**均分**成为合法切分点：
+
+| source 层 | 服务的层 |
+| --- | --- |
+| 2 | 2–7 |
+| 8 | 8–13 |
+| 14 | 14–19 |
+| 20 | 20–39（同时是 `candidate_source_layer_id`，候选块被 24/28/32/36 复用） |
+
+`{'cuda:0':1,'cuda:1':1}` 得到的切分点正好是 20，stage 0 = 0–19、stage 1 = 20–39，
+每个 (source, 消费者) 对都在同一张卡上，Engram 层 [1, 14] 也都在 stage 0。
+**不要为了平衡显存把切分点挪到 21**（`head.weight` 1.3 GB 在 stage 1，会让 stage 1 略重）：
+挪一层就会把 source 20 和它的 19 个消费层拆到两张卡上。
+
+### 与张量并行的取舍
+
+| | 张量并行 `--tp 2` | 按层切分 |
+| --- | --- | --- |
+| 每卡稠密显存 | 约一半（注意力 / 共享专家 / head 切开，其余复制） | 约一半（整层归属一张卡） |
+| 单请求 prefill | 明显变快（注意力与稠密 GEMM 并行） | 基本不变 |
+| 单请求 decode | 变慢（每个算子多一次两卡 worker 调度，实测约 34 us/算子） | 基本不变 |
+| 通信 | 每层 2 次 all-reduce（NVLink，量小） | 每个 stage 边界 1 次隐藏状态搬运 |
+| 约束 | `num_attention_heads / tp` 必须是 32 的倍数并对齐 o_groups | 切分点必须落在 kv source 边界 |
+
+建议：长上下文 / prefill 为主用 `--tp 2`；要显存（给 KV cache 或专家缓存腾地方）、
+或者以 decode 吞吐为主，用按层切分。两者目前是二选一。
+
 ## 多请求与前缀缓存
 
 ### 批量 decode

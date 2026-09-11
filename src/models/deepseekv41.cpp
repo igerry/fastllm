@@ -323,6 +323,29 @@ namespace fastllm {
             dst.CopyFrom(src);
         }
 
+        // 从复制布局的某一张卡副本拷到 CPU（root 在复制布局下只有形状信息）
+        void V41ReplicaToCpu(Data &dst, const Data &src, const std::vector<int> &tpDevices) {
+#ifdef USE_CUDA
+            if (!tpDevices.empty() && src.multiDeviceData && src.IsTensorParallelReplicated()) {
+                for (int device : tpDevices) {
+                    auto it = src.multiDeviceDatas.find(device);
+                    if (it == src.multiDeviceDatas.end() || it->second == nullptr ||
+                        it->second->cudaData == nullptr) {
+                        continue;
+                    }
+                    const int oriDevice = FastllmCudaGetDevice();
+                    FastllmCudaSetDevice(device);
+                    dst.CopyFrom(*it->second);
+                    dst.ToDevice(DataDevice::CPU);
+                    FastllmCudaSetDevice(oriDevice);
+                    return;
+                }
+            }
+#endif
+            dst.CopyFrom(src);
+            dst.ToDevice(DataDevice::CPU);
+        }
+
         // 分配一个（可能是复制布局的）空张量
         void V41AllocLike(Data &dst, DataType type, const std::vector<int> &dims,
                           const Data &reference, const std::vector<int> &tpDevices) {
@@ -2751,7 +2774,22 @@ namespace fastllm {
                 // 在 cpu / numa 上仍然是单份计算，结果随后广播回两张卡。
                 const bool routedExpertParallel = V41DeviceSpecUsesType(
                     this->SelectMoeDeviceForLayer(layer), "multicuda");
-                MergeMOEBlock(&ffnInput, &expertIndex, &expertScore, &moeWeights, &biass[layer],
+                Data *moeInputPtr = &ffnInput;
+                Data *moeIndexPtr = &expertIndex;
+                Data *moeScorePtr = &expertScore;
+                Data cpuMoeInput, cpuMoeIndex, cpuMoeScore;
+                if (tp && !routedExpertParallel) {
+                    // MoE 落在 cpu / numa 时，输入必须从某张卡的副本拷出来：
+                    // 直接交给 CPU 算子会让 Data::ToDevice 从复制布局已经失效的
+                    // root 上读，直接段错误。
+                    V41ReplicaToCpu(cpuMoeInput, ffnInput, tpDevices);
+                    V41ReplicaToCpu(cpuMoeIndex, expertIndex, tpDevices);
+                    V41ReplicaToCpu(cpuMoeScore, expertScore, tpDevices);
+                    moeInputPtr = &cpuMoeInput;
+                    moeIndexPtr = &cpuMoeIndex;
+                    moeScorePtr = &cpuMoeScore;
+                }
+                MergeMOEBlock(moeInputPtr, moeIndexPtr, moeScorePtr, &moeWeights, &biass[layer],
                               &w1, &w2, &w3, &tempInput, &tempOutput, 1.0f, &ffnOut, layer,
                               ffnInput.dataType, ffnInput.dataType, &moeInputTemp, &moeOutputTemp,
                               MoeGateSwiglu, routedExpertParallel, swiglu_limit, true);

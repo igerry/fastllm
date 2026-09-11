@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <mutex>
 #include <vector>
 
 #include <cuda_bf16.h>
@@ -1881,11 +1882,23 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
     // FASTLLM_DSV41_LEGACY_ATTN=1 可退回下面的 FP32 标量 kernel 做对比 / 排查。
     if (q.dataType == DataType::BFLOAT16 && dim == kMmaDim && heads % kMmaHeads == 0 &&
         V41MmaSupported() && !V41EnvOn("FASTLLM_DSV41_LEGACY_ATTN")) {
-        static bool sharedReady = false;
-        if (!sharedReady) {
-            cudaFuncSetAttribute(V41SparseAttentionMmaKernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 (int)sizeof(V41MmaShared));
-            sharedReady = true;
+        // cudaFuncSetAttribute 是**按设备**生效的：多卡（张量并行 / 按层切分）下
+        // 每张卡都要设一次。原来的进程级 static bool 会让第二张卡漏设，
+        // 动态共享内存超过默认 48 KB，kernel 启动直接返回 invalid argument。
+        // 张量并行时两个 worker 线程并发进入这里，还会退化成偶发失败。
+        {
+            static std::mutex mmaSharedMutex;
+            static bool mmaSharedReady[16] = {false};
+            const int mmaDevice = FastllmCudaGetDevice();
+            if (mmaDevice >= 0 && mmaDevice < 16) {
+                std::lock_guard<std::mutex> lock(mmaSharedMutex);
+                if (!mmaSharedReady[mmaDevice]) {
+                    cudaFuncSetAttribute(V41SparseAttentionMmaKernel,
+                                         cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                         (int)sizeof(V41MmaShared));
+                    mmaSharedReady[mmaDevice] = true;
+                }
+            }
         }
         const int tokens = bsz * seqlen;
         const int headBlocks = heads / kMmaHeads;

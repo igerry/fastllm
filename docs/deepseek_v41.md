@@ -99,12 +99,24 @@ ftllm server /path/to/DeepSeek-V4.1-Flash \
 | --- | --- |
 | 加载耗时 | 约 7 分钟（含两张 Engram 表各 101.4 GB 读入内存） |
 | 显存 | 15.9 GB，单卡即可（稠密 FP8 反量化为 float16 后） |
-| 内存 | 524 GB 常驻 |
-| prefill | 2054 token 约 13 秒；33999 token 约 242 秒（约 140–160 token/s） |
-| decode | 单请求 1.7–4.4 token/s（路由专家在 CPU） |
+| 内存 | 约 521 GB 常驻 |
 | 图像 | 448x336 的图 210 个 prompt token，端到端 6 秒 |
 
-decode 速度受限于当前朴素的稀疏注意力与 indexer kernel，以及 CPU 上的 FP4 专家；见文末的未完成项。
+prefill 与 decode（同一台机器、同一组提示词，BF16 mma kernel 上线前后对照）：
+
+| 上下文 | prefill 旧 | prefill 新 | decode 旧 | decode 新 |
+| --- | --- | --- | --- | --- |
+| 14 | 1.9 s | 2.2 s | 194 ms/token | 164 ms/token |
+| 974 | 5.7 s | 4.8 s | 302 ms/token | 153 ms/token |
+| 8014 | 35.9 s | 16.9 s | 423 ms/token | 234 ms/token |
+| 32014 | 207.3 s | 66.4 s | 319 ms/token | 132 ms/token |
+
+单步 decode 的算子分解（`FASTLLM_PRINT_PROFILE=1 FASTLLM_CUDA_SYNC=1`，短上下文）显示 `MergeMOE`
+（CPU 上的 FP4 路由专家）占绝对多数：新 kernel 上线前为 137 ms / 190 ms。因此短上下文的 decode
+主要由 CPU 专家决定，长上下文与 prefill 才由注意力与 indexer 决定。
+
+CPU 专家的当前瓶颈：融合的 FP4 GEMM 只有 AVX512-BF16 实现，在没有 AVX512 的机器（如 Zen 3 的 EPYC 7C13）
+上回退为"先把 FP4 解量化到临时 BF16 缓冲，再做普通 BF16 GEMM"，读写放大数倍。见文末的未完成项。
 
 行为验证（贪心解码）：中英文常识、算术、代码生成、逻辑推理均正确；34k token 上下文的"大海捞针"命中
 （该长度会激活候选块两级 top-k）；工具调用能正确产出 `tool_calls`；图像输入能正确描述图中的形状与颜色。

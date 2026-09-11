@@ -593,6 +593,92 @@ namespace {
         V41Store<T>(y, idx, v);
     }
 
+    // ---------------- HcApplyPre + RMSNorm 融合 ----------------
+    //
+    // V4.1 每个子层的入口都是「HcApplyPre(curHidden, pre) -> x -> RMSNorm(x) -> 子层输入」，
+    // 中间的 x 只被紧接着的 RMSNorm 读一次。融合后省掉 x 的一次写 + 一次读，
+    // 以及一次 kernel 启动（40 层 x 2 次）。
+    //
+    // 数值必须与「HcApplyPre 写 BF16」+「FastllmRMSNormKernelInner1<T> 的 BF16 版本」
+    // 逐 bit 相同，因此这里照抄两边的顺序：
+    //   * 折叠按 h 从小到大 FP32 累加，写进中间结果前先舍入到 BF16（HcApplyPre 的 V41Store）；
+    //   * 平方和按 i = tid, tid + T, ... 的顺序累加，warp shuffle-down 归约树、
+    //     跨 warp 的 warp_sums 归约、rsqrtf(val / channels + eps) 与写出的 lo * s * w
+    //     都与 RMSNorm kernel 一致。
+    // 所以 THREAD_PER_BLOCK 必须与 LaunchFastllmRMSNormBFloat16 对同一个 channels 的选择相同。
+    template <int THREAD_PER_BLOCK, int MAX_ITER>
+    __global__ void __launch_bounds__(THREAD_PER_BLOCK)
+    V41HcPreNormKernel(const __nv_bfloat16 *x, const float *pre, const float *weight,
+                       __nv_bfloat16 *out, int hcMult, int channels, float eps) {
+        constexpr int WARP_SIZE = 32;
+        constexpr int NUM_WARPS = THREAD_PER_BLOCK / WARP_SIZE;
+        __shared__ float warp_sums[NUM_WARPS];
+        __shared__ float scale;
+
+        const int o = blockIdx.x;
+        const int bf2 = channels / 2;
+        const __nv_bfloat162 *xb = reinterpret_cast<const __nv_bfloat162*>(x) + (uint64_t)o * hcMult * bf2;
+        const float *preRow = pre + (uint64_t)o * hcMult;
+        __nv_bfloat162 *outb = reinterpret_cast<__nv_bfloat162*>(out) + (uint64_t)o * bf2;
+
+        const unsigned tid = threadIdx.x;
+        const int warp_id = (int)tid / WARP_SIZE, lane_id = (int)tid % WARP_SIZE;
+
+        float2 cache[MAX_ITER];
+        float sum2 = 0.0f;
+#pragma unroll
+        for (int k = 0; k < MAX_ITER; k++) {
+            const int i = (int)tid + k * THREAD_PER_BLOCK;
+            if (i < bf2) {
+                float lo = 0.0f, hi = 0.0f;
+                for (int h = 0; h < hcMult; h++) {
+                    const __nv_bfloat162 v = xb[(uint64_t)h * bf2 + i];
+                    const float p = preRow[h];
+                    lo += p * __bfloat162float(v.x);
+                    hi += p * __bfloat162float(v.y);
+                }
+                lo = __bfloat162float(__float2bfloat16_rn(lo));
+                hi = __bfloat162float(__float2bfloat16_rn(hi));
+                cache[k] = make_float2(lo, hi);
+                sum2 += lo * lo + hi * hi;
+            }
+        }
+
+#pragma unroll
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            sum2 += __shfl_down_sync(0xffffffff, sum2, offset);
+        }
+        if (lane_id == 0) {
+            warp_sums[warp_id] = sum2;
+        }
+        __syncthreads();
+        if (warp_id == 0) {
+            float val = (lane_id < NUM_WARPS) ? warp_sums[lane_id] : 0.0f;
+#pragma unroll
+            for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+                val += __shfl_down_sync(0xffffffff, val, offset);
+            }
+            if (lane_id == 0) {
+                scale = rsqrtf(val / channels + eps);
+            }
+        }
+        __syncthreads();
+
+        const float s = scale;
+#pragma unroll
+        for (int k = 0; k < MAX_ITER; k++) {
+            const int i = (int)tid + k * THREAD_PER_BLOCK;
+            if (i < bf2) {
+                const float w0 = __ldg(&weight[i * 2]);
+                const float w1 = __ldg(&weight[i * 2 + 1]);
+                __nv_bfloat162 ov;
+                ov.x = __float2bfloat16_rn(cache[k].x * s * w0);
+                ov.y = __float2bfloat16_rn(cache[k].y * s * w1);
+                outb[i] = ov;
+            }
+        }
+    }
+
     // ---------------- EngramApply ----------------
 
     constexpr int kEngramThreads = 256;
@@ -2111,6 +2197,63 @@ extern "C" bool FastllmCudaDeepSeekV41HcApplyPre(const fastllm::Data &x, const f
                                                         (float*)y.cudaData, tokens, hcMult, dim);
     }
     return V41CheckLaunch("HcApplyPre");
+}
+
+extern "C" bool FastllmCudaDeepSeekV41HcPreNorm(const fastllm::Data &x, const fastllm::Data &pre,
+                                               fastllm::Data &normWeight, float eps, fastllm::Data &output) {
+    if (V41EnvOn("FASTLLM_DSV41_DISABLE_HCPRENORM")) {
+        return false;
+    }
+    if (!V41OnCuda(x) || !V41OnCuda(pre) || x.dims.size() != 4 || x.dataType != DataType::BFLOAT16 ||
+        pre.dataType != DataType::FLOAT32 || x.multiDeviceData || pre.multiDeviceData ||
+        normWeight.multiDeviceData) {
+        return false;
+    }
+    const int bsz = x.dims[0], seqlen = x.dims[1], hcMult = x.dims[2], channels = x.dims[3];
+    const int tokens = bsz * seqlen;
+    if (tokens <= 0 || hcMult <= 0 || channels <= 0 || (channels & 1) != 0) {
+        return false;
+    }
+    if (pre.Count(0) != (uint64_t)tokens * hcMult) {
+        return false;
+    }
+    normWeight.ToDevice(DataDevice::CUDA);
+    if (normWeight.dataType != DataType::FLOAT32 || normWeight.dims.size() != 1 ||
+        normWeight.dims[0] != channels || normWeight.cudaData == nullptr) {
+        return false;
+    }
+    // THREAD_PER_BLOCK 必须与 LaunchFastllmRMSNormBFloat16 的选择一致，否则归约树不同、
+    // 结果不再逐 bit 相同。channels == 3072 走的是另一个专用 kernel，这里不接管。
+    if (channels == 3072) {
+        return false;
+    }
+    const int threads = channels < 512 ? 64 : (channels < 4096 ? 512 : 1024);
+    const int bf2 = channels / 2;
+    const int maxIter = (bf2 + threads - 1) / threads;
+    if (!V41PrepareOutput(output, DataType::BFLOAT16, {bsz, seqlen, channels})) {
+        return false;
+    }
+    const __nv_bfloat16 *xp = (const __nv_bfloat16*)x.cudaData;
+    const float *prep = (const float*)pre.cudaData;
+    const float *wp = (const float*)normWeight.cudaData;
+    __nv_bfloat16 *op = (__nv_bfloat16*)output.cudaData;
+#define V41_HCPRENORM_LAUNCH(T)                                                                     \
+    switch (maxIter) {                                                                              \
+        case 1: V41HcPreNormKernel<T, 1><<<tokens, T>>>(xp, prep, wp, op, hcMult, channels, eps); break;  \
+        case 2: V41HcPreNormKernel<T, 2><<<tokens, T>>>(xp, prep, wp, op, hcMult, channels, eps); break;  \
+        case 3: V41HcPreNormKernel<T, 3><<<tokens, T>>>(xp, prep, wp, op, hcMult, channels, eps); break;  \
+        case 4: V41HcPreNormKernel<T, 4><<<tokens, T>>>(xp, prep, wp, op, hcMult, channels, eps); break;  \
+        default: return false;                                                                      \
+    }
+    if (threads == 64) {
+        V41_HCPRENORM_LAUNCH(64)
+    } else if (threads == 512) {
+        V41_HCPRENORM_LAUNCH(512)
+    } else {
+        V41_HCPRENORM_LAUNCH(1024)
+    }
+#undef V41_HCPRENORM_LAUNCH
+    return V41CheckLaunch("HcPreNorm");
 }
 
 extern "C" bool FastllmCudaDeepSeekV41EngramApply(fastllm::Data &hidden, const fastllm::Data &kv,

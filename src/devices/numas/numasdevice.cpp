@@ -306,10 +306,16 @@ namespace fastllm {
     // 多卡专家流的重叠开关。默认全部关闭，行为与合入前完全一致。
     //   FT_MOE_ASSIST_OVERLAP=1  assist 卡的输入 staging 与输出归约改成事件
     //                            依赖，从主线程关键路径上移走。
+    //   FT_MOE_ASSIST_BALANCE=1  按各卡实测的每专家耗时分配 GPU 专家，而不是
+    //                            固定按 route 数均分。
+    //   FT_EXPERT_LIMIT_AUTO=1   用真实层反馈出的 CPU/GPU 速度算 expertLimit，
+    //                            取代单专家合成 benchmark 的估计。
     //   FASTLLM_NUMAS_MOE_ASSIST_PROFILE=1  打印 prefill 各阶段耗时。
     struct NumasMoeAssistConfig {
         bool overlap = false;
+        bool balance = false;
         bool profile = false;
+        bool autoExpertLimit = false;
     };
 
     static const NumasMoeAssistConfig &GetNumasMoeAssistConfig() {
@@ -328,14 +334,172 @@ namespace fastllm {
             };
             NumasMoeAssistConfig parsed;
             parsed.overlap = readBool("FT_MOE_ASSIST_OVERLAP");
+            parsed.balance = readBool("FT_MOE_ASSIST_BALANCE");
             parsed.profile = readBool("FASTLLM_NUMAS_MOE_ASSIST_PROFILE");
+            parsed.autoExpertLimit = readBool("FT_EXPERT_LIMIT_AUTO");
+            if (parsed.autoExpertLimit) {
+                printf("Activate NUMA MoE measured expertLimit\n");
+            }
             if (parsed.overlap) {
                 printf("Activate NUMA MoE assist overlap\n");
+            }
+            if (parsed.balance) {
+                printf("Activate NUMA MoE assist bandwidth balance\n");
             }
             return parsed;
         }();
         return config;
     }
+
+    // 每张卡跑一个 GPU 专家的实测耗时（毫秒，EMA）。assist 卡与承载稠密层的卡
+    // 共享同一条主存通路，实际吞吐不一定相同，按 route 数均分会让快卡空等慢卡。
+    // 这里用真实层的耗时反馈，不做额外的合成 benchmark。
+    class NumasMoeDeviceSpeedTracker {
+    public:
+        static NumasMoeDeviceSpeedTracker &GetInstance() {
+            static NumasMoeDeviceSpeedTracker instance;
+            return instance;
+        }
+
+        void RecordGpu(int device, int expertCount, double elapsedMs) {
+            if (device < 0 || expertCount <= 0 || elapsedMs <= 0.0) {
+                return;
+            }
+            const double sample = elapsedMs / expertCount;
+            std::lock_guard<std::mutex> guard(locker);
+            auto it = msPerExpert.find(device);
+            if (it == msPerExpert.end()) {
+                msPerExpert[device] = sample;
+            } else {
+                it->second = it->second * 0.7 + sample * 0.3;
+            }
+            gpuSamples[device]++;
+        }
+
+        // 没有样本时返回 0，调用方退回均分。
+        double GetMsPerExpert(int device) {
+            std::lock_guard<std::mutex> guard(locker);
+            auto it = msPerExpert.find(device);
+            return it == msPerExpert.end() ? 0.0 : it->second;
+        }
+
+        void RecordCpu(size_t routes, double elapsedMs) {
+            if (routes == 0 || elapsedMs <= 0.0) {
+                return;
+            }
+            const double sample = elapsedMs / (double)routes;
+            std::lock_guard<std::mutex> guard(locker);
+            cpuMsPerRoute = cpuMsPerRoute <= 0.0 ? sample :
+                cpuMsPerRoute * 0.7 + sample * 0.3;
+            cpuSamples++;
+        }
+
+        double GetCpuMsPerRoute() {
+            std::lock_guard<std::mutex> guard(locker);
+            return cpuMsPerRoute;
+        }
+
+        // 用真实层反馈出来的两个系数直接算 makespan 最优的 expertLimit。
+        // 与合成 benchmark 的区别：per-expert 的 GPU 耗时来自流水线跑满时的
+        // 实测均值（包含跨专家的 H2D/compute 重叠、以及两张卡并发时的互相
+        // 干扰），不会像单专家 + 每轮 sync 的 benchmark 那样系统性高估 GPU。
+        // 样本不足时返回 0，调用方沿用原有估计。
+        int PredictExpertLimit(
+                const std::vector<std::vector<std::pair<int, float> > >
+                    &expertTasks,
+                Data **weights, int weightsBatch,
+                const std::vector<int> &gpuDevices,
+                int defaultLimit, int minSamples,
+                double *outCpuMs, double *outGpuMs) {
+            std::vector<double> unitCost;
+            double cpuUnit = 0.0;
+            {
+                std::lock_guard<std::mutex> guard(locker);
+                if (cpuSamples < minSamples || cpuMsPerRoute <= 0.0) {
+                    return 0;
+                }
+                cpuUnit = cpuMsPerRoute;
+                for (int device : gpuDevices) {
+                    auto it = msPerExpert.find(device);
+                    auto countIt = gpuSamples.find(device);
+                    if (it == msPerExpert.end() || it->second <= 0.0 ||
+                        countIt == gpuSamples.end() ||
+                        countIt->second < minSamples) {
+                        return 0;
+                    }
+                    unitCost.push_back(it->second);
+                }
+            }
+            if (unitCost.empty()) {
+                return 0;
+            }
+
+            int maxTaskSize = 0;
+            for (int e = 0; e < (int)expertTasks.size(); e++) {
+                if (e * 2 >= weightsBatch || weights[e * 2] == nullptr) {
+                    continue;
+                }
+                maxTaskSize = std::max(
+                    maxTaskSize, (int)expertTasks[e].size());
+            }
+            if (maxTaskSize <= 0) {
+                return 0;
+            }
+            maxTaskSize = std::min(maxTaskSize, defaultLimit);
+
+            int bestLimit = 0;
+            double bestMakespan = DBL_MAX;
+            double bestCpuMs = 0.0, bestGpuMs = 0.0;
+            std::vector<double> gpuLoads;
+            for (int t = 1; t <= maxTaskSize + 1; t++) {
+                double cpuRoutes = 0.0;
+                int gpuExpertCount = 0;
+                for (int e = 0; e < (int)expertTasks.size(); e++) {
+                    if (e * 2 >= weightsBatch || weights[e * 2] == nullptr ||
+                        expertTasks[e].empty()) {
+                        continue;
+                    }
+                    if ((int)expertTasks[e].size() < t) {
+                        cpuRoutes += (double)expertTasks[e].size();
+                    } else {
+                        gpuExpertCount++;
+                    }
+                }
+                // 与实际分配用的贪心一致：每次把下一个专家放到预计最早空闲
+                // 的卡上，所以慢卡自然少拿。
+                gpuLoads.assign(unitCost.size(), 0.0);
+                for (int i = 0; i < gpuExpertCount; i++) {
+                    auto loadIt = std::min_element(
+                        gpuLoads.begin(), gpuLoads.end());
+                    *loadIt += unitCost[loadIt - gpuLoads.begin()];
+                }
+                const double cpuMs = cpuRoutes * cpuUnit;
+                const double gpuMs = gpuLoads.empty() ? 0.0 :
+                    *std::max_element(gpuLoads.begin(), gpuLoads.end());
+                const double makespan = std::max(cpuMs, gpuMs);
+                if (makespan < bestMakespan) {
+                    bestMakespan = makespan;
+                    bestLimit = t;
+                    bestCpuMs = cpuMs;
+                    bestGpuMs = gpuMs;
+                }
+            }
+            if (outCpuMs != nullptr) {
+                *outCpuMs = bestCpuMs;
+            }
+            if (outGpuMs != nullptr) {
+                *outGpuMs = bestGpuMs;
+            }
+            return bestLimit;
+        }
+
+    private:
+        std::mutex locker;
+        std::map<int, double> msPerExpert;
+        std::map<int, int> gpuSamples;
+        double cpuMsPerRoute = 0.0;
+        int cpuSamples = 0;
+    };
 
     static MachineNumaInfo machineNumaInfo;
     NumaConfig *fastllmNumaConfig = nullptr;
@@ -8089,23 +8253,50 @@ namespace fastllm {
             // CPU/GPU expert split benchmark in that case.
             if (gpuPrefill && !hasExpertLimitOverride) {
 #ifdef USE_CUDA
-                const NumasMoeCudaInputReplica &profileReplica =
-                    cudaInputReplicas.front();
-                FastllmCudaSetDevice(profileReplica.deviceId);
-                Data profileInput(
-                    input.dataType, input.dims,
-                    DataDevice::CPU, input.cpuData);
-                profileInput.cudaData = profileReplica.cudaData;
-                profileInput.cudaDataBorrowed = true;
-                profileInput.dataDeviceIds = {profileReplica.deviceId};
-                expertLimit = std::min(expertLimit, 
-                    MoeExpertSpeedEstimator::GetInstance().GetDynamicExpertLimit(
-                        profileInput, output, w1, w2, w3,
-                        weights, biass, weightsBatch, topk, sharedScale,
-                        expertTasks, expertLimit,
-                        (int)cudaInputReplicas.size()
-                    )
-                );
+                // 先试实测反馈模型；样本不够（前几层）时退回原来的合成
+                // benchmark，保证第一次 prefill 也有一个合理的切分。
+                int measuredLimit = 0;
+                if (assistConfig.autoExpertLimit) {
+                    std::vector<int> gpuDevices;
+                    for (const auto &replica : cudaInputReplicas) {
+                        gpuDevices.push_back(replica.deviceId);
+                    }
+                    double predictCpuMs = 0.0, predictGpuMs = 0.0;
+                    measuredLimit = NumasMoeDeviceSpeedTracker::GetInstance().
+                        PredictExpertLimit(
+                            expertTasks, weights, weightsBatch, gpuDevices,
+                            expertLimit, 4, &predictCpuMs, &predictGpuMs);
+                    if (measuredLimit > 0 && assistConfig.profile) {
+                        printf(
+                            "[fastllm-profile-numas-moe-assist] layer=%d "
+                            "measured_limit=%d predict_cpu=%.2fms "
+                            "predict_gpu=%.2fms\n",
+                            layer, measuredLimit, predictCpuMs,
+                            predictGpuMs);
+                        fflush(stdout);
+                    }
+                }
+                if (measuredLimit > 0) {
+                    expertLimit = std::min(expertLimit, measuredLimit);
+                } else {
+                    const NumasMoeCudaInputReplica &profileReplica =
+                        cudaInputReplicas.front();
+                    FastllmCudaSetDevice(profileReplica.deviceId);
+                    Data profileInput(
+                        input.dataType, input.dims,
+                        DataDevice::CPU, input.cpuData);
+                    profileInput.cudaData = profileReplica.cudaData;
+                    profileInput.cudaDataBorrowed = true;
+                    profileInput.dataDeviceIds = {profileReplica.deviceId};
+                    expertLimit = std::min(expertLimit,
+                        MoeExpertSpeedEstimator::GetInstance().GetDynamicExpertLimit(
+                            profileInput, output, w1, w2, w3,
+                            weights, biass, weightsBatch, topk, sharedScale,
+                            expertTasks, expertLimit,
+                            (int)cudaInputReplicas.size()
+                        )
+                    );
+                }
 #endif
             }
             phaseLap(phaseLimitMs);
@@ -8157,12 +8348,43 @@ namespace fastllm {
                         }
                         return a < b;
                     });
-                for (int expert : orderedGpuExperts) {
-                    auto loadIt = std::min_element(
-                        gpuExpertLoads.begin(), gpuExpertLoads.end());
-                    int worker = (int)(loadIt - gpuExpertLoads.begin());
-                    gpuExpertSets[worker].insert(expert);
-                    gpuExpertLoads[worker] += expertTasks[expert].size();
+                // 每个专家在某张卡上的代价 ≈ 该卡的「每专家实测毫秒」。专家
+                // 权重的 H2D 是主导项，与 route 数几乎无关，所以按实测耗时
+                // 分配等价于按各卡实际带宽分配。没有样本时退回原来的均分。
+                std::vector<double> workerUnitCost(gpuWorkerCount, 1.0);
+                bool useMeasuredCost = false;
+                if (assistConfig.balance && gpuWorkerCount > 1) {
+                    auto &tracker =
+                        NumasMoeDeviceSpeedTracker::GetInstance();
+                    useMeasuredCost = true;
+                    for (int i = 0; i < gpuWorkerCount; i++) {
+                        double cost = tracker.GetMsPerExpert(
+                            cudaInputReplicas[i].deviceId);
+                        if (cost <= 0.0) {
+                            useMeasuredCost = false;
+                            break;
+                        }
+                        workerUnitCost[i] = cost;
+                    }
+                }
+                if (useMeasuredCost) {
+                    std::vector<double> predictedMs(gpuWorkerCount, 0.0);
+                    for (int expert : orderedGpuExperts) {
+                        auto loadIt = std::min_element(
+                            predictedMs.begin(), predictedMs.end());
+                        int worker = (int)(loadIt - predictedMs.begin());
+                        gpuExpertSets[worker].insert(expert);
+                        gpuExpertLoads[worker] += expertTasks[expert].size();
+                        predictedMs[worker] += workerUnitCost[worker];
+                    }
+                } else {
+                    for (int expert : orderedGpuExperts) {
+                        auto loadIt = std::min_element(
+                            gpuExpertLoads.begin(), gpuExpertLoads.end());
+                        int worker = (int)(loadIt - gpuExpertLoads.begin());
+                        gpuExpertSets[worker].insert(expert);
+                        gpuExpertLoads[worker] += expertTasks[expert].size();
+                    }
                 }
 
                 gpuId = cudaInputReplicas.front().deviceId;
@@ -8276,6 +8498,8 @@ namespace fastllm {
                                     "input replica.");
                             }
                         }
+                        auto workerStart =
+                            std::chrono::steady_clock::now();
                         // RegisterNumas converts source FP8 weights in place
                         // to their packed representation.  Normalize CUDA
                         // experts before their first hybrid-prefill use, so a
@@ -8308,6 +8532,11 @@ namespace fastllm {
                             index, score, w1, w2, w3, weights, biass,
                             sharedScale, true, gpuExpertSets[i], true,
                             MoeGateSwiglu, deepSeekV4Mode, swigluLimit);
+                        NumasMoeDeviceSpeedTracker::GetInstance().RecordGpu(
+                            workerDevice, (int)gpuExpertSets[i].size(),
+                            std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() -
+                                workerStart).count());
                         // 归约的跨卡传输也在 worker 线程里发起：DoCuda... 返回
                         // 时本卡的 partial 已经算完，这一步与 root 卡的剩余
                         // 专家、以及主线程的 CPU 专家重叠。主线程只需要在
@@ -8360,11 +8589,23 @@ namespace fastllm {
                     cpuOutputPinned = fastllmMoeDataManagerNumas.EnsurePinnedOutput(output.GetBytes());
                 }
 #endif
+                auto cpuExpertStart = std::chrono::steady_clock::now();
                 DoNumasMergeMOEOnCPU(
                     input, output, index, score, weights, biass,
                     sharedScale, weightsBatch, topk, cpuExperts, fastllmMoeDataManagerNumas,
                     cpuOutputPinned, swigluLimit, deepSeekV4Mode
                 );
+                {
+                    size_t cpuRoutes = 0;
+                    for (int expert : cpuExperts) {
+                        cpuRoutes += expertTasks[expert].size();
+                    }
+                    NumasMoeDeviceSpeedTracker::GetInstance().RecordCpu(
+                        cpuRoutes,
+                        std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() -
+                            cpuExpertStart).count());
+                }
 #ifdef USE_CUDA
                 // CPU partial 直接写入 pinned buffer，再异步搬到复用的 GPU staging buffer。
                 if (gpuPrefill && !gpuExperts.empty() && cpuOutputPinned != nullptr) {

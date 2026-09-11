@@ -749,9 +749,14 @@ def _is_moe_architecture(architecture: str, model_type: str = "", text_model_typ
         "qwen3_8_flash_next_text",
     ])
 
-def _prefers_multicuda_tp(architecture: str, model_type: str = "") -> bool:
-    return (architecture == "DeepseekV4ForCausalLM" or
-            model_type == "deepseek_v4")
+def _prefers_multicuda_tp(architecture: str, model_type: str = "",
+                          text_model_type: str = "") -> bool:
+    # DeepSeek-V4.1 与 V4 共用同一套 multicuda 张量并行实现（注意力按 query head
+    # 切分 + wo_b 列切 all-reduce），--tp N 同样要落到 multicuda 执行器上。
+    return (architecture in ("DeepseekV4ForCausalLM",
+                             "DeepseekV41ForCausalLM") or
+            model_type in ("deepseek_v4", "deepseek_v41") or
+            text_model_type == "deepseek_v41_text")
 
 def _prefers_laguna_hybrid_tp(architecture: str, model_type: str = "") -> bool:
     return (architecture == "LagunaForCausalLM" or
@@ -1361,7 +1366,7 @@ def make_normal_llm_model(args, startup_progress = None):
                 is_thread_tp_moe_model = True
             if (_prefers_laguna_hybrid_tp(architecture, model_type)):
                 is_laguna_hybrid_tp_model = True
-            if (_prefers_multicuda_tp(architecture, model_type)):
+            if (_prefers_multicuda_tp(architecture, model_type, text_model_type)):
                 is_multicuda_tp_model = True
             if (is_moe_model):
                 if (args.cache_history == ""):

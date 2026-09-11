@@ -152,6 +152,8 @@ bool FastllmCudaTensorParallelGreedyGatherGraphCreate(
         void **exec);
 bool FastllmCudaGraphLaunch(void *exec);
 void FastllmCudaGraphDestroy(void *graph);
+// 清掉当前线程粘着的 CUDA 运行时错误（捕获失败后回退到逐算子之前必须调用）
+void FastllmCudaClearLastError();
 void FastllmCudaGraphExecDestroy(void *exec);
 const char *FastllmCudaGraphLastError();
 bool FastllmCudaGraphIsCapturing();

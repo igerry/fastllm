@@ -238,6 +238,8 @@ kernel launch。**单卡有收益（省下每步上千次 launch），TP 下收�
 | `FASTLLM_DSV41_CUDA_GRAPH_REPLAY_MASK` | 7 | 排查用：按位选择回放哪几种段（bit0 pre / bit1 post / bit2 route），其余走逐算子 |
 | `FASTLLM_DSV41_CUDA_GRAPH_FAIL_AT` | 关 | 排查用：让第 N 段捕获强制失败，验证回退路径 |
 | `FASTLLM_DSV41_CUDA_GRAPH_INVALIDATE_EVERY` | 关 | 排查用：每 N 次回放强制失效一次，验证重捕获路径 |
+| `FASTLLM_DSV41_CUDA_GRAPH_FORCE_ROUTE_CAPTURE` | 关 | 排查用：强行捕获本来进不了图的路由，验证撞上非法同步 D2H 时的回退 |
+| `FASTLLM_DSV41_CUDA_GRAPH_ALLOW_PIPELINE` | 关 | 排查用：按层切分下强行开图（只会捕获失败后回退） |
 
 ### 捕获了什么、没捕获什么
 
@@ -252,11 +254,21 @@ kernel launch。**单卡有收益（省下每步上千次 launch），TP 下收�
 | --- | --- |
 | pre | hc_attn 混合 -> attn_norm -> wq_a / q_norm / wq_b、wkv / kv_norm -> compressor 的 wkv / wgate 投影、indexer 的 wq_b / weights_proj 投影 |
 | post | wo_a -> wo_b -> hc 残差 -> hc_ffn 混合 -> ffn_norm |
-| route | 路由 gate + `SelectExpert` + 共享专家 |
+| route | 路由 gate + `SelectExpert` |
+| sharedExpert | 共享专家 gateup / SwiGLU / down |
 
 段与段之间保持逐算子执行：RoPE、压缩块追加、indexer 打分与 top-k、稀疏注意力、滑窗写入
-（pre 与 post 之间），以及 `MergeMOEBlock`、共享专家相加、hc 残差（route 之后）。
-40 层的真实模型每步因此是 120 次图启动 + 约 360 次逐算子调用，而不是约 1150 次逐算子调用。
+（pre 与 post 之间），以及 `MergeMOEBlock`、共享专家相加、hc 残差（sharedExpert 之后）。
+
+**占位段**：某一段本来就进不了图时，它会被标成占位段——捕获与回放时都逐算子执行，
+只占住段号让前后段对齐。目前有两种情况：
+
+- **路由**：`FastllmCudaDeepSeekV4RouteScoreTransform` 的 kernel 只支持 ≤ 256 个专家，
+  真实模型是 384，于是路由整段走 CPU 参考实现，里面的 `logits.ToDevice(CPU)` 是同步 D2H，
+  捕获期间非法。真实模型上 40 个 route 段全部是占位段。
+- **共享专家**：`GetCudaSharedExpert()` 为假或权重是 disk weight 时。
+
+因此真实模型每步是 120 次图启动 + 40 段占位 + 约 360 次逐算子调用。
 
 这样做的好处是**图里不含任何 startPos、缓存长度或缓存指针**：图一经捕获，在权重与设备布局
 不变的前提下一直有效，上下文增长既不会让它失效，也不需要为 KV 预分配上下文上限。
@@ -267,6 +279,10 @@ kernel launch。**单卡有收益（省下每步上千次 launch），TP 下收�
 只有同时满足下面全部条件的前向才会走图，其余一律逐算子执行：
 
 - 单请求、单片段、`seqlen == 1` 且 `startPos > 0`（即真正的单 token decode）；
+- 单卡，或 multicuda 张量并行。**按层切分（`--device "{'cuda:0':1,'cuda:1':1}"`）不支持**：
+  一段图只能属于一张卡，而按层切分下每层跑在不同的卡上，层间的跨卡拷贝在捕获期需要
+  预先建好的 NCCL 通信子。默认自动不启用；`FASTLLM_DSV41_CUDA_GRAPH_ALLOW_PIPELINE=1`
+  可以强行打开，但结果只会是捕获失败后回退到逐算子；
 - 纯文本（图像 token 走 CPU 参考路由，无法进图）；
 - 不是 DSpark 的多 token 校验前向（那是 `seqlen > 1`，形状不同）；
 - 模型主体确实跑在 CUDA / multicuda 上（`--device cpu` 时不启用）；
@@ -302,6 +318,26 @@ kernel launch。**单卡有收益（省下每步上千次 launch），TP 下收�
 
 开图与关图的 decode 输出**逐 token 一致**（1500 步长上下文 decode 的 token 序列完全相同），
 logits 的 `max|diff|` / `cos` 与关图逐位相同——图没有改变任何计算，只改变了提交方式。
+
+### 真实权重上的实测（DeepSeek-V4.1-Flash，单卡 3090 Ti + `--moe_device numa` + `--kv_cache_dtype fp4_e2m1`）
+
+同一棵代码树、同一份配置，只切 `FASTLLM_DSV41_CUDA_GRAPH`：
+
+| | 关图 | 开图 |
+| --- | --- | --- |
+| decode（ctx 14 / 974 / 8014 / 32014） | 78 / 78 / 79 / 80 ms/token | 79 / 79 / 79 / 79 ms/token |
+| prefill 首 token（同上四档） | 0.9 / 5.1 / 13.1 / 51.9 s | 0.8 / 5.1 / 13.1 / 51.3 s |
+| 贪心输出与基线比对 | 一致 3/3 | 一致 3/3 |
+| 大海捞针 31k / 123k | 命中 / 命中 | 命中 / 命中 |
+| 捕获情况 | — | 160 段（其中 40 段路由为占位段） |
+
+**真实模型单卡上开图基本持平**。原因是 decode 的 78 ms 里有 45–55 ms 是 CPU 上的 FP4 路由专家，
+GPU 侧只有 25–30 ms，而逐算子的 launch 是异步下发的、正好被 CPU 那段掩盖掉，省下它并不缩短
+关键路径。图的收益集中在 **multicuda 张量并行**那条路径上（每个算子要唤醒两个 worker 并同步
+一次，约 34 us/算子，没有任何东西掩盖它）。
+
+按层切分（流水线）下 decode 与单卡持平，同样是 CPU 专家为瓶颈，因此即使把图支持到那条路径上，
+预期收益也接近于零——这也是目前不支持它的原因之一。
 
 
 ## 按层切分（流水线 / 模型分片）

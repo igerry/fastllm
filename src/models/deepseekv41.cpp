@@ -17,6 +17,7 @@
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
+#include "devices/multicuda/fastllm-multicuda.cuh"
 #endif
 
 #include <algorithm>
@@ -139,6 +140,242 @@ namespace fastllm {
         Executor &V41Executor() {
             return *((Executor*)GetExecutor());
         }
+
+        // ---------------- 张量并行（multicuda）辅助 ----------------
+        //
+        // V4.1 的切分方式与 V4 一致：只有 query head 维被切分（wq_b 按行切 ->
+        // 稀疏注意力 -> wo_a 按 head 组切 -> wo_b 按列切 + all-reduce），
+        // 其余激活全部在每张卡上保留一份完整副本。跨层共享的压缩 KV / indexer key /
+        // 滑窗 KV 缓存也是每卡一份：它们与 head 无关，切分后每一个后续层（以及
+        // 后续 index source 层）都要 all-gather 才能用，而复制只多花一份算力。
+        bool V41DeviceSpecUsesType(const std::string &spec, const std::string &type) {
+            std::string normalized = spec;
+            std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                           [](unsigned char c) { return (char)std::tolower(c); });
+            return normalized == type || normalized.rfind(type + ":", 0) == 0;
+        }
+
+        bool V41DeviceMapUsesMultiCuda(const std::map<std::string, int> &deviceMap) {
+            for (const auto &it : deviceMap) {
+                if (V41DeviceSpecUsesType(it.first, "multicuda")) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // 从 deviceMap 的 key（如 "multicuda:0,1"）直接数出 TP rank 数。
+        // InitParams 阶段执行器还没设置过 multicuda 设备表，只能这样拿。
+        int V41MultiCudaRankCount(const std::map<std::string, int> &deviceMap) {
+            for (const auto &it : deviceMap) {
+                if (!V41DeviceSpecUsesType(it.first, "multicuda")) {
+                    continue;
+                }
+                size_t pos = it.first.find(':');
+                if (pos == std::string::npos) {
+#ifdef USE_CUDA
+                    return std::max(1, FastllmCudaGetDeviceCount());
+#else
+                    return 1;
+#endif
+                }
+                int count = 0;
+                std::string spec = it.first.substr(pos + 1);
+                size_t start = 0;
+                while (start <= spec.size()) {
+                    size_t end = spec.find(',', start);
+                    std::string item = spec.substr(start, end == std::string::npos ? std::string::npos : end - start);
+                    if (!item.empty()) {
+                        count++;
+                    }
+                    if (end == std::string::npos) {
+                        break;
+                    }
+                    start = end + 1;
+                }
+                return std::max(1, count);
+            }
+            return 1;
+        }
+
+        // 返回当前生效的多卡设备列表；不是多卡张量并行时返回空
+        std::vector<int> V41TpDevices(const std::map<std::string, int> &deviceMap) {
+            std::vector<int> devices;
+#ifdef USE_CUDA
+            if (!V41DeviceMapUsesMultiCuda(deviceMap)) {
+                return devices;
+            }
+            // FastllmGetMulticudaDeviceAndRatio 读的是"上一个跑过的 multicuda 算子"
+            // 发布的全局设备表，前向开始时可能还没被写过；先按执行器里解析好的
+            // deviceIds 取，取不到再退回全局表。
+            devices = V41Executor().GetDeviceIds("multicuda");
+            if (devices.size() <= 1) {
+                std::map<int, int> ratios;
+                devices.clear();
+                FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
+            }
+            if (devices.size() <= 1) {
+                devices.clear();
+            }
+#endif
+            return devices;
+        }
+
+#ifdef USE_CUDA
+        void V41ResetMultiDevice(Data &data) {
+            if (!data.multiDeviceData) {
+                return;
+            }
+            for (auto &it : data.multiDeviceDatas) {
+                delete it.second;
+            }
+            data.multiDeviceDatas.clear();
+            data.multiDeviceData = false;
+            data.ClearTensorParallelLayout();
+        }
+
+        // 把 root 的形状 / 扩容信息与 0 号卡副本对齐（副本才是真实数据）
+        void V41SyncRootFromReplica(Data &data, const std::vector<int> &devices) {
+            if (!data.multiDeviceData || devices.empty()) {
+                return;
+            }
+            auto it = data.multiDeviceDatas.find(devices[0]);
+            if (it == data.multiDeviceDatas.end() || it->second == nullptr) {
+                return;
+            }
+            Data *first = it->second;
+            data.dataType = first->dataType;
+            data.UpdateUnitSize();
+            if (data.dims != first->dims) {
+                data.Resize(first->dims);
+            }
+            data.expansionDims = first->expansionDims;
+            data.strides = first->strides;
+            data.expansionSize = first->expansionSize;
+            data.expansionBytes = first->expansionBytes;
+            data.dataDevice = DataDevice::CUDA;
+            data.dataDeviceIds = devices;
+            data.tpLayout = TP_LAYOUT_REPLICATED;
+            data.tpAxis = -1;
+            data.tpGlobalDims = data.dims;
+        }
+
+        // 复制布局下的张量拷贝：逐卡拷贝，不经过可能已经失效的 root
+        void V41CopyTensor(Data &dst, const Data &src, const std::vector<int> &devices) {
+            if (devices.empty() || !src.multiDeviceData || !src.IsTensorParallelReplicated()) {
+                dst.CopyFrom(src);
+                return;
+            }
+            V41ResetMultiDevice(dst);
+            dst.FreeSpace();
+            dst.dataType = src.dataType;
+            dst.UpdateUnitSize();
+            dst.Resize(src.dims);
+            dst.dataDevice = DataDevice::CUDA;
+            dst.dataDeviceIds = devices;
+            dst.multiDeviceData = true;
+            const int oriDevice = FastllmCudaGetDevice();
+            for (int device : devices) {
+                auto it = src.multiDeviceDatas.find(device);
+                AssertInFastLLM(it != src.multiDeviceDatas.end() && it->second != nullptr,
+                                "DeepSeekV41: missing TP replica while copying a tensor.");
+                FastllmCudaSetDevice(device);
+                Data *local = new Data();
+                local->CopyFrom(*it->second);
+                local->dataDeviceIds = {device};
+                dst.multiDeviceDatas[device] = local;
+            }
+            FastllmCudaSetDevice(oriDevice);
+            dst.tpLayout = TP_LAYOUT_REPLICATED;
+            dst.tpAxis = -1;
+            dst.tpGlobalDims = dst.dims;
+            V41SyncRootFromReplica(dst, devices);
+        }
+
+        // 路由分数变换与专家选择在每张卡上各算一份：路由结果必须逐位一致，
+        // 否则两张卡的共享专家 / all-reduce 会对不上。
+        bool V41RouteScoreTransformTp(Data &logits, int mode, const std::vector<int> &devices) {
+            if (devices.empty() || !logits.multiDeviceData ||
+                !logits.IsTensorParallelReplicated()) {
+                return FastllmCudaDeepSeekV4RouteScoreTransform(logits, mode);
+            }
+            std::vector<char> ok(devices.size(), 0);
+            if (!MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
+                    auto it = logits.multiDeviceDatas.find(device);
+                    if (it != logits.multiDeviceDatas.end() && it->second != nullptr) {
+                        ok[rank] = FastllmCudaDeepSeekV4RouteScoreTransform(*it->second, mode);
+                    }
+                })) {
+                return false;
+            }
+            return std::all_of(ok.begin(), ok.end(), [](char v) { return v != 0; });
+        }
+#endif
+
+        // 张量并行感知的赋值：复制布局下逐卡拷贝，否则退回普通 CopyFrom
+        void V41Assign(Data &dst, const Data &src, const std::vector<int> &tpDevices) {
+#ifdef USE_CUDA
+            if (!tpDevices.empty() && src.multiDeviceData && src.IsTensorParallelReplicated()) {
+                V41CopyTensor(dst, src, tpDevices);
+                return;
+            }
+#endif
+            dst.CopyFrom(src);
+        }
+
+        // 从复制布局的某一张卡副本拷到 CPU（root 在复制布局下只有形状信息）
+        void V41ReplicaToCpu(Data &dst, const Data &src, const std::vector<int> &tpDevices) {
+#ifdef USE_CUDA
+            if (!tpDevices.empty() && src.multiDeviceData && src.IsTensorParallelReplicated()) {
+                for (int device : tpDevices) {
+                    auto it = src.multiDeviceDatas.find(device);
+                    if (it == src.multiDeviceDatas.end() || it->second == nullptr ||
+                        it->second->cudaData == nullptr) {
+                        continue;
+                    }
+                    const int oriDevice = FastllmCudaGetDevice();
+                    FastllmCudaSetDevice(device);
+                    dst.CopyFrom(*it->second);
+                    dst.ToDevice(DataDevice::CPU);
+                    FastllmCudaSetDevice(oriDevice);
+                    return;
+                }
+            }
+#endif
+            dst.CopyFrom(src);
+            dst.ToDevice(DataDevice::CPU);
+        }
+
+        // 分配一个（可能是复制布局的）空张量
+        void V41AllocLike(Data &dst, DataType type, const std::vector<int> &dims,
+                          const Data &reference, const std::vector<int> &tpDevices) {
+#ifdef USE_CUDA
+            if (!tpDevices.empty() && reference.multiDeviceData &&
+                reference.IsTensorParallelReplicated()) {
+                V41ResetMultiDevice(dst);
+                dst.FreeSpace();
+                dst.dataType = type;
+                dst.UpdateUnitSize();
+                dst.Resize(dims);
+                dst.dataDevice = DataDevice::CUDA;
+                dst.dataDeviceIds = tpDevices;
+                PrepareMultiCudaReplicatedData(dst, tpDevices, false);
+                const int oriDevice = FastllmCudaGetDevice();
+                for (int device : tpDevices) {
+                    FastllmCudaSetDevice(device);
+                    dst.multiDeviceDatas.at(device)->Allocate();
+                }
+                FastllmCudaSetDevice(oriDevice);
+                V41SyncRootFromReplica(dst, tpDevices);
+                return;
+            }
+#endif
+            dst.dataType = type;
+            dst.Resize(dims);
+            dst.ToDevice(reference.dataDevice);
+            dst.Allocate();
+        }
+
 
         std::vector<int> V41ReadTokenIds(const Data &inputIds) {
             Data cpuIds;
@@ -284,12 +521,29 @@ namespace fastllm {
         }
 
         // 在 axis=1 上追加行（预扩容 + CatDirect），cache 需为 [b, cap, d]
-        void V41AppendRows(Data &cache, const Data &rows) {
+        // 张量并行时缓存是每卡一份：扩容必须逐卡执行，root 只保留形状信息。
+        void V41AppendRows(Data &cache, const Data &rows,
+                           const std::vector<int> &tpDevices = std::vector<int>()) {
             const int unitLen = 256;
             if (cache.dims.size() == 0 && cache.expansionDims.size() == 0) {
                 cache.dataType = rows.dataType;
                 cache.UpdateUnitSize();
             }
+            bool tp = false;
+#ifdef USE_CUDA
+            tp = !tpDevices.empty() && rows.multiDeviceData && rows.IsTensorParallelReplicated();
+            if (tp && !cache.multiDeviceData) {
+                if (cache.Count(0) == 0) {
+                    // 空缓存：直接在每张卡上建副本（前缀缓存恢复出来的缓存在 CPU 上，
+                    // 由 CopyToMultiDevices 从 CPU 广播，不能把 dataDevice 强改成 CUDA）
+                    cache.dataDevice = DataDevice::CUDA;
+                    cache.dataDeviceIds = tpDevices;
+                }
+                PrepareMultiCudaReplicatedData(cache, tpDevices, cache.Count(0) > 0);
+                V41SyncRootFromReplica(cache, tpDevices);
+            }
+            tp = tp && cache.multiDeviceData && cache.IsTensorParallelReplicated();
+#endif
             while ((cache.dims.size() == 0 &&
                     (cache.expansionDims.size() == 0 || rows.dims[1] > cache.expansionDims[1])) ||
                    (cache.dims.size() > 0 && cache.dims[1] + rows.dims[1] > cache.expansionDims[1])) {
@@ -300,18 +554,48 @@ namespace fastllm {
                     newDims = cache.dims;
                     newDims[1] += std::max(((rows.dims[1] - 1) / unitLen + 1) * unitLen, cache.dims[1] / 2);
                 }
+#ifdef USE_CUDA
+                if (tp) {
+                    const int oriDevice = FastllmCudaGetDevice();
+                    for (int device : tpDevices) {
+                        Data *local = cache.multiDeviceDatas.at(device);
+                        FastllmCudaSetDevice(device);
+                        local->Expansion(newDims);
+                    }
+                    FastllmCudaSetDevice(oriDevice);
+                    V41SyncRootFromReplica(cache, tpDevices);
+                    continue;
+                }
+#endif
                 cache.Expansion(newDims);
             }
             CatDirect(cache, rows, 1);
         }
 
         // 把 [1, n, w] 的分块结果写进 [1, N, w] 的整段缓冲的第 offset 行
-        void V41WriteRows(Data &dst, const Data &src, int offset) {
+        void V41WriteRows(Data &dst, const Data &src, int offset,
+                          const std::vector<int> &tpDevices = std::vector<int>()) {
             const uint64_t rowBytes = (uint64_t)src.dims[2] * src.unitSize / src.unitSizeDiv;
             const uint64_t bytes = (uint64_t)src.dims[1] * rowBytes;
             if (bytes == 0) {
                 return;
             }
+#ifdef USE_CUDA
+            if (!tpDevices.empty() && dst.multiDeviceData && dst.IsTensorParallelReplicated() &&
+                src.multiDeviceData && src.IsTensorParallelReplicated()) {
+                const int oriDevice = FastllmCudaGetDevice();
+                for (int device : tpDevices) {
+                    Data *dstLocal = dst.multiDeviceDatas.at(device);
+                    Data *srcLocal = src.multiDeviceDatas.at(device);
+                    FastllmCudaSetDevice(device);
+                    FastllmCudaCopyFromDeviceToDevice(
+                        (uint8_t*)dstLocal->cudaData + (uint64_t)offset * rowBytes,
+                        (uint8_t*)srcLocal->cudaData, bytes);
+                }
+                FastllmCudaSetDevice(oriDevice);
+                return;
+            }
+#endif
             if (dst.dataDevice == DataDevice::CUDA) {
 #ifdef USE_CUDA
                 FastllmCudaCopyFromDeviceToDevice((uint8_t*)dst.cudaData + (uint64_t)offset * rowBytes,
@@ -668,6 +952,65 @@ namespace fastllm {
             this->cantQuantLinears.insert(pre + ".attn.indexer.wk.weight");
             this->cantQuantLinears.insert(pre + ".attn.indexer.weights_proj.weight");
             this->cantQuantLinears.insert(pre + ".ffn.gate.weight");
+        }
+
+        // 注意力的 head 切分有硬约束（CUDA 稀疏注意力 kernel 每 block 32 个 head，
+        // wo_a 要求区间对齐到 o_group）。不满足时撤销 DeepSeekV4Model::InitParams
+        // 注册的注意力 TP 权重，让它们整块加载，前向里注意力也退回复制布局。
+        if (V41DeviceMapUsesMultiCuda(this->deviceMap)) {
+            const int ranks = V41MultiCudaRankCount(this->deviceMap);
+            const bool aligned =
+                ranks > 1 && o_groups > 0 &&
+                num_attention_heads % ranks == 0 &&
+                (num_attention_heads / ranks) % 32 == 0 &&
+                num_attention_heads % o_groups == 0 &&
+                (num_attention_heads / ranks) % (num_attention_heads / o_groups) == 0;
+            if (!aligned) {
+                // 注意力切不开时整体退回单卡：只切 FFN / head 的"半 TP"没有可验证的
+                // 收益（注意力仍要在每张卡上各算一份），而视觉编码器也还不是 TP 感知的。
+                for (int i = 0; i < block_cnt; i++) {
+                    for (const char *suffix : {".attn.wq_b.weight", ".attn.wo_a.weight",
+                                               ".attn.wo_b.weight"}) {
+                        std::string name = "layers." + std::to_string(i) + suffix;
+                        this->specialWeights.erase(name);
+                        this->specialWeightLayerIds.erase(name);
+                    }
+                }
+                this->specialWeights.erase("head.weight");
+                this->specialWeightLayerIds.erase("head.weight");
+                std::string fallbackDevice = "cuda";
+                for (const auto &it : this->deviceMap) {
+                    if (!V41DeviceSpecUsesType(it.first, "multicuda")) {
+                        continue;
+                    }
+                    size_t pos = it.first.find(':');
+                    if (pos != std::string::npos) {
+                        std::string spec = it.first.substr(pos + 1);
+                        size_t comma = spec.find(',');
+                        std::string first = comma == std::string::npos ? spec : spec.substr(0, comma);
+                        size_t slash = first.find('/');
+                        if (slash != std::string::npos) {
+                            first = first.substr(0, slash);
+                        }
+                        if (!first.empty()) {
+                            fallbackDevice = "cuda:" + first;
+                        }
+                    }
+                    break;
+                }
+                printf("[Fastllm] DeepSeek-V4.1 tensor parallel needs num_attention_heads / tp to be a "
+                       "multiple of 32 and aligned to o_groups (got %d heads, %d ranks, o_groups=%d); "
+                       "falling back to %s.\n",
+                       num_attention_heads, ranks, o_groups, fallbackDevice.c_str());
+                fflush(stdout);
+                this->deviceMap = std::map<std::string, int>{{fallbackDevice, 1}};
+                if (V41DeviceMapUsesMultiCuda(this->moeDeviceMap)) {
+                    this->moeDeviceMap = this->deviceMap;
+                }
+                if (V41DeviceMapUsesMultiCuda(this->layeredMoeDeviceMap)) {
+                    this->layeredMoeDeviceMap = this->deviceMap;
+                }
+            }
         }
 
         LoadEngramMeta();
@@ -1160,6 +1503,24 @@ namespace fastllm {
             if (src.dims.size() == 0 || src.Count(0) == 0) {
                 return;
             }
+#ifdef USE_CUDA
+            // 张量并行下缓存是每卡一份，root 只保留形状；快照必须从某张卡的副本上取。
+            if (src.multiDeviceData && src.IsTensorParallelReplicated()) {
+                for (const auto &it : src.multiDeviceDatas) {
+                    if (it.second == nullptr || it.second->cudaData == nullptr) {
+                        continue;
+                    }
+                    const int oriDevice = FastllmCudaGetDevice();
+                    FastllmCudaSetDevice(it.first);
+                    Data local;
+                    local.CopyFrom(*it.second);
+                    local.ToDevice(DataDevice::CPU);
+                    FastllmCudaSetDevice(oriDevice);
+                    dst.CopyFrom(local);
+                    return;
+                }
+            }
+#endif
             dst.CopyFrom(src);
             dst.ToDevice(DataDevice::CPU);
         }
@@ -1788,6 +2149,45 @@ namespace fastllm {
         // --kv_cache_dtype fp8_e4m3：滑窗 KV 与压缩 KV 以 FP8 + UE8M0 块 scale 存储（默认 BF16）
         const bool fp8KV = this->kvCacheDataType == DataType::FP8_E4M3;
 
+        // ---- 张量并行 ----
+        // deviceMap 为 multicuda 且不止一张卡时启用：q / attn_sink / 注意力输出 / wo_a
+        // 按 query head 切分，wo_b 与共享专家 down 按列切并 all-reduce，其余全部复制。
+        // FastllmGetMulticudaDeviceAndRatio 读的是 ApplyDeviceMap 设置的全局设备表，
+        // 首次前向前必须先应用一次主 device map，否则拿到的是空列表。
+        ApplyDeviceMap(this->deviceMap, 1, block_cnt);
+        const std::vector<int> tpDevices = V41TpDevices(this->deviceMap);
+        const bool tp = !tpDevices.empty();
+        // 注意力能否按 head 切分：CUDA 稀疏注意力 kernel 每个 block 处理 32 个 head，
+        // 要求每张卡分到的 head 数是 32 的倍数；wo_a 又要求 head 区间对齐到 o_group。
+        // 不满足时（例如 32 头的迷你模型、或 64 头开 TP=4）注意力退回"每卡各算一份"，
+        // 稠密 FFN / head 仍然切分。
+        const int tpRanks = (int)tpDevices.size();
+        const bool tpHeadsAligned =
+            tpRanks > 0 && o_groups > 0 &&
+            num_attention_heads % tpRanks == 0 &&
+            (num_attention_heads / tpRanks) % 32 == 0 &&
+            num_attention_heads % o_groups == 0 &&
+            (num_attention_heads / tpRanks) % (num_attention_heads / o_groups) == 0;
+        // InitParams 已经在 head 数切不开时把 device map 改回单卡（那时 tp 为假），
+        // 这里的 tpHeadsAligned 只是同一条约束的兜底。
+        // 排查用开关：关掉注意力 head 切分 / 共享专家切分后，全部算子退化为"两卡各算一份"，
+        // 可以把数值问题定位到切分路径还是复制路径。
+        const bool tpAttention = tp && tpHeadsAligned &&
+                                 !V41EnvFlag("FASTLLM_DSV41_DISABLE_TP_ATTENTION");
+        const bool tpSharedExpert = tp && !V41EnvFlag("FASTLLM_DSV41_DISABLE_TP_SHARED_EXPERT");
+        if (std::getenv("FASTLLM_TRACE_OPS") != nullptr) {
+            static bool printed = false;
+            if (!printed) {
+                printed = true;
+                fprintf(stderr, "[v41tp] tp=%d devices=%d deviceMap:", (int)tp, (int)tpDevices.size());
+                for (auto &it : this->deviceMap) {
+                    fprintf(stderr, " '%s'=%d", it.first.c_str(), it.second);
+                }
+                fprintf(stderr, "\n");
+                fflush(stderr);
+            }
+        }
+
         // ---- Engram 历史 ----
         std::vector<int> tokenIds = V41ReadTokenIds(inputIds);
         AssertInFastLLM((int)tokenIds.size() == total, "DeepSeekV41Model::ForwardSegments: inputIds length mismatch.");
@@ -1856,7 +2256,17 @@ namespace fastllm {
                 ToDataType(embedOut, DataType::BFLOAT16);
             }
             embedOut.Reshape({1, seqlen, 1, dim});
-            Repeat(embedOut, 2, hc_mult, hiddenStates);
+            bool repeated = false;
+#ifdef USE_CUDA
+            if (tp) {
+                // Repeat 没有 multicuda 实现，直接走"广播到每卡副本后逐卡 Repeat"，
+                // 否则只有 root 被写入、两张卡的副本会失配。
+                repeated = MultiCudaRepeatToReplicated(embedOut, 2, hc_mult, hiddenStates);
+            }
+#endif
+            if (!repeated) {
+                Repeat(embedOut, 2, hc_mult, hiddenStates);
+            }
         }
         Data *curHidden = &hiddenStates;
         Data *nextHidden = &hiddenTemp;
@@ -1901,9 +2311,16 @@ namespace fastllm {
         std::vector<char> segHasCandidates(numSegments, 0);
 
         Data attnPre, attnPost, attnComb, ffnPre, ffnPost, ffnComb;
+        // 上一子层产出的 pre 系数。原来用 preMix.CopyFrom(ffnPre) 传递，
+        // 但复制布局下 CopyFrom 只会拷贝可能已失效的 root，这里改成指针传递
+        // （ffnPre 在被下一层 attention 消费之后才会被覆盖）。
+        Data *preMixPtr = &preMix;
         Data x, attnInput, qr, qNorm, q, kv, attnOut, woAOut, attnProj;
         Data ffnInput, ffnOut, expertIndex, expertScore;
         Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp;
+        // TP + cpu/numa MoE 时，从卡上副本拷出来的路由专家输入（复用同一组缓冲，
+        // 避免每层重新分配、也避免栈上 Data 的地址被下游缓存复用）
+        Data cpuMoeInput, cpuMoeIndex, cpuMoeScore;
         std::vector<Data> segQ(numSegments), segKV(numSegments), segAttnOut(numSegments);
         Data catTmp[2];
 
@@ -1951,15 +2368,22 @@ namespace fastllm {
             V41HcMix(*curHidden, weight[pre + ".hc_attn_fn"], weight[pre + ".hc_attn_scale"],
                      weight[pre + ".hc_attn_base"], hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
                      attnPre, attnPost, attnComb);
-            V41HcApplyPre(*curHidden, preMix, x);
+            V41HcApplyPre(*curHidden, *preMixPtr, x);
             V41RMSNormBF16(x, weight[pre + ".attn_norm.weight"], rms_norm_eps, attnInput);
 
-            Linear(attnInput, weight[pre + ".attn.wq_a.weight"], Data(), qr);
+            // wq_a / wkv 是复制的（KV 是 MLA 式的单份 latent，与 head 无关）；
+            // wq_b 按行切 -> q 的 head 维分片，Reshape 会把 tpAxis 从最后一维换算到 head 维。
+            Linear(attnInput, weight[pre + ".attn.wq_a.weight"], Data(), qr, tp);
             V41RMSNormBF16(qr, weight[pre + ".attn.q_norm.weight"], rms_norm_eps, qNorm);
-            Linear(qNorm, weight[pre + ".attn.wq_b.weight"], Data(), q);
+            if (tpAttention) {
+                weight[pre + ".attn.wq_b.weight"].tpLinearType = TP_LINEAR_ROW;
+            }
+            // 不切分注意力时 wq_b 也必须显式走复制布局：否则 MultiCudaLinearOp 会按
+            // "大权重通用切分 + gather"处理，而那条路径读的是复制张量已失效的 root。
+            Linear(qNorm, weight[pre + ".attn.wq_b.weight"], Data(), q, tp && !tpAttention);
             q.Reshape({1, seqlen, num_attention_heads, headDim});
 
-            Linear(attnInput, weight[pre + ".attn.wkv.weight"], Data(), kv);
+            Linear(attnInput, weight[pre + ".attn.wkv.weight"], Data(), kv, tp);
             V41RMSNormBF16(kv, weight[pre + ".attn.kv_norm.weight"], rms_norm_eps, kv);
             kv.Reshape({1, seqlen, headDim});
 
@@ -1972,19 +2396,22 @@ namespace fastllm {
                 std::string cpre = pre + ".attn.compressor";
                 Data xFloat;
                 ToDataType(attnInput, xFloat, DataType::FLOAT32);
-                Linear(xFloat, weight[cpre + ".wkv.weight"], Data(), rawKVAll);
+                Linear(xFloat, weight[cpre + ".wkv.weight"], Data(), rawKVAll, tp);
                 ToDataType(rawKVAll, DataType::FLOAT32);
                 if (ratio > 1) {
-                    Linear(xFloat, weight[cpre + ".wgate.weight"], Data(), rawScoreAll);
+                    Linear(xFloat, weight[cpre + ".wgate.weight"], Data(), rawScoreAll, tp);
                     ToDataType(rawScoreAll, DataType::FLOAT32);
                 }
             }
             if (ratio > 0 && isIndexSource[layer]) {
                 std::string ipre = pre + ".attn.indexer";
-                Linear(qNorm, weight[ipre + ".wq_b.weight"], Data(), qIdxAll);
+                // indexer 在每张卡上各算一份：它选出的候选块要供后续所有层复用，
+                // 切 index head 就得对 [token, m] 的分数矩阵做 all-reduce，
+                // 通信量远大于重复计算，而且两卡 top-k 必须逐位一致。
+                Linear(qNorm, weight[ipre + ".wq_b.weight"], Data(), qIdxAll, tp);
                 qIdxAll.Reshape({1, seqlen, index_n_heads, index_head_dim});
                 Data idxWeights;
-                Linear(attnInput, weight[ipre + ".weights_proj.weight"], Data(), idxWeights);
+                Linear(attnInput, weight[ipre + ".weights_proj.weight"], Data(), idxWeights, tp);
                 ToDataType(idxWeights, DataType::FLOAT32);
                 Mul(idxWeights, (1.0f / std::sqrt((float)index_head_dim)) * (1.0f / std::sqrt((float)index_n_heads)),
                     idxWeightsAll);
@@ -2028,9 +2455,9 @@ namespace fastllm {
                         if (seg.spec != nullptr && seg.spec->deferWindow) {
                             seg.spec->prevRawTail[layer] = specPrevTail;
                             seg.spec->prevBlocks[layer] = specPrevBlocks;
-                            seg.spec->rawKV[layer].CopyFrom(*kvAll);
+                            V41Assign(seg.spec->rawKV[layer], *kvAll, tpDevices);
                             if (ratio > 1) {
-                                seg.spec->rawScore[layer].CopyFrom(*scoreAll);
+                                V41Assign(seg.spec->rawScore[layer], *scoreAll, tpDevices);
                             }
                         }
                         const int n = kvAll->dims[1];
@@ -2053,19 +2480,19 @@ namespace fastllm {
                             if (isIndexSource[layer]) {
                                 std::string ipre = pre + ".attn.indexer";
                                 Data kIdx;
-                                Linear(latent, weight[ipre + ".wk.weight"], Data(), kIdx);
+                                Linear(latent, weight[ipre + ".wk.weight"], Data(), kIdx, tp);
                                 V41RMSNormBF16(kIdx, weight[ipre + ".k_norm.weight"], rms_norm_eps, kIdx);
                                 kIdx.Reshape({1, blocks, index_head_dim});
                                 V41RotaryQuant(kIdx, rope, blockStart * ratio, ratio, false, 2, 32);
-                                V41AppendRows(cache.indexK, kIdx);
+                                V41AppendRows(cache.indexK, kIdx, tpDevices);
                             }
                             V41RotaryQuant(latent, rope, blockStart * ratio, ratio, false, 3, 16);
                             if (fp8KV) {
                                 Data latent8;
                                 V41QuantizeKV(latent, latent8);
-                                V41AppendRows(cache.compressedKV, latent8);
+                                V41AppendRows(cache.compressedKV, latent8, tpDevices);
                             } else {
-                                V41AppendRows(cache.compressedKV, latent);
+                                V41AppendRows(cache.compressedKV, latent, tpDevices);
                             }
                             cache.compressedBlocks += blocks;
                         }
@@ -2073,10 +2500,10 @@ namespace fastllm {
                         if (rem > 0) {
                             Data tailKV, tailScore;
                             Split(*kvAll, 1, full, n, tailKV);
-                            cache.rawTailKV.CopyFrom(tailKV);
+                            V41Assign(cache.rawTailKV, tailKV, tpDevices);
                             if (ratio > 1) {
                                 Split(*scoreAll, 1, full, n, tailScore);
-                                cache.rawTailScore.CopyFrom(tailScore);
+                                V41Assign(cache.rawTailScore, tailScore, tpDevices);
                             }
                         }
                         cache.rawTail = rem;
@@ -2122,7 +2549,7 @@ namespace fastllm {
                                 Data candAll, topkAll;
                                 Data prevCandidate;
                                 if (useCandidates) {
-                                    prevCandidate.CopyFrom(segCandidate[s]);
+                                    V41Assign(prevCandidate, segCandidate[s], tpDevices);
                                 }
                                 for (int c = 0; c < numChunks; c++) {
                                     const int c0 = c * chunkTokens;
@@ -2144,26 +2571,24 @@ namespace fastllm {
                                                    std::max(1, candidate_block_size), topkChunk);
                                     if (c == 0) {
                                         if (isCandidateLayer) {
-                                            candAll.dataType = candChunk.dataType;
-                                            candAll.Resize({candChunk.dims[0], segLen, candChunk.dims[2]});
-                                            candAll.ToDevice(candChunk.dataDevice);
-                                            candAll.Allocate();
+                                            V41AllocLike(candAll, candChunk.dataType,
+                                                         {candChunk.dims[0], segLen, candChunk.dims[2]},
+                                                         candChunk, tpDevices);
                                         }
-                                        topkAll.dataType = topkChunk.dataType;
-                                        topkAll.Resize({topkChunk.dims[0], segLen, topkChunk.dims[2]});
-                                        topkAll.ToDevice(topkChunk.dataDevice);
-                                        topkAll.Allocate();
+                                        V41AllocLike(topkAll, topkChunk.dataType,
+                                                     {topkChunk.dims[0], segLen, topkChunk.dims[2]},
+                                                     topkChunk, tpDevices);
                                     }
                                     if (isCandidateLayer) {
-                                        V41WriteRows(candAll, candChunk, c0);
+                                        V41WriteRows(candAll, candChunk, c0, tpDevices);
                                     }
-                                    V41WriteRows(topkAll, topkChunk, c0);
+                                    V41WriteRows(topkAll, topkChunk, c0, tpDevices);
                                 }
                                 if (isCandidateLayer) {
-                                    segCandidate[s].CopyFrom(candAll);
+                                    V41Assign(segCandidate[s], candAll, tpDevices);
                                     segHasCandidates[s] = 1;
                                 }
-                                segTopK[s].CopyFrom(topkAll);
+                                V41Assign(segTopK[s], topkAll, tpDevices);
                             }
                         }
                         if (segTopK[s].dims.size() == 3) {
@@ -2200,7 +2625,7 @@ namespace fastllm {
                     // DSpark 校验：环形缓冲的写入推迟到接受长度确定之后。片段内的位置
                     // 一律从 chunkKV 读取，因此推迟写入不改变本次前向的任何结果，
                     // 也就不需要为回滚保存被覆盖的旧行。
-                    seg.spec->windowKV[layer].CopyFrom(*windowRows);
+                    V41Assign(seg.spec->windowKV[layer], *windowRows, tpDevices);
                 } else {
                     V41WindowStore(*windowRows, cache.windowKV, startPos, window_size);
                 }
@@ -2209,8 +2634,17 @@ namespace fastllm {
             }
 
             Data *attnOutAll = single ? &attnOut : catSegments(segAttnOut, catTmp);
+            if (tpAttention) {
+                // wo_a 按 head 组切（与 q 的分片一致），wo_b 按列切；
+                // wo_b 的输入是分片的，MultiCudaLinearOp 会自动走 column + all-reduce。
+                weight[pre + ".attn.wo_a.weight"].tpLinearType = TP_LINEAR_ROW;
+                weight[pre + ".attn.wo_b.weight"].tpLinearType = TP_LINEAR_COLUMN;
+            }
             DeepSeekV4WoA(*attnOutAll, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
-            Linear(woAOut, weight[pre + ".attn.wo_b.weight"], Data(), attnProj);
+            // 切分时 woAOut 是分片的，MultiCudaLinearOp 自动走 column + all-reduce；
+            // 不切分时 woAOut 是复制的，必须显式要求复制布局，否则会退回单卡 CUDA
+            // 读到已经失效的 root。
+            Linear(woAOut, weight[pre + ".attn.wo_b.weight"], Data(), attnProj, tp && !tpAttention);
             if (dumpDebug) {
                 V41DumpTensor(attnInput, "fl_layer" + std::to_string(layer) + "_attn_in" + dumpSuffix);
                 V41DumpTensor(*attnOutAll, "fl_layer" + std::to_string(layer) + "_attn_o" + dumpSuffix);
@@ -2239,7 +2673,7 @@ namespace fastllm {
                 std::string gpre = pre + ".ffn.gate";
                 Data xFloat, logits;
                 ToDataType(ffnInput, xFloat, DataType::FLOAT32);
-                Linear(xFloat, weight[gpre + ".weight"], Data(), logits);
+                Linear(xFloat, weight[gpre + ".weight"], Data(), logits, tp);
                 ToDataType(logits, DataType::FLOAT32);
                 if (std::fabs(gate_temp - 1.0f) > 1e-6f) {
                     Mul(logits, 1.0f / gate_temp, logits);
@@ -2256,9 +2690,10 @@ namespace fastllm {
                 }
                 bool routed = false;
 #ifdef USE_CUDA
-                if (!hasImageTokens && logits.dataDevice == DataDevice::CUDA &&
+                if (!hasImageTokens &&
+                    (logits.dataDevice == DataDevice::CUDA || (tp && logits.multiDeviceData)) &&
                     !V41EnvFlag("FASTLLM_DSV41_DISABLE_CUDA_ROUTE") &&
-                    FastllmCudaDeepSeekV4RouteScoreTransform(logits, 2)) {
+                    V41RouteScoreTransformTp(logits, 2, tpDevices)) {
                     gateBias.ToDevice(DataDevice::CUDA);
                     SelectExpert(logits, expertIndex, expertScore, num_experts_per_tok, true,
                                  routed_scaling_factor, &gateBias);
@@ -2266,9 +2701,18 @@ namespace fastllm {
                 }
 #endif
                 if (!routed) {
-                    logits.ToDevice(DataDevice::CPU);
+                    // 图像 token 走 CPU 参考路由。复制布局下 logits 的 root 只有形状信息，
+                    // 直接 ToDevice(CPU) 会读到失效指针，必须从卡上副本拷出来。
+                    Data cpuLogits;
+                    const Data *logitsCpu = &logits;
+                    if (tp && logits.multiDeviceData && logits.IsTensorParallelReplicated()) {
+                        V41ReplicaToCpu(cpuLogits, logits, tpDevices);
+                        logitsCpu = &cpuLogits;
+                    } else {
+                        logits.ToDevice(DataDevice::CPU);
+                    }
                     gateBias.ToDevice(DataDevice::CPU);
-                    const float *raw = (const float*)logits.cpuData;
+                    const float *raw = (const float*)logitsCpu->cpuData;
                     const float *bias = (const float*)gateBias.cpuData;
                     std::vector<int> indices((uint64_t)seqlen * num_experts_per_tok);
                     std::vector<float> scores((uint64_t)seqlen * num_experts_per_tok);
@@ -2304,6 +2748,12 @@ namespace fastllm {
                     Data idxData(DataType::INT32, {seqlen, num_experts_per_tok});
                     idxData.Allocate();
                     memcpy(idxData.cpuData, indices.data(), indices.size() * sizeof(int));
+#ifdef USE_CUDA
+                    // 之前几层可能把它们做成了复制布局，CopyFrom 只会写 root，
+                    // 留下的旧副本会被后面的 multicuda 算子当成有效数据。
+                    V41ResetMultiDevice(expertIndex);
+                    V41ResetMultiDevice(expertScore);
+#endif
                     expertIndex.CopyFrom(idxData);
                     expertScore.CopyFrom(Data(DataType::FLOAT32, {seqlen, num_experts_per_tok}, scores));
                 }
@@ -2318,6 +2768,11 @@ namespace fastllm {
                 if (GetCudaSharedExpert() && sharedGateupIt != weight.weight.end() &&
                     sharedDownIt != weight.weight.end() && !sharedGateupIt->second.isDiskWeight &&
                     !sharedDownIt->second.isDiskWeight) {
+                    if (tpSharedExpert) {
+                        sharedGateupIt->second.tpLinearType = TP_LINEAR_ROW;
+                        sharedGateupIt->second.tpPackType = TP_PACK_GATEUP;
+                        sharedDownIt->second.tpLinearType = TP_LINEAR_COLUMN;
+                    }
                     Data ww1, ww3;
                     LinearSwigluBlock(&ffnInput, &sharedGateupIt->second, GetEmptyData(), &ww3, &ww1);
                     Linear(ww1, sharedDownIt->second, *GetEmptyData(), sharedExpertOut);
@@ -2325,13 +2780,40 @@ namespace fastllm {
                     hasSharedExpertOut = true;
                 }
                 this->ApplyMoeDeviceMapForLayer(layer);
-                MergeMOEBlock(&ffnInput, &expertIndex, &expertScore, &moeWeights, &biass[layer],
+                // 路由专家在 multicuda 上按专家并行（每卡一部分专家 + all-reduce），
+                // 在 cpu / numa 上仍然是单份计算，结果随后广播回两张卡。
+                const bool routedExpertParallel = V41DeviceSpecUsesType(
+                    this->SelectMoeDeviceForLayer(layer), "multicuda");
+                Data *moeInputPtr = &ffnInput;
+                Data *moeIndexPtr = &expertIndex;
+                Data *moeScorePtr = &expertScore;
+                if (tp && !routedExpertParallel) {
+                    // MoE 落在 cpu / numa 时，输入必须从某张卡的副本拷出来：
+                    // 直接交给 CPU 算子会让 Data::ToDevice 从复制布局已经失效的
+                    // root 上读，直接段错误。
+                    V41ReplicaToCpu(cpuMoeInput, ffnInput, tpDevices);
+                    V41ReplicaToCpu(cpuMoeIndex, expertIndex, tpDevices);
+                    V41ReplicaToCpu(cpuMoeScore, expertScore, tpDevices);
+                    moeInputPtr = &cpuMoeInput;
+                    moeIndexPtr = &cpuMoeIndex;
+                    moeScorePtr = &cpuMoeScore;
+                }
+                MergeMOEBlock(moeInputPtr, moeIndexPtr, moeScorePtr, &moeWeights, &biass[layer],
                               &w1, &w2, &w3, &tempInput, &tempOutput, 1.0f, &ffnOut, layer,
                               ffnInput.dataType, ffnInput.dataType, &moeInputTemp, &moeOutputTemp,
-                              MoeGateSwiglu, false, swiglu_limit, true);
+                              MoeGateSwiglu, routedExpertParallel, swiglu_limit, true);
                 ApplyDeviceMap(this->deviceMap, layer + 1, block_cnt);
+#ifdef USE_CUDA
+                if (tp && ffnOut.dataDevice == DataDevice::CPU && ffnOut.cpuData != nullptr) {
+                    // CPU / NUMA 上算出的路由专家结果只有一份，广播到两张卡后才能
+                    // 与复制布局的共享专家输出、hc 残差相加。
+                    PrepareMultiCudaReplicatedData(ffnOut, tpDevices, true);
+                }
+#endif
                 if (hasSharedExpertOut) {
-                    ffnOut.ToDevice(sharedExpertOut.dataDevice);
+                    if (!(tp && ffnOut.multiDeviceData && sharedExpertOut.multiDeviceData)) {
+                        ffnOut.ToDevice(sharedExpertOut.dataDevice);
+                    }
                     AddTo(ffnOut, sharedExpertOut);
                 }
             }
@@ -2343,7 +2825,7 @@ namespace fastllm {
             }
             DeepSeekV4HcPost(ffnOut, *curHidden, ffnPost, ffnComb, *nextHidden);
             std::swap(curHidden, nextHidden);
-            preMix.CopyFrom(ffnPre);
+            preMixPtr = &ffnPre;
             if (dumpDebug) {
                 V41DumpTensor(*curHidden, "fl_layer" + std::to_string(layer) + dumpSuffix);
             }
@@ -2354,17 +2836,40 @@ namespace fastllm {
         // 这里的 RMSNorm + head + TopK 与 LLMSamplingBlock 的 allSimple 分支等价。
         if (numSegments == 1 && segments[0].spec != nullptr && segments[0].spec->wantAllGreedy) {
             Data allHidden, normed, allLogits, topk;
-            V41HcApplyPre(*curHidden, preMix, allHidden);
+            V41HcApplyPre(*curHidden, *preMixPtr, allHidden);
             RMSNorm(allHidden, weight["norm.weight"], rms_norm_eps, normed);
-            Linear(normed, weight["head.weight"], *GetEmptyData(), allLogits);
+            // DSpark 校验分支自己做 TopK，需要完整 logits，这里让 head 走复制布局
+            if (tp) {
+                weight["head.weight"].tpLinearType = TP_LINEAR_NONE;
+            }
+            Linear(normed, weight["head.weight"], *GetEmptyData(), allLogits, tp);
             ToDataType(allLogits, DataType::FLOAT32);
-            TopK(allLogits, topk, 1);
-            topk.ToDevice(DataDevice::CPU);
-            const int stride = topk.dims[topk.dims.size() - 1];
-            const float *topkData = (const float*)topk.cpuData;
             segments[0].spec->greedy.resize(seqlen);
-            for (int i = 0; i < seqlen; i++) {
-                segments[0].spec->greedy[i] = (int)(topkData[(uint64_t)i * stride] + 1e-3);
+            if (tp && allLogits.multiDeviceData && allLogits.IsTensorParallelReplicated()) {
+                // TopK 没有 multicuda 实现，会退回单卡读复制布局已失效的 root；
+                // 这里直接从副本拷到 CPU 上自己取 argmax。
+                Data cpuLogits;
+                V41ReplicaToCpu(cpuLogits, allLogits, tpDevices);
+                const int vocab = cpuLogits.dims.back();
+                const float *values = (const float*)cpuLogits.cpuData;
+                for (int i = 0; i < seqlen; i++) {
+                    const float *row = values + (uint64_t)i * vocab;
+                    int best = 0;
+                    for (int v = 1; v < vocab; v++) {
+                        if (row[v] > row[best]) {
+                            best = v;
+                        }
+                    }
+                    segments[0].spec->greedy[i] = best;
+                }
+            } else {
+                TopK(allLogits, topk, 1);
+                topk.ToDevice(DataDevice::CPU);
+                const int stride = topk.dims[topk.dims.size() - 1];
+                const float *topkData = (const float*)topk.cpuData;
+                for (int i = 0; i < seqlen; i++) {
+                    segments[0].spec->greedy[i] = (int)(topkData[(uint64_t)i * stride] + 1e-3);
+                }
             }
             for (auto &seg : segments) {
                 seg.state->totalLen += seg.seqlen;
@@ -2375,13 +2880,13 @@ namespace fastllm {
         // ---- head（每个片段只取最后一个 token）----
         Data headInput;
         if (single && seqlen == 1) {
-            V41HcApplyPre(*curHidden, preMix, headInput);
+            V41HcApplyPre(*curHidden, *preMixPtr, headInput);
         } else {
             std::vector<Data> lastHidden(numSegments), lastPre(numSegments);
             for (int s = 0; s < numSegments; s++) {
                 int end = segments[s].offset + segments[s].seqlen;
                 Split(*curHidden, 1, end - 1, end, lastHidden[s]);
-                Split(preMix, 1, end - 1, end, lastPre[s]);
+                Split(*preMixPtr, 1, end - 1, end, lastPre[s]);
             }
             Data hiddenTmp[2], preTmp[2];
             Data *hiddenAll = catSegments(lastHidden, hiddenTmp);
@@ -2396,6 +2901,13 @@ namespace fastllm {
             if (config.do_sample && config.top_k <= 1 && config.temperature > 1e-6f) {
                 config.top_k = 5;
             }
+        }
+        // head 按行切分：两张卡各算一半词表，LLMSamplingBlock 的
+        // SampleTensorParallelGreedyLogits / GatherTensorParallelLogitsToRoot 负责合并。
+        // 不切分时 head 的 Linear 会走 multicuda 的"通用切分 + gather"路径，
+        // 那条路径读的是复制张量已经失效的 root，结果是错的。
+        if (tp) {
+            weight["head.weight"].tpLinearType = TP_LINEAR_ROW;
         }
         LLMSamplingBlock(this, &headInput, &weight["norm.weight"], &weight["head.weight"],
                          rms_norm_eps, numSegments, true, samplingSeqLens, samplingPastKeyValues,

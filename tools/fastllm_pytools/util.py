@@ -749,9 +749,14 @@ def _is_moe_architecture(architecture: str, model_type: str = "", text_model_typ
         "qwen3_8_flash_next_text",
     ])
 
-def _prefers_multicuda_tp(architecture: str, model_type: str = "") -> bool:
-    return (architecture == "DeepseekV4ForCausalLM" or
-            model_type == "deepseek_v4")
+def _prefers_multicuda_tp(architecture: str, model_type: str = "",
+                          text_model_type: str = "") -> bool:
+    # DeepSeek-V4.1 与 V4 共用同一套 multicuda 张量并行实现（注意力按 query head
+    # 切分 + wo_b 列切 all-reduce），--tp N 同样要落到 multicuda 执行器上。
+    return (architecture in ("DeepseekV4ForCausalLM",
+                             "DeepseekV41ForCausalLM") or
+            model_type in ("deepseek_v4", "deepseek_v41") or
+            text_model_type == "deepseek_v41_text")
 
 def _prefers_laguna_hybrid_tp(architecture: str, model_type: str = "") -> bool:
     return (architecture == "LagunaForCausalLM" or
@@ -1157,6 +1162,7 @@ def make_normal_llm_model(args, startup_progress = None):
     is_moe_model = False
     is_thread_tp_moe_model = False
     is_multicuda_tp_model = False
+    is_deepseek_v41_model = False
     is_laguna_hybrid_tp_model = False
     is_laguna_model = False
     is_qwen35_model = False
@@ -1361,8 +1367,12 @@ def make_normal_llm_model(args, startup_progress = None):
                 is_thread_tp_moe_model = True
             if (_prefers_laguna_hybrid_tp(architecture, model_type)):
                 is_laguna_hybrid_tp_model = True
-            if (_prefers_multicuda_tp(architecture, model_type)):
+            if (_prefers_multicuda_tp(architecture, model_type, text_model_type)):
                 is_multicuda_tp_model = True
+            if (architecture == 'DeepseekV41ForCausalLM' or
+                    model_type == 'deepseek_v41' or
+                    text_model_type == 'deepseek_v41_text'):
+                is_deepseek_v41_model = True
             if (is_moe_model):
                 if (args.cache_history == ""):
                     args.cache_history = "true"
@@ -1507,7 +1517,9 @@ def make_normal_llm_model(args, startup_progress = None):
     if (tp_arg != ""):
         os.environ["FASTLLM_TP"] = tp_arg
         if (_uses_thread_tp(tp_arg)):
-            if (atype_was_auto):
+            if (atype_was_auto and not is_deepseek_v41_model):
+                # DeepSeek-V4.1 的 SetDataType 只接受 float32（推理精度由模型内部
+                # 自己按 BF16 走），--tp 不能像其它模型那样把 atype 改成 float16。
                 args.atype = "bfloat16" if is_laguna_model else "float16"
             if (not(args.device and args.device != "")):
                 args.device = _first_thread_tp_cuda_device(tp_arg)

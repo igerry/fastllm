@@ -45,10 +45,11 @@
 - 真实 checkpoint 的权重格式（FP8 32x32、FP4 路由专家、FP8 + UE8M0 的 Engram 表）；
 - 图像输入（OpenAI 接口的 `image_url`）：ViT + aligner、图像 token 的 `gate.bias_vl` 路由与 Engram 掩码，详见下文；
 - DSpark 投机解码（`mtp.*` 草稿层），详见下文"DSpark 投机解码"。
+- 双卡张量并行（`--tp 2`），详见下文"张量并行"。
 
 尚未实现：
 
-- CUDA Graph、张量并行等 V4 已有的性能特性；
+- CUDA Graph（V4 已有）；张量并行只覆盖主干，视觉编码器与 DSpark 草稿层仍是单卡；
 - DSpark 与批量 decode 的组合（批内不产生候选，只保持草稿缓存同步）、DSpark 与采样 / 图文请求的组合。
 
 ## Engram 元数据
@@ -120,6 +121,72 @@ CPU 专家的当前瓶颈：融合的 FP4 GEMM 只有 AVX512-BF16 实现，在�
 
 行为验证（贪心解码）：中英文常识、算术、代码生成、逻辑推理均正确；34k token 上下文的"大海捞针"命中
 （该长度会激活候选块两级 top-k）；工具调用能正确产出 `tool_calls`；图像输入能正确描述图中的形状与颜色。
+
+## 张量并行
+
+```bash
+ftllm server /path/to/DeepSeek-V4.1-Flash --tp 2 --moe_device numa --dtype float16
+```
+
+`--tp 2` 会把主 device 归一化成 `multicuda:0,1` 并设置 `FASTLLM_TP`（触发加载期的权重切分）。
+用户显式给出的 `--moe_device`（如 `numa`）不受影响：路由专家仍在 CPU / NUMA 上算一份，
+结果广播回两张卡。直接写 `--device multicuda:0,1` 也能启用，只是稠密权重改为在首次使用时切分，
+显存峰值更高。
+
+### 切什么、为什么
+
+沿用 DeepSeek-V4 的切法，只切 **query head** 这一条线：
+
+| 权重 | 切法 | 说明 |
+| --- | --- | --- |
+| `attn.wq_b` | 按行切（`linearRow`） | 输出 q 的 head 维分片，`Reshape` 会把 tpAxis 从最后一维换算到 head 维 |
+| `attn.attn_sink` | 按 head 切 | 与 q 的分片区间一致 |
+| `attn.wo_a` | 按 head 组切（`linearRow`） | 区间必须对齐到 `o_group`（每组 `num_attention_heads / o_groups` 个 head） |
+| `attn.wo_b` | 按列切（`linearColumn`） | 输入分片，输出 all-reduce 回复制布局 |
+| `ffn.shared_experts.gateup` / `w2` | 行切 / 列切 | 与其它 MoE 模型一致 |
+| `head.weight` | 按行切 | 两卡各算一半词表，`LLMSamplingBlock` 已有分片 logits 的贪心 / 汇聚路径 |
+
+其余全部**复制**（每卡一份完整副本）：`wq_a`、`wkv`、`compressor.*`、`indexer.*`、`ffn.gate`、
+各 RMSNorm 权重，以及跨层共享的压缩 KV、indexer key、滑窗 KV 缓存。
+
+为什么跨层共享的压缩 KV 与两级 indexer 选复制而不是切分 + all-gather：
+
+- **压缩 KV 与 head 无关**。V4.1 的注意力是 MLA 式的：每个位置只有一份 `head_dim` 的 latent，
+  所有 query head 共享它。沿 head 切它没有意义，沿序列切则每一层注意力都要 all-gather 整段 KV，
+  通信量正比于上下文长度 × 层数。复制的代价只是一份显存（压缩后本身就比滑窗 KV 小 1~2 倍）。
+- **压缩 KV 是跨层共享的**。`kv_source_layer_ids` 的层算出的 cache 会被后面若干层直接读，
+  切分后每个消费层都要重新 all-gather，而不是只在生产层付一次代价。
+- **两级 indexer 的候选块也是跨层共享的**。`candidate_source_layer_id` 选出的候选块被之后所有
+  index source 层复用。indexer 的分数矩阵是 `[token, m]`（1M 上下文时每 token 有 50 万个候选），
+  切 index head 意味着要对这个矩阵做 all-reduce 才能取 top-k——通信量比整个注意力还大。
+  而且 top-k 必须在两张卡上**逐位一致**：卡 0 和卡 1 选到不同的 KV 块，
+  两边算出的注意力就不是同一个函数的两个分片了。复制 indexer 既省通信又天然保证一致。
+- **路由分数变换与专家选择同理**逐卡各算一份，保证两卡选到同一组专家。
+- **Engram 表在 CPU**，查表结果按 token 复制到每张卡。
+
+### 约束
+
+CUDA 稀疏注意力 kernel 每个 block 处理 32 个 head，所以 `num_attention_heads / tp` 必须是 32 的倍数，
+并且要对齐到 `o_group`。真实模型 64 头、`o_groups=8`，TP=2 满足（每卡 32 头 = 4 个 o_group）；
+TP=4 不满足。不满足时模型会打印一行说明并**整体退回单卡**（撤销注意力与 head 的 TP 权重注册，
+把 device map 改回 `cuda:<第一张卡>`），而不是做"只切 FFN"的半张量并行。
+
+视觉编码器（ViT + aligner）与 DSpark 草稿层还不是张量并行感知的，图文请求下视觉部分仍在单卡上算。
+
+### 收益与代价
+
+迷你模型（`--perf-config`：4 层、64 头、`o_groups=8`，与真实模型同构）在 2 x RTX 3090 Ti 上：
+
+| 场景 | 单卡 | TP=2 |
+| --- | --- | --- |
+| prefill 2048 token | 0.60 s | 0.33 s |
+| prefill 8192 token | 0.80 s | 0.43 s |
+| decode（4 层，每 token） | 3.3 ms | 7.7 ms |
+
+prefill 接近减半；decode 变慢，因为 multicuda 的 eager 调度对**每个算子**都要唤醒两个 worker 线程
+并同步一次，实测每个算子多约 34 us。迷你模型每层只有几十微秒的真实计算，被调度开销淹没；
+真实模型每层的 GPU 计算是它的十几倍，两者大致相抵。**长上下文 / prefill 为主的负载开 `--tp 2`，
+纯 decode 负载建议先测再决定**；要让 decode 也稳定获益需要接入 CUDA Graph（V4 已有，V4.1 还没做）。
 
 ## 多请求与前缀缓存
 
@@ -391,5 +458,8 @@ indexer 分数矩阵的分块效果（65536 token prefill，扣掉同卡其它�
 | `FASTLLM_DSV41_DISABLE_FAKE_QUANT` | 关闭 FP8 / FP4 伪量化（仅用于对齐调试） |
 | `FASTLLM_DSV41_DISABLE_CUDA_ROUTE` | 路由退回 CPU 参考实现 |
 | `FASTLLM_DSV41_DUMP_DIR` | 把每层中间张量写到该目录（对齐调试） |
+| `FASTLLM_DSV41_DISABLE_TP_ATTENTION` | 张量并行时不切分注意力 head（排查用，注意力改为每卡各算一份） |
+| `FASTLLM_DSV41_DISABLE_TP_SHARED_EXPERT` | 张量并行时不切分共享专家（排查用） |
+| `FASTLLM_TRACE_OPS` | 逐算子打印"算子名 / 落在哪个设备 / 权重名"（排查 TP 落点用） |
 | `FASTLLM_DSV41_DISABLE_PREFIX_CACHE` 等 | 前缀缓存相关，见"多请求与前缀缓存" |
 | `FASTLLM_DSPARK_*` | DSpark 投机解码相关，见"DSpark 投机解码" |

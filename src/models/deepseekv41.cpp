@@ -21,12 +21,15 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <thread>
 
@@ -95,6 +98,161 @@ namespace fastllm {
         bool V41EnvFlag(const char *name) {
             const char *v = std::getenv(name);
             return v != nullptr && v[0] != '\0' && strcmp(v, "0") != 0;
+        }
+
+        // ---------------- Engram 计时 ----------------
+        // FASTLLM_DSV41_ENGRAM_PROFILE=1 累计统计，=2 额外逐次打印。
+        // 三段分别是：hash（算行号）、gather（读表 + FP8→BF16）、wkv（投影）、apply（门控写回）。
+        // wkv / apply 落在 GPU 上且是异步下发的，要拿到真实耗时必须同时设 FASTLLM_CUDA_SYNC=1，
+        // 否则这两项只反映 kernel launch 的时间。
+        // FASTLLM_DSV41_ENGRAM_PROFILE_EVERY=N 控制每累计 N 次打印一行（默认 64，0 表示只在退出时打印）。
+
+        double V41NowMs() {
+            return std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now().time_since_epoch()).count();
+        }
+
+        struct V41EngramStat {
+            uint64_t calls = 0;
+            uint64_t tokens = 0;
+            double hash = 0.0, gather = 0.0, wkv = 0.0, apply = 0.0, wait = 0.0;
+        };
+
+        struct V41EngramProfiler {
+            int level = 0;
+            uint64_t reportEvery = 64;
+            std::mutex mutex;
+            V41EngramStat decode, prefill;
+            uint64_t sinceReport = 0;
+
+            V41EngramProfiler() {
+                const char *v = std::getenv("FASTLLM_DSV41_ENGRAM_PROFILE");
+                if (v != nullptr && v[0] != '\0' && strcmp(v, "0") != 0) {
+                    level = atoi(v);
+                    if (level <= 0) {
+                        level = 1;
+                    }
+                }
+                const char *e = std::getenv("FASTLLM_DSV41_ENGRAM_PROFILE_EVERY");
+                if (e != nullptr && e[0] != '\0') {
+                    long long n = atoll(e);
+                    reportEvery = n > 0 ? (uint64_t)n : 0;
+                }
+            }
+
+            ~V41EngramProfiler() {
+                if (level > 0) {
+                    Report("汇总");
+                }
+            }
+
+            void Add(int layer, int tokens, double hash, double gather, double wkv, double apply, double wait) {
+                std::lock_guard<std::mutex> guard(mutex);
+                V41EngramStat &s = tokens > 1 ? prefill : decode;
+                s.calls++;
+                s.tokens += (uint64_t)tokens;
+                s.hash += hash;
+                s.gather += gather;
+                s.wkv += wkv;
+                s.apply += apply;
+                s.wait += wait;
+                if (level >= 2) {
+                    printf("[Engram] layer %d tokens %d | hash %.3f gather %.3f wkv %.3f apply %.3f wait %.3f ms\n",
+                           layer, tokens, hash, gather, wkv, apply, wait);
+                }
+                if (reportEvery > 0 && ++sinceReport >= reportEvery) {
+                    sinceReport = 0;
+                    ReportLocked("进行中");
+                }
+            }
+
+            void Report(const char *tag) {
+                std::lock_guard<std::mutex> guard(mutex);
+                ReportLocked(tag);
+            }
+
+            void ReportLocked(const char *tag) {
+                Line(tag, "decode ", decode);
+                Line(tag, "prefill", prefill);
+                fflush(stdout);
+            }
+
+            static void Line(const char *tag, const char *name, const V41EngramStat &s) {
+                if (s.calls == 0) {
+                    return;
+                }
+                double n = (double)s.calls;
+                double sum = s.hash + s.gather + s.wkv + s.apply;
+                printf("[Engram %s] %s %llu 次 / %llu token：每次 hash %.3f + gather %.3f + wkv %.3f + apply %.3f "
+                       "= %.3f ms（等待预取 %.3f，累计 %.1f ms）\n",
+                       tag, name, (unsigned long long)s.calls, (unsigned long long)s.tokens,
+                       s.hash / n, s.gather / n, s.wkv / n, s.apply / n, sum / n, s.wait / n, sum);
+            }
+        };
+
+        V41EngramProfiler &V41Profiler() {
+            static V41EngramProfiler profiler;
+            return profiler;
+        }
+
+        // ---------------- Engram 表的内存访问提示 ----------------
+        // FASTLLM_DSV41_ENGRAM_MADVISE=random / hugepage / both（默认 off，行为不变）。
+        //   random   ：表是纯随机访问，MADV_RANDOM 关掉内核的顺序预读（mmap 模式下最有用）。
+        //   hugepage ：常驻模式下改用匿名 mmap + MADV_HUGEPAGE 分配 100 GB 的表，
+        //              4 KB 页要 2500 万个 PTE，随机查表几乎每次都 TLB miss；
+        //              顺带省掉 std::vector 的 100 GB 清零，加载也更快。
+
+        struct V41EngramMadviseCfg {
+            bool random = false;
+            bool hugePage = false;
+        };
+
+        V41EngramMadviseCfg V41EngramMadvise() {
+            V41EngramMadviseCfg cfg;
+            const char *v = std::getenv("FASTLLM_DSV41_ENGRAM_MADVISE");
+            if (v == nullptr || v[0] == '\0') {
+                return cfg;
+            }
+            std::string s = v;
+            cfg.random = s.find("random") != std::string::npos || s.find("both") != std::string::npos ||
+                         s == "1" || s.find("all") != std::string::npos;
+            cfg.hugePage = s.find("huge") != std::string::npos || s.find("both") != std::string::npos ||
+                           s.find("all") != std::string::npos;
+            return cfg;
+        }
+
+        void V41MadviseRandom(const void *ptr, uint64_t bytes) {
+#if !defined(_WIN32) && !defined(_WIN64) && defined(MADV_RANDOM)
+            if (ptr == nullptr || bytes == 0) {
+                return;
+            }
+            long pageSize = sysconf(_SC_PAGESIZE);
+            uintptr_t start = (uintptr_t)ptr / pageSize * pageSize;
+            size_t len = (size_t)(bytes + ((uintptr_t)ptr - start));
+            madvise((void*)start, len, MADV_RANDOM);
+#endif
+        }
+
+        // 匿名大页分配：常驻表用它替代 std::vector，可以在填充之前打上 MADV_HUGEPAGE。
+        bool V41AllocAnon(uint64_t bytes, bool hugePage, void *&mapping, size_t &mapLen, uint8_t *&ptr) {
+#if defined(_WIN32) || defined(_WIN64)
+            return false;
+#else
+            void *p = mmap(nullptr, (size_t)bytes, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (p == MAP_FAILED) {
+                return false;
+            }
+#ifdef MADV_HUGEPAGE
+            if (hugePage) {
+                madvise(p, (size_t)bytes, MADV_HUGEPAGE);
+            }
+#endif
+            mapping = p;
+            mapLen = (size_t)bytes;
+            ptr = (uint8_t*)p;
+            return true;
+#endif
         }
 
         // ---------------- 算子封装 ----------------
@@ -1199,6 +1357,7 @@ namespace fastllm {
                         "DeepSeekV41: model directory is unknown, can't load engram tables.");
         std::string dir = this->weight.dicts["model_directory"];
         bool useMmap = V41EnvFlag("FASTLLM_DSV41_ENGRAM_MMAP");
+        V41EngramMadviseCfg madviseCfg = V41EngramMadvise();
         engramTables.clear();
         for (size_t l = 0; l < engram_layer_ids.size(); l++) {
             int layer = engram_layer_ids[l];
@@ -1219,8 +1378,9 @@ namespace fastllm {
             AssertInFastLLM(table->dim == engram_head_dim && weightInfo.bytes == (uint64_t)table->rows * table->dim &&
                             scaleInfo.bytes == (uint64_t)table->rows * (table->dim / table->scaleBlock),
                             "DeepSeekV41: engram table byte count mismatch for " + base + "weight");
-            printf("[Fastllm] DeepSeek-V4.1: loading engram table for layer %d (%.1f GB, %s)...\n",
-                   layer, (weightInfo.bytes + scaleInfo.bytes) / 1e9, useMmap ? "mmap" : "resident");
+            printf("[Fastllm] DeepSeek-V4.1: loading engram table for layer %d (%.1f GB, %s%s%s)...\n",
+                   layer, (weightInfo.bytes + scaleInfo.bytes) / 1e9, useMmap ? "mmap" : "resident",
+                   madviseCfg.random ? " +random" : "", madviseCfg.hugePage ? " +hugepage" : "");
             fflush(stdout);
             bool mapped = false;
             if (useMmap) {
@@ -1230,12 +1390,27 @@ namespace fastllm {
                                          table->mmapScale, table->mmapScaleLen, table->scale);
             }
             if (!mapped) {
-                table->dataStorage.resize(weightInfo.bytes);
-                table->scaleStorage.resize(scaleInfo.bytes);
-                V41ReadFileRange(weightInfo.fileName, weightInfo.offset, table->dataStorage.data(), weightInfo.bytes);
-                V41ReadFileRange(scaleInfo.fileName, scaleInfo.offset, table->scaleStorage.data(), scaleInfo.bytes);
-                table->data = table->dataStorage.data();
-                table->scale = table->scaleStorage.data();
+                // 常驻：默认用 std::vector；开了 hugepage 提示时改用匿名 mmap，
+                // 这样可以在读入之前 madvise(MADV_HUGEPAGE)，还省掉 vector 的清零。
+                uint8_t *dataPtr = nullptr, *scalePtr = nullptr;
+                bool anon = madviseCfg.hugePage &&
+                            V41AllocAnon(weightInfo.bytes, true, table->mmapData, table->mmapDataLen, dataPtr) &&
+                            V41AllocAnon(scaleInfo.bytes, true, table->mmapScale, table->mmapScaleLen, scalePtr);
+                if (!anon) {
+                    table->dataStorage.resize(weightInfo.bytes);
+                    table->scaleStorage.resize(scaleInfo.bytes);
+                    dataPtr = table->dataStorage.data();
+                    scalePtr = table->scaleStorage.data();
+                }
+                V41ReadFileRange(weightInfo.fileName, weightInfo.offset, dataPtr, weightInfo.bytes);
+                V41ReadFileRange(scaleInfo.fileName, scaleInfo.offset, scalePtr, scaleInfo.bytes);
+                table->data = dataPtr;
+                table->scale = scalePtr;
+            }
+            if (madviseCfg.random) {
+                // 表是按哈希随机访问的，顺序预读只会白白占用内存带宽 / 页缓存
+                V41MadviseRandom(table->data, weightInfo.bytes);
+                V41MadviseRandom(table->scale, scaleInfo.bytes);
             }
             engramTables.push_back(std::static_pointer_cast<void>(table));
         }
@@ -1245,11 +1420,12 @@ namespace fastllm {
 
     // ==================== Engram 前向 ====================
 
-    void DeepSeekV41Model::ComputeEngramHashes(int engramLayerIndex,
-                                               const std::vector<int> &history, int startPos, int seqlen,
-                                               std::vector<int64_t> &rows) const {
-        const int maxNgram = engram_max_ngram_size;
-        const int heads = engram_n_heads;
+    namespace {
+        // 自由函数版的哈希计算：预取线程不持有 model，只需要元数据与两个尺寸。
+        void V41ComputeEngramHashes(const DeepSeekV41EngramMeta &engramMeta, int engramLayerIndex,
+                                    int maxNgram, int heads,
+                                    const std::vector<int> &history, int startPos, int seqlen,
+                                    std::vector<int64_t> &rows) {
         const int cols = (maxNgram - 1) * heads;
         const auto &multipliers = engramMeta.multipliers[engramLayerIndex];
         const auto &primes = engramMeta.primes[engramLayerIndex];
@@ -1281,6 +1457,128 @@ namespace fastllm {
                 }
             }
         }
+        }
+    }
+
+    void DeepSeekV41Model::ComputeEngramHashes(int engramLayerIndex,
+                                               const std::vector<int> &history, int startPos, int seqlen,
+                                               std::vector<int64_t> &rows) const {
+        V41ComputeEngramHashes(engramMeta, engramLayerIndex, engram_max_ngram_size, engram_n_heads,
+                               history, startPos, seqlen, rows);
+    }
+
+    namespace {
+        // 片段的历史窗口快照：预取线程不引用请求状态，只看这份副本，
+        // 这样即使前向提前退出、请求被回收，后台线程也不会读到失效内存。
+        struct V41EngramSegSnapshot {
+            std::vector<int> history;   // [startPos - maxNgram + 1, startPos + seqlen) 的副本，索引已平移
+            int startPos = 0;           // 平移后的起点
+            int seqlen = 0;
+            int offset = 0;             // 在整批里的 token 偏移
+        };
+
+        std::vector<V41EngramSegSnapshot> V41SnapshotSegments(const std::vector<DeepSeekV41Segment> &segments,
+                                                              int maxNgram) {
+            std::vector<V41EngramSegSnapshot> ret(segments.size());
+            for (size_t i = 0; i < segments.size(); i++) {
+                const DeepSeekV41Segment &seg = segments[i];
+                const std::vector<int> &history = seg.state->engramHistory;
+                int lo = std::max(0, seg.startPos - maxNgram + 1);
+                int hi = std::min((int)history.size(), seg.startPos + seg.seqlen);
+                ret[i].history.assign(history.begin() + lo, history.begin() + std::max(lo, hi));
+                ret[i].startPos = seg.startPos - lo;
+                ret[i].seqlen = seg.seqlen;
+                ret[i].offset = seg.offset;
+            }
+            return ret;
+        }
+
+        // 由快照算出整批的行号与 mask（dead token）。lo > 0 时窗口内不会出现 p < 0，
+        // lo == 0 时窗口就是原始历史，两种情况下平移都不改变语义。
+        void V41BuildEngramInputs(const DeepSeekV41EngramMeta &meta, int engramLayerIndex,
+                                  int maxNgram, int heads,
+                                  const std::vector<V41EngramSegSnapshot> &snapshots, int total,
+                                  std::vector<int64_t> &rows, std::vector<float> &maskValues, bool &hasDead) {
+            const int cols = (maxNgram - 1) * heads;
+            rows.clear();
+            rows.reserve((size_t)total * cols);
+            maskValues.assign(total, 1.0f);
+            hasDead = false;
+            std::vector<int64_t> segRows;
+            for (const V41EngramSegSnapshot &seg : snapshots) {
+                V41ComputeEngramHashes(meta, engramLayerIndex, maxNgram, heads,
+                                       seg.history, seg.startPos, seg.seqlen, segRows);
+                rows.insert(rows.end(), segRows.begin(), segRows.end());
+                for (int i = 0; i < seg.seqlen; i++) {
+                    if (seg.history[seg.startPos + i] < 0) {
+                        maskValues[seg.offset + i] = 0.0f;
+                        hasDead = true;
+                    }
+                }
+            }
+        }
+
+        // 把要用到的表行摸一遍（每 64 字节一次），把页表项与 cache line 提前拉进来。
+        // mmap 模式下这一步会把缺页代价挪到后台线程；常驻模式下主要是省 TLB / DRAM 延迟。
+        void V41TouchEngramRows(const V41EngramTable &table, const std::vector<int64_t> &rows) {
+            const int dim = table.dim;
+            const int scaleCols = dim / std::max(1, table.scaleBlock);
+            volatile uint64_t sink = 0;
+            for (size_t i = 0; i < rows.size(); i++) {
+                int64_t row = rows[i];
+                if (row < 0 || row >= table.rows) {
+                    continue;
+                }
+                const uint8_t *src = table.data + (uint64_t)row * dim;
+                for (int d = 0; d < dim; d += 64) {
+                    sink += src[d];
+                }
+                sink += table.scale[(uint64_t)row * scaleCols];
+            }
+            (void)sink;
+        }
+
+        // 常驻线程池上的一段 token 区间
+        struct V41EngramGatherOp : MultiThreadBaseOp {
+            const std::function<void(int, int)> *worker;
+            int st, end;
+            V41EngramGatherOp(const std::function<void(int, int)> *worker, int st, int end)
+                : worker(worker), st(st), end(end) {}
+            void Run() override {
+                (*worker)(st, end);
+            }
+        };
+
+        // 一次跨层预取任务。生命周期由模型持有，析构时保证 join。
+        struct V41EngramPrefetchJob {
+            std::thread worker;
+            int engramLayerIndex = -1;
+            int total = 0;
+            std::vector<int64_t> rows;
+            std::vector<float> maskValues;
+            bool hasDead = false;
+            bool ready = false;
+
+            void Join() {
+                if (worker.joinable()) {
+                    worker.join();
+                }
+            }
+
+            void Reset() {
+                Join();
+                engramLayerIndex = -1;
+                total = 0;
+                ready = false;
+                hasDead = false;
+                rows.clear();
+                maskValues.clear();
+            }
+
+            ~V41EngramPrefetchJob() {
+                Join();
+            }
+        };
     }
 
     void DeepSeekV41Model::GatherEngramRows(int layer, const std::vector<int64_t> &rows, int tokens, Data &output) {
@@ -1302,7 +1600,7 @@ namespace fastllm {
         uint16_t *dst = (uint16_t*)output.cpuData;
         static const FP8E4M3ToFP32Manager fp8;
 
-        auto worker = [&](int st, int end) {
+        const std::function<void(int, int)> worker = [&](int st, int end) {
             for (int t = st; t < end; t++) {
                 for (int c = 0; c < cols; c++) {
                     int64_t row = rows[(size_t)t * cols + c];
@@ -1317,6 +1615,36 @@ namespace fastllm {
                 }
             }
         };
+        // FASTLLM_DSV41_ENGRAM_POOL=1：改用 fastllm 常驻线程池。原来的实现每次调用都
+        // 现场 create/join 最多 32 个 std::thread，prefill 时这笔固定开销比查表本身还大。
+        // 结果逐位相同（只是换了执行 worker 的线程），默认仍走旧路径。
+        static const bool usePool = V41EnvFlag("FASTLLM_DSV41_ENGRAM_POOL");
+        if (usePool) {
+            AliveThreadPool *pool = GetAlivePool();
+            int threadSt = pool->curActivateThreadInterval.first;
+            int threadLen = pool->curActivateThreadInterval.second - threadSt;
+            int threads = std::min(tokens, std::max(1, threadLen));
+            if (threads <= 1 || tokens < 8) {
+                worker(0, tokens);
+            } else {
+                std::vector<V41EngramGatherOp*> ops;
+                int per = (tokens + threads - 1) / threads;
+                for (int i = 0; i < threads; i++) {
+                    int st = i * per, end = std::min(tokens, st + per);
+                    if (st < end) {
+                        ops.push_back(new V41EngramGatherOp(&worker, st, end));
+                    }
+                }
+                for (size_t i = 0; i < ops.size(); i++) {
+                    pool->PushOp(threadSt + (int)i, ops[i]);
+                }
+                for (size_t i = 0; i < ops.size(); i++) {
+                    pool->Wait(threadSt + (int)i);
+                    delete ops[i];
+                }
+            }
+            return;
+        }
         int threads = std::min(tokens, std::max(1, (int)std::thread::hardware_concurrency() / 2));
         threads = std::min(threads, 32);
         if (threads <= 1 || tokens < 8) {
@@ -1341,38 +1669,105 @@ namespace fastllm {
         AssertInFastLLM(engramMeta.loaded,
                         "DeepSeekV41: engram meta is not loaded. Generate engram_meta.json with "
                         "`python -m ftllm.deepseek_v41_engram <model_dir>` or set FASTLLM_DSV41_ENGRAM_META.");
+        static const bool prefetchEnabled = V41EnvFlag("FASTLLM_DSV41_ENGRAM_PREFETCH");
+        V41EngramProfiler &profiler = V41Profiler();
+        const bool profiling = profiler.level > 0;
+        double tHash = 0.0, tGather = 0.0, tWkv = 0.0, tApply = 0.0, tWait = 0.0, mark = 0.0;
+
         std::string pre = "layers." + std::to_string(layer) + ".engram";
         int total = 0;
         for (auto &seg : segments) {
             total += seg.seqlen;
         }
-        const int cols = (engram_max_ngram_size - 1) * engram_n_heads;
+
+        // ---- 第一段：算行号（查表索引）----
         std::vector<int64_t> rows;
-        rows.reserve((size_t)total * cols);
-        std::vector<float> maskValues(total, 1.0f);
+        std::vector<float> maskValues;
         bool hasDead = false;
-        for (auto &seg : segments) {
-            const std::vector<int> &history = seg.state->engramHistory;
-            std::vector<int64_t> segRows;
-            ComputeEngramHashes(engramLayerIndex, history, seg.startPos, seg.seqlen, segRows);
-            rows.insert(rows.end(), segRows.begin(), segRows.end());
-            for (int i = 0; i < seg.seqlen; i++) {
-                if (history[seg.startPos + i] < 0) {
-                    maskValues[seg.offset + i] = 0.0f;
-                    hasDead = true;
-                }
+
+        V41EngramPrefetchJob *job = nullptr;
+        if (prefetchEnabled) {
+            if (this->engramPrefetch == nullptr) {
+                this->engramPrefetch = std::make_shared<V41EngramPrefetchJob>();
+            }
+            job = (V41EngramPrefetchJob*)this->engramPrefetch.get();
+            if (engramLayerIndex == 0) {
+                // 新的一次前向：丢掉上一次可能残留的任务（前向中途异常退出时会留下）
+                job->Reset();
             }
         }
+
+        bool tookPrefetched = false;
+        if (job != nullptr && job->engramLayerIndex == engramLayerIndex) {
+            mark = profiling ? V41NowMs() : 0.0;
+            job->Join();
+            if (profiling) {
+                tWait = V41NowMs() - mark;
+            }
+            if (job->ready && job->total == total && (int)job->maskValues.size() == total) {
+                rows.swap(job->rows);
+                maskValues.swap(job->maskValues);
+                hasDead = job->hasDead;
+                tookPrefetched = true;
+            }
+            job->Reset();
+        }
+        if (!tookPrefetched) {
+            mark = profiling ? V41NowMs() : 0.0;
+            V41BuildEngramInputs(engramMeta, engramLayerIndex, engram_max_ngram_size, engram_n_heads,
+                                 V41SnapshotSegments(segments, engram_max_ngram_size), total,
+                                 rows, maskValues, hasDead);
+            if (profiling) {
+                tHash = V41NowMs() - mark;
+            }
+        }
+
+        // ---- 顺手把下一个 engram 层的行号与表行放到后台算 ----
+        // 哈希只依赖 token 历史，进入第 0 层之前就已经全部确定，所以这里不需要任何中间激活。
+        if (job != nullptr && engramLayerIndex + 1 < (int)engram_layer_ids.size() &&
+            engramLayerIndex + 1 < (int)engramTables.size()) {
+            int nextIndex = engramLayerIndex + 1;
+            job->engramLayerIndex = nextIndex;
+            job->total = total;
+            job->ready = false;
+            auto snapshots = V41SnapshotSegments(segments, engram_max_ngram_size);
+            const DeepSeekV41EngramMeta &meta = engramMeta;
+            int maxNgram = engram_max_ngram_size, heads = engram_n_heads;
+            auto tablePtr = std::static_pointer_cast<V41EngramTable>(engramTables[nextIndex]);
+            job->worker = std::thread([job, nextIndex, total, snapshots, &meta, maxNgram, heads, tablePtr]() {
+                V41BuildEngramInputs(meta, nextIndex, maxNgram, heads, snapshots, total,
+                                     job->rows, job->maskValues, job->hasDead);
+                V41TouchEngramRows(*tablePtr, job->rows);
+                job->ready = true;
+            });
+        }
+
+        // ---- 第二段：查表 + FP8→BF16 ----
+        mark = profiling ? V41NowMs() : 0.0;
         Data gathered;
         GatherEngramRows(layer, rows, total, gathered);
+        if (profiling) {
+            tGather = V41NowMs() - mark;
+        }
+
+        // ---- 第三段：wkv 投影与门控写回（GPU，异步）----
+        mark = profiling ? V41NowMs() : 0.0;
         Data kv;
         Linear(gathered, weight[pre + ".wkv.weight"], Data(), kv);
+        if (profiling) {
+            tWkv = V41NowMs() - mark;
+            mark = V41NowMs();
+        }
         Data mask;
         if (hasDead) {
             mask.CopyFrom(Data(DataType::FLOAT32, {1, total}, maskValues));
         }
         V41EngramApply(hiddenStates, kv, weight[pre + ".q_weight"], weight[pre + ".k_weight"],
                        hasDead ? &mask : nullptr, rms_norm_eps);
+        if (profiling) {
+            tApply = V41NowMs() - mark;
+            profiler.Add(layer, total, tHash, tGather, tWkv, tApply, tWait);
+        }
     }
 
     // ==================== 请求状态 ====================

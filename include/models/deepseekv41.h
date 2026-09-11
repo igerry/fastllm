@@ -290,6 +290,10 @@ namespace fastllm {
         int engram_compressed_vocab_size = 0;
         DeepSeekV41EngramMeta engramMeta;
         std::vector<std::shared_ptr<void> > engramTables;   // 每个 engram 层一张表（实现见 cpp）
+        // 跨层预取：两个 engram 层相距很远（默认层 1 与层 14），而哈希只依赖 token 历史、
+        // 不依赖中间激活，所以下一层的行号与表行可以在本层计算时后台算好。
+        // 由 FASTLLM_DSV41_ENGRAM_PREFETCH 打开，默认关闭（实现见 cpp）。
+        std::shared_ptr<void> engramPrefetch;
 
         // -------- 请求状态 --------
         // 状态同时按 &pastKeyValues（单请求 Forward）与 &pastKeyValues[0].first（调度器的多请求

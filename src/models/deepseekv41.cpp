@@ -30,6 +30,7 @@
 #include <functional>
 #include <limits>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <thread>
 
@@ -1289,6 +1290,16 @@ namespace fastllm {
     DeepSeekV41Model::GetTensorMap(const std::vector<std::string> &tensorNames) {
         std::map<std::string, std::vector<std::pair<std::string, DataType> > > result;
         std::vector<std::string> ordinary;
+        // engram.wkv 在真实权重里本来就是 F8_E4M3 + UE8M0 块 scale（block 32x32），
+        // 默认会被解量化成启动 dtype（float16），权重体积翻倍。
+        // FASTLLM_DSV41_ENGRAM_WKV_FP8=1 时按原样保留 FP8，不做任何重量化，
+        // 数值上就是 checkpoint 里的那份权重（比解成 float16 少一次舍入）。
+        // 只有伴随 .scale 张量存在时才生效，BF16 权重的迷你模型不受影响。
+        static const bool wkvFp8 = V41EnvFlag("FASTLLM_DSV41_ENGRAM_WKV_FP8");
+        std::set<std::string> tensorNameSet;
+        if (wkvFp8) {
+            tensorNameSet.insert(tensorNames.begin(), tensorNames.end());
+        }
         for (const std::string &name : tensorNames) {
             // DSpark 草稿层：只有开启投机解码时才加载（默认跳过，省下约 30 GB 权重）
             if (V41StartsWith(name, "mtp.")) {
@@ -1320,6 +1331,11 @@ namespace fastllm {
             }
             // Engram 表由模型自行读取（超出通用加载器的 int32 scale 索引范围）
             if (name.find(".engram.embed.") != std::string::npos) {
+                continue;
+            }
+            if (wkvFp8 && V41EndsWith(name, ".engram.wkv.weight") &&
+                tensorNameSet.count(name.substr(0, name.size() - strlen("weight")) + "scale") > 0) {
+                result[name].push_back({name, DataType::FP8_E4M3});
                 continue;
             }
             if (name.find(".engram.q_weight") != std::string::npos ||

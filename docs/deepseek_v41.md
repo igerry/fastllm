@@ -184,8 +184,91 @@ TP=4 不满足。不满足时模型会打印一行说明并**整体退回单卡*
 
 prefill 接近减半；decode 变慢，因为 multicuda 的 eager 调度对**每个算子**都要唤醒两个 worker 线程
 并同步一次，实测每个算子多约 34 us。迷你模型每层只有几十微秒的真实计算，被调度开销淹没；
-真实模型每层的 GPU 计算是它的十几倍，两者大致相抵。**长上下文 / prefill 为主的负载开 `--tp 2`，
-纯 decode 负载建议先测再决定**；要让 decode 也稳定获益需要接入 CUDA Graph（V4 已有，V4.1 还没做）。
+真实模型每层的 GPU 计算是它的十几倍，两者大致相抵。
+
+这条开销正是 CUDA Graph 要解决的（见下一节）：同一个 4 层迷你模型上开图之后，
+TP=2 的 decode 从 7.4 ms/token 降到 4.5 ms/token。**长上下文 / prefill 为主的负载开 `--tp 2`；
+纯 decode 负载开 `--tp 2` 时建议同时打开 CUDA Graph。**
+
+## 单 token decode 的 CUDA Graph
+
+```bash
+FASTLLM_DSV41_CUDA_GRAPH=1 ftllm server /path/to/DeepSeek-V4.1-Flash --device cuda --moe_device numa
+```
+
+把单 token decode 里与位置无关的那部分 GPU 计算捕获成 CUDA Graph，一次启动代替上千次
+kernel launch。**单卡有收益（省下每步上千次 launch），TP 下收益大得多**——multicuda 每个算子
+要唤醒两个 worker 并同步一次，进图之后这笔钱一次付清。
+
+### 开关
+
+| 变量 | 默认 | 作用 |
+| --- | --- | --- |
+| `FASTLLM_DSV41_CUDA_GRAPH` | 跟随 `FASTLLM_CUDA_GRAPH` | `1` 开、`0` 关。不设置时跟随全局开关 |
+| `FASTLLM_DSV41_CUDA_GRAPH_WARMUP` | 2 | 捕获前的预热轮数（让显存池、权重量化缓存达到稳态） |
+| `FASTLLM_DSV41_CUDA_GRAPH_DEBUG` | 关 | 打印捕获 / 失效 / 关闭事件 |
+| `FASTLLM_DSV41_CUDA_GRAPH_REPLAY_MASK` | 7 | 排查用：按位选择回放哪几种段（bit0 pre / bit1 post / bit2 route），其余走逐算子 |
+| `FASTLLM_DSV41_CUDA_GRAPH_FAIL_AT` | 关 | 排查用：让第 N 段捕获强制失败，验证回退路径 |
+
+### 捕获了什么、没捕获什么
+
+整段前向没法一次捕获：Engram 查表在 CPU 上做、压缩 KV 与 indexer key 用 `Expansion + CatDirect`
+追加（写偏移是 host 状态、容量增长时会重新分配）、滑窗 KV 是环形缓冲（写位置随 token 变）、
+两级 indexer 的候选数随上下文增长、路由专家还可能落在 cpu / numa 上。这些"随 token 变化"的
+部分集中在每层的注意力核心与 MoE 两处。
+
+因此按层做**分段捕获**，每层捕获三段与 token 位置完全无关的纯 GPU 计算：
+
+| 段 | 内容 |
+| --- | --- |
+| pre | hc_attn 混合 -> attn_norm -> wq_a / q_norm / wq_b、wkv / kv_norm -> compressor 的 wkv / wgate 投影、indexer 的 wq_b / weights_proj 投影 |
+| post | wo_a -> wo_b -> hc 残差 -> hc_ffn 混合 -> ffn_norm |
+| route | 路由 gate + `SelectExpert` + 共享专家 |
+
+段与段之间保持逐算子执行：RoPE、压缩块追加、indexer 打分与 top-k、稀疏注意力、滑窗写入
+（pre 与 post 之间），以及 `MergeMOEBlock`、共享专家相加、hc 残差（route 之后）。
+40 层的真实模型每步因此是 120 次图启动 + 约 360 次逐算子调用，而不是约 1150 次逐算子调用。
+
+这样做的好处是**图里不含任何 startPos、缓存长度或缓存指针**：图一经捕获，在权重与设备布局
+不变的前提下一直有效，上下文增长既不会让它失效，也不需要为 KV 预分配上下文上限。
+代价是注意力核心（约每层 1/3 的算子）留在图外。
+
+### 适用范围
+
+只有同时满足下面全部条件的前向才会走图，其余一律逐算子执行：
+
+- 单请求、单片段、`seqlen == 1` 且 `startPos > 0`（即真正的单 token decode）；
+- 纯文本（图像 token 走 CPU 参考路由，无法进图）；
+- 不是 DSpark 的多 token 校验前向（那是 `seqlen > 1`，形状不同）；
+- 模型主体确实跑在 CUDA / multicuda 上（`--device cpu` 时不启用）；
+- 没有开 `FASTLLM_DSV41_DUMP_DIR`、`FASTLLM_CUDA_SYNC`、`FASTLLM_PRINT_PROFILE`
+  （它们会在捕获中插入 host 侧拷贝或同步）。
+
+开了 DSpark 时，校验前向逐算子执行、其间的单 token decode 仍然走图，两者可以共存。
+批量 decode（`batch > 1`）不走图。
+
+### 失效与回退
+
+- 整个模型共用一份图（图只碰权重与常驻解码工作区，不碰任何请求私有的缓存），
+  并发前向用 `try_lock` 抢工作区，抢不到的直接逐算子执行；
+- 每次回放前核对全部边界张量的设备地址，任何一个搬了家（设备迁移、重新分配）就销毁重捕获，
+  连续失效超过三次彻底关图；
+- 设备布局、TP 切分方式、KV dtype、共享专家开关任一变化都会重捕获；
+- 捕获或回放失败（含 TP 下某个 rank 失败）就地退回逐算子并永久关掉图，打印一行原因，不会崩。
+
+### 实测（迷你模型，2 x RTX 3090 Ti）
+
+| 场景 | 关图 | 开图 | |
+| --- | --- | --- | --- |
+| 单卡，6 层（32 头） | 3.73 ms/token | 3.56 ms/token | -4.6% |
+| 单卡，4 层（64 头，`--perf-config` 同构） | 3.12 ms/token | 2.99 ms/token | -4.4% |
+| TP=2，4 层（64 头） | 7.41 ms/token | 4.53 ms/token | **-39%** |
+
+单卡的收益有限（迷你模型每步的 GPU 计算本来就把 launch 掩盖掉了大半），TP 下收益显著，
+和"每算子 34 us x 每层约 14 个进图算子"的估算一致。按 40 层外推，TP 下每 token 约省 28 ms。
+
+开图与关图的 decode 输出**逐 token 一致**，logits 的 `max|diff|` / `cos` 与关图逐位相同
+（图没有改变任何计算，只改变了提交方式）。
 
 ## 按层切分（流水线 / 模型分片）
 
@@ -572,6 +655,7 @@ indexer 分数矩阵的分块效果（65536 token prefill，扣掉同卡其它�
 | `FASTLLM_DSV41_DUMP_DIR` | 把每层中间张量写到该目录（对齐调试） |
 | `FASTLLM_DSV41_DISABLE_TP_ATTENTION` | 张量并行时不切分注意力 head（排查用，注意力改为每卡各算一份） |
 | `FASTLLM_DSV41_DISABLE_TP_SHARED_EXPERT` | 张量并行时不切分共享专家（排查用） |
+| `FASTLLM_DSV41_CUDA_GRAPH` 等 | 单 token decode 的 CUDA Graph，见"单 token decode 的 CUDA Graph" |
 | `FASTLLM_TRACE_OPS` | 逐算子打印"算子名 / 落在哪个设备 / 权重名"（排查 TP 落点用） |
 | `FASTLLM_DSV41_DISABLE_PREFIX_CACHE` 等 | 前缀缓存相关，见"多请求与前缀缓存" |
 | `FASTLLM_DSPARK_*` | DSpark 投机解码相关，见"DSpark 投机解码" |

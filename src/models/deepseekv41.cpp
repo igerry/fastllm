@@ -160,8 +160,11 @@ namespace fastllm {
                 s.apply += apply;
                 s.wait += wait;
                 if (level >= 2) {
+                    // 服务端的 stdout 是重定向到文件的块缓冲，不 flush 的话最后一批
+                    // 逐次记录会一直留在缓冲区里（进程被 kill 时直接丢掉）
                     printf("[Engram] layer %d tokens %d | hash %.3f prep %.3f gather %.3f wkv %.3f apply %.3f wait %.3f ms\n",
                            layer, tokens, hash, prep, gather, wkv, apply, wait);
+                    fflush(stdout);
                 }
                 if (reportEvery > 0 && ++sinceReport >= reportEvery) {
                     sinceReport = 0;

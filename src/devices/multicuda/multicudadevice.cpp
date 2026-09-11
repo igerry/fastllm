@@ -387,6 +387,12 @@ namespace fastllm {
             FastllmCudaSetDevice(device);
             if (wait) {
                 FastllmCudaCurrentThreadStreamWaitEvent(event);
+                // 等到这个事件之后，worker 自己的 per-thread stream 才并进调用方正在
+                // 捕获的图。捕获活跃标志是 thread_local 的，只有在本线程上做一次
+                // "精确查询"才会置位；否则后续算子里的 FastllmCudaGraphIsCapturingFast()
+                // 会一路返回 false，于是走同步的 cudaMemset / cudaMemcpy 把捕获打断。
+                // 只有全局 FASTLLM_CUDA_GRAPH 打开时旧代码才碰巧不受影响。
+                FastllmCudaGraphIsCapturing();
             } else {
                 FastllmCudaEventRecordCurrentThread(event);
             }

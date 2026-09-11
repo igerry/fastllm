@@ -15,6 +15,7 @@
 #include "executor.h"
 #include "utils.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +26,12 @@
 #include <vector>
 
 using namespace fastllm;
+
+#ifdef USE_CUDA
+// 融合 kernel 直接调用（模型里也是这样用的：拒绝时退回 HcApplyPre + RMSNorm 两步）
+extern "C" bool FastllmCudaDeepSeekV41HcPreNorm(const fastllm::Data &x, const fastllm::Data &pre,
+                                     fastllm::Data &normWeight, float eps, fastllm::Data &output);
+#endif
 
 static Executor &Exec() {
     return *((Executor*)GetExecutor());
@@ -75,6 +82,15 @@ static std::vector<uint8_t> ReadBytes(const Data &data) {
     cpu.ToDevice(DataDevice::CPU);
     std::vector<uint8_t> out(cpu.Count(0));
     memcpy(out.data(), cpu.cpuData, out.size());
+    return out;
+}
+
+static std::vector<int32_t> ReadInts(const Data &data) {
+    Data cpu;
+    cpu.CopyFrom(data);
+    cpu.ToDevice(DataDevice::CPU);
+    std::vector<int32_t> out(cpu.Count(0));
+    memcpy(out.data(), cpu.cpuData, out.size() * sizeof(int32_t));
     return out;
 }
 
@@ -366,6 +382,200 @@ static void CheckIndexerRead(bool cuda) {
     std::cout << "  [" << tag << "] IndexerScore：FP4 indexer key 与 BF16 逐 bit 相同\n";
 }
 
+// ---------------- 4. IndexerTopK 的 CPU / CUDA 逐字节一致 ----------------
+//
+// CPU 参考实现是「按 (分数降序, 下标升序) 稳定排序取前 keep 个，再按下标升序输出，
+// 不足 width 补 -1」。CUDA kernel 用 radix select + 阈值 + 并列预算复现这条规则，
+// 必须逐字节一致，否则候选集变化会直接改掉注意力结果。
+//
+// 这里刻意把分数量化到很少的几档，制造大量并列（并列处理是最容易写错的地方），
+// 并覆盖：有 / 无候选掩码、blockSize 是 / 不是 2 的幂（后者不走候选块压缩）、
+// visible 小于 / 大于 width、topK 大于可用候选数。
+static void CheckIndexerTopK() {
+    struct Case {
+        int seqlen, m, ratio, startPos, topK, blockSize, topkBlocks;
+        bool useCand;
+        const char *name;
+    };
+    const std::vector<Case> cases = {
+        {6, 200, 1, 0,   32, 8,  6,  true,  "候选掩码 + blockSize 8"},
+        {6, 200, 1, 0,   32, 0,  0,  false, "无候选掩码"},
+        {5, 130, 2, 500, 24, 16, 3,  true,  "ratio 2 + startPos 500"},
+        {4, 100, 1, 0,   16, 5,  4,  true,  "blockSize 5（非 2 的幂，不压缩候选块）"},
+        {4, 100, 1, 0,  200, 8,  6,  true,  "topK 大于可用候选数"},
+        {3, 64,  1, 0,    8, 8,  8,  true,  "候选块全选"},
+        {3, 40,  1, 0,   16, 8,  1,  true,  "只留一个候选块"},
+    };
+    std::mt19937 rng(20260911);
+    for (const Case &c : cases) {
+        // 分数只取 6 档，制造大量并列
+        Data score(DataType::FLOAT32, {1, c.seqlen, c.m});
+        score.Allocate();
+        for (int i = 0; i < c.seqlen * c.m; i++) {
+            ((float*)score.cpuData)[i] = 0.25f * (float)(rng() % 6);
+        }
+        // 候选掩码由 CPU 的 CandidateBlocks 生成，两边共用同一份
+        Data candCpu;
+        bool hasCand = c.useCand && c.blockSize > 0;
+        if (hasCand) {
+            Data scoreCopy;
+            scoreCopy.CopyFrom(score);
+            Exec().RunOnDevice("cpu", "DeepSeekV41CandidateBlocks",
+                               {{"score", &scoreCopy}, {"output", &candCpu}}, {},
+                               {{"blockSize", c.blockSize}, {"topkBlocks", c.topkBlocks},
+                                {"compressRatio", c.ratio}, {"startPos", c.startPos}});
+        }
+        IntDict ints = {{"topK", c.topK}, {"compressRatio", c.ratio}, {"startPos", c.startPos},
+                        {"blockSize", std::max(1, c.blockSize)}};
+
+        Data scoreCpu, candRefCpu, refOut;
+        scoreCpu.CopyFrom(score);
+        DataDict cpuDatas = {{"score", &scoreCpu}, {"output", &refOut}};
+        if (hasCand) {
+            candRefCpu.CopyFrom(candCpu);
+            cpuDatas["candidates"] = &candRefCpu;
+        }
+        Exec().RunOnDevice("cpu", "DeepSeekV41IndexerTopK", cpuDatas, {}, ints);
+        const std::vector<int32_t> ref = ReadInts(refOut);
+
+        auto runCuda = [&](const char *legacy) {
+            if (legacy != nullptr) {
+                setenv(legacy, "1", 1);
+            }
+            Data scoreDev, candDev, gotOut;
+            scoreDev.CopyFrom(score);
+            ToDev(scoreDev, true);
+            DataDict datas = {{"score", &scoreDev}, {"output", &gotOut}};
+            if (hasCand) {
+                candDev.CopyFrom(candCpu);
+                ToDev(candDev, true);
+                datas["candidates"] = &candDev;
+            }
+            Exec().RunOnDevice("cuda", "DeepSeekV41IndexerTopK", datas, {}, ints);
+            std::vector<int32_t> got = ReadInts(gotOut);
+            if (legacy != nullptr) {
+                unsetenv(legacy);
+            }
+            return got;
+        };
+
+        Require(runCuda(nullptr) == ref,
+                std::string("IndexerTopK[") + c.name + "]：CUDA 新 kernel 与 CPU 参考不一致");
+        Require(runCuda("FASTLLM_DSV41_LEGACY_TOPK") == ref,
+                std::string("IndexerTopK[") + c.name + "]：CUDA legacy kernel 与 CPU 参考不一致");
+        std::cout << "  [cuda] IndexerTopK " << c.name << "：与 CPU 参考逐字节相同（新 / legacy）\n";
+    }
+}
+
+// ---------------- 5. RotaryQuant 新旧 kernel 逐 bit 一致 ----------------
+//
+// 新实现把 quantMode == 0 拆成「只旋转」的 kernel，quantMode > 0 改成 shuffle 换对 +
+// 一个 block 多行；两者都必须与旧的「一行一个 block + 共享内存」实现逐 bit 相同。
+static void CheckRotaryQuantEquiv() {
+    struct Case { int rows, rowsPerToken, dim, ropeDim, quantMode, quantBlock, startPos, posStep, inverse; };
+    const std::vector<Case> cases = {
+        {37,  1, 512, 128, 0, 32, 0,    1, 0},
+        {36,  4, 512, 128, 0, 32, 1000, 1, 1},
+        {33,  1, 512, 128, 1, 32, 7,    1, 0},
+        {33,  1, 512, 128, 3, 16, 7,    2, 0},
+        {130, 1, 128, 128, 2, 32, 5,    1, 0},
+        {128, 8, 128, 64,  2, 32, 5,    1, 0},
+    };
+    std::mt19937 rng(777);
+    std::normal_distribution<float> dist(0.0f, 1.3f);
+    for (const Case &c : cases) {
+        std::vector<int> dims = c.rowsPerToken > 1
+            ? std::vector<int>{1, c.rows / c.rowsPerToken, c.rowsPerToken, c.dim}
+            : std::vector<int>{1, c.rows, c.dim};
+        size_t count = 1;
+        for (int d : dims) {
+            count *= (size_t)d;
+        }
+        std::vector<float> values(count);
+        for (size_t i = 0; i < values.size(); i++) {
+            values[i] = dist(rng);
+        }
+        FloatDict floats = {{"ropeBase", 10000.0f}, {"ropeFactor", 1.0f}};
+        IntDict ints = {{"ropeDim", c.ropeDim}, {"startPos", c.startPos}, {"posStep", c.posStep},
+                        {"inverse", c.inverse}, {"originalSeqLen", 0}, {"betaFast", 32}, {"betaSlow", 1},
+                        {"quantMode", c.quantMode}, {"quantBlock", c.quantBlock}};
+        auto run = [&](bool legacy) {
+            Data x = MakeBf16(dims, values);
+            ToDev(x, true);
+            if (legacy) {
+                setenv("FASTLLM_DSV41_LEGACY_ROTARY", "1", 1);
+            }
+            Exec().RunOnDevice("cuda", "DeepSeekV41RotaryQuant", {{"input", &x}}, floats, ints);
+            if (legacy) {
+                unsetenv("FASTLLM_DSV41_LEGACY_ROTARY");
+            }
+            return ReadFloats(x);
+        };
+        Require(BitEqual(run(false), run(true)),
+                "RotaryQuant：新 kernel 与 legacy kernel 不一致（quantMode " +
+                std::to_string(c.quantMode) + ", dim " + std::to_string(c.dim) + ")");
+    }
+    std::cout << "  [cuda] RotaryQuant：新 kernel 与 legacy kernel 逐 bit 相同（6 组配置）\n";
+}
+
+// ---------------- 6. HcApplyPre + RMSNorm 融合与两步分开做逐 bit 一致 ----------------
+//
+// 融合 kernel 必须复现两件事：HcApplyPre 折叠后写 BF16 的舍入，以及 RMSNorm 的归约树
+// （平方和的累加顺序、warp shuffle-down、rsqrtf(val / channels + eps)、写出的 lo * s * w）。
+// 归约树与 THREAD_PER_BLOCK 绑定，所以这里覆盖 RMSNorm 会选到的三档线程数
+// （channels < 512 -> 64、< 4096 -> 512、否则 1024），以及真实模型的 5120。
+#ifdef USE_CUDA
+static void CheckHcPreNormFused() {
+    struct Case { int seqlen, hcMult, channels; };
+    const std::vector<Case> cases = {
+        {3, 4, 5120},   // 真实模型：hidden_size 5120、hc_mult 4
+        {2, 4, 4096},
+        {5, 4, 2048},
+        {4, 2, 256},
+        {2, 4, 1024},
+    };
+    std::mt19937 rng(31337);
+    std::normal_distribution<float> dist(0.0f, 0.8f);
+    for (const Case &c : cases) {
+        const size_t n = (size_t)c.seqlen * c.hcMult * c.channels;
+        std::vector<float> xv(n);
+        for (size_t i = 0; i < n; i++) {
+            xv[i] = dist(rng);
+        }
+        Data pre(DataType::FLOAT32, {1, c.seqlen, c.hcMult});
+        pre.Allocate();
+        for (int i = 0; i < c.seqlen * c.hcMult; i++) {
+            ((float*)pre.cpuData)[i] = dist(rng);
+        }
+        Data w(DataType::FLOAT32, {c.channels});
+        w.Allocate();
+        for (int i = 0; i < c.channels; i++) {
+            ((float*)w.cpuData)[i] = 0.5f + 0.001f * (i % 97);
+        }
+        const float eps = 1e-6f;
+
+        // 两步：HcApplyPre + RMSNorm
+        Data xA = MakeBf16({1, c.seqlen, c.hcMult, c.channels}, xv), preA, wA, mid, refOut;
+        preA.CopyFrom(pre); wA.CopyFrom(w);
+        ToDev(xA, true); ToDev(preA, true); ToDev(wA, true);
+        Exec().RunOnDevice("cuda", "DeepSeekV41HcApplyPre",
+                           {{"input", &xA}, {"pre", &preA}, {"output", &mid}}, {}, {});
+        Exec().RunOnDevice("cuda", "RMSNorm", {{"input", &mid}, {"weight", &wA}, {"output", &refOut}},
+                           {{"eps", eps}}, {});
+
+        // 融合
+        Data xB = MakeBf16({1, c.seqlen, c.hcMult, c.channels}, xv), preB, wB, gotOut;
+        preB.CopyFrom(pre); wB.CopyFrom(w);
+        ToDev(xB, true); ToDev(preB, true); ToDev(wB, true);
+        Require(FastllmCudaDeepSeekV41HcPreNorm(xB, preB, wB, eps, gotOut),
+                "HcPreNorm：融合 kernel 拒绝了 channels " + std::to_string(c.channels));
+        Require(BitEqual(ReadFloats(refOut), ReadFloats(gotOut)),
+                "HcPreNorm：融合与两步分开做不一致（channels " + std::to_string(c.channels) + ")");
+    }
+    std::cout << "  [cuda] HcApplyPre + RMSNorm：融合与两步分开做逐 bit 相同（5 组配置）\n";
+}
+#endif
+
 int main() {
     try {
         gHasCuda = Exec().HasDevice("cuda");
@@ -392,6 +602,19 @@ int main() {
             CheckIndexerRead(true);
             unsetenv("FASTLLM_DSV41_LEGACY_ATTN");
             unsetenv("FASTLLM_DSV41_LEGACY_INDEXER");
+            std::cout << "== 读路径（CUDA 逐元素 FP4 解包回退）==\n";
+            setenv("FASTLLM_DSV41_LEGACY_FP4_UNPACK", "1", 1);
+            CheckAttentionRead(true);
+            CheckIndexerRead(true);
+            unsetenv("FASTLLM_DSV41_LEGACY_FP4_UNPACK");
+            std::cout << "== IndexerTopK（CUDA vs CPU 逐字节）==\n";
+            CheckIndexerTopK();
+            std::cout << "== RotaryQuant（新 kernel vs legacy）==\n";
+            CheckRotaryQuantEquiv();
+#ifdef USE_CUDA
+            std::cout << "== HcApplyPre + RMSNorm 融合 ==\n";
+            CheckHcPreNormFused();
+#endif
         } else {
             std::cout << "(未编译 / 未检测到 CUDA，跳过 GPU 部分)\n";
         }

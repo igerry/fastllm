@@ -601,6 +601,21 @@ namespace fastllm {
             }, {}, {});
         }
 
+        // 子层入口的「HcApplyPre -> RMSNorm」：中间张量只被紧接着的 RMSNorm 读一次，
+        // 单卡 CUDA 上用融合 kernel 一次算完（结果逐 bit 相同）；其余情况退回两步。
+        void V41HcApplyPreNorm(const Data &input, const Data &pre, Data &normWeight, float eps,
+                               Data &tmp, Data &output) {
+#ifdef USE_CUDA
+            static const bool disableFused = V41EnvFlag("FASTLLM_DSV41_DISABLE_HCPRENORM");
+            if (!disableFused && input.dataDevice == DataDevice::CUDA && !input.multiDeviceData &&
+                FastllmCudaDeepSeekV41HcPreNorm(input, pre, normWeight, eps, output)) {
+                return;
+            }
+#endif
+            V41HcApplyPre(input, pre, tmp);
+            V41RMSNormBF16(tmp, normWeight, eps, output);
+        }
+
         void V41EngramApply(Data &hidden, const Data &kv, Data &qWeight, Data &kWeight,
                             const Data *mask, float eps) {
             DataDict datas = {
@@ -3456,8 +3471,8 @@ namespace fastllm {
             V41HcMix(*curHidden, weight[pre + ".hc_attn_fn"], weight[pre + ".hc_attn_scale"],
                      weight[pre + ".hc_attn_base"], hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
                      attnPre, attnPost, attnComb);
-            V41HcApplyPre(*curHidden, *preMixPtr, x);
-            V41RMSNormBF16(x, weight[pre + ".attn_norm.weight"], rms_norm_eps, attnInput);
+            V41HcApplyPreNorm(*curHidden, *preMixPtr, weight[pre + ".attn_norm.weight"], rms_norm_eps,
+                              x, attnInput);
 
             // wq_a / wkv 是复制的（KV 是 MLA 式的单份 latent，与 head 无关）；
             // wq_b 按行切 -> q 的 head 维分片，Reshape 会把 tpAxis 从最后一维换算到 head 维。
@@ -3787,8 +3802,8 @@ namespace fastllm {
             V41HcMix(*curHidden, weight[pre + ".hc_ffn_fn"], weight[pre + ".hc_ffn_scale"],
                      weight[pre + ".hc_ffn_base"], hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps,
                      ffnPre, ffnPost, ffnComb);
-            V41HcApplyPre(*curHidden, attnPre, x);
-            V41RMSNormBF16(x, weight[pre + ".ffn_norm.weight"], rms_norm_eps, ffnInput);
+            V41HcApplyPreNorm(*curHidden, attnPre, weight[pre + ".ffn_norm.weight"], rms_norm_eps,
+                              x, ffnInput);
             ffnDims = ffnInput.dims;
             ffnInput.Reshape({seqlen, dim});
             };   // runAttentionPost

@@ -814,6 +814,9 @@ bool FastllmCudaDeepSeekV41HcMix(const fastllm::Data &x, fastllm::Data &hcFn, fa
                                  fastllm::Data &hcBase, int hcMult, int sinkhornIters, float eps,
                                  float normEps, fastllm::Data &pre, fastllm::Data &post, fastllm::Data &comb);
 bool FastllmCudaDeepSeekV41HcApplyPre(const fastllm::Data &x, const fastllm::Data &pre, fastllm::Data &y);
+// HcApplyPre + RMSNorm 的融合（结果与两步分开做逐 bit 相同；不支持的形状返回 false）
+bool FastllmCudaDeepSeekV41HcPreNorm(const fastllm::Data &x, const fastllm::Data &pre,
+                                     fastllm::Data &normWeight, float eps, fastllm::Data &output);
 bool FastllmCudaDeepSeekV41EngramApply(fastllm::Data &hidden, const fastllm::Data &kv,
                                        fastllm::Data &qWeight, fastllm::Data &kWeight,
                                        const fastllm::Data *mask, float eps, float clampValue);

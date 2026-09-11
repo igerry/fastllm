@@ -139,10 +139,16 @@ namespace {
         return sign | (uint8_t)idx;
     }
 
+    // E2M1 -> float，纯位运算（不再查表，省掉每个元素一次 local / constant 访存）：
+    //   c == 0 -> 0；c == 1 -> 0.5（E2M1 的次正规）；c >= 2 -> (1 + 0.5 * (c & 1)) * 2^((c >> 1) - 1)
+    // 与旧的 grid[] 查表逐 bit 相同（含 code == 8 时的 -0.0）。
     __device__ __forceinline__ float V41DecodeFp4Dev(int code) {
-        const float grid[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
-        float v = grid[code & 7];
-        return (code & 8) ? -v : v;
+        const int c = code & 7;
+        uint32_t bits = c == 0 ? 0u
+                               : ((((uint32_t)(126 + (c >> 1))) << 23) |
+                                  ((c >= 2 ? (uint32_t)(c & 1) : 0u) << 22));
+        bits |= ((uint32_t)(code & 8)) << 28;
+        return __uint_as_float(bits);
     }
 
     // 量化缓存行的解码（布局见 cpu/deepseekv41ops.cpp 顶部的说明）：
@@ -168,6 +174,111 @@ namespace {
             return v * (float)s;
         }
         return v * ldexpf(1.0f, (int)scales[d >> 5] - 127);
+    }
+
+    __device__ __forceinline__ uint32_t V41Pack2Bf16(float a, float b) {
+        __nv_bfloat162 v = __halves2bfloat162(__float2bfloat16_rn(a), __float2bfloat16_rn(b));
+        return *reinterpret_cast<const uint32_t*>(&v);
+    }
+
+    // 一次展开 8 个连续元素并直接写成 mma 片段需要的 16 字节 BF16。
+    //
+    // 要求 (d0 & 7) == 0、dst 16 字节对齐。
+    // 8 个元素落在同一个 scale 块内（blockSize 是 16 或 32），所以 scale 只算一次；
+    // 打包 FP4 的 4 个字节按一次 uint32 读出（缓存行起始与 4 字节对齐：三种 rowBytes
+    // 都是 4 的倍数，d0 >> 1 也是 4 的倍数），FP8 按两次 uint32 读出。
+    // 数值与逐元素的 V41LoadKvRow + __float2bfloat16_rn 逐 bit 相同。
+    __device__ __forceinline__ void V41LoadKvRow8Bf16(const uint8_t *row, int dim, int d0,
+                                                      int quantMode, __nv_bfloat16 *dst) {
+        uint32_t o[4];
+        if (quantMode == 1) {
+            const float scale = ldexpf(1.0f, (int)row[dim + (d0 >> 5)] - 127);
+            const uint32_t w0 = *(const uint32_t*)(row + d0);
+            const uint32_t w1 = *(const uint32_t*)(row + d0 + 4);
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const uint32_t w = (e < 2) ? w0 : w1;
+                const int sh = (e & 1) * 16;
+                __nv_fp8_e4m3 c0, c1;
+                c0.__x = (unsigned char)((w >> sh) & 0xFF);
+                c1.__x = (unsigned char)((w >> (sh + 8)) & 0xFF);
+                o[e] = V41Pack2Bf16((float)c0 * scale, (float)c1 * scale);
+            }
+        } else {
+            const uint8_t *scales = row + (dim >> 1);
+            float scale;
+            if (quantMode == 3) {
+                __nv_fp8_e4m3 s;
+                s.__x = scales[d0 >> 4];
+                scale = (float)s;
+            } else {
+                scale = ldexpf(1.0f, (int)scales[d0 >> 5] - 127);
+            }
+            const uint32_t packed = *(const uint32_t*)(row + (d0 >> 1));
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int byte = (int)((packed >> (e * 8)) & 0xFF);
+                o[e] = V41Pack2Bf16(V41DecodeFp4Dev(byte & 0xF) * scale,
+                                    V41DecodeFp4Dev(byte >> 4) * scale);
+            }
+        }
+        *((float4*)dst) = make_float4(__uint_as_float(o[0]), __uint_as_float(o[1]),
+                                      __uint_as_float(o[2]), __uint_as_float(o[3]));
+    }
+
+    // 一次展开 16 个连续元素（head_dim = 512 时正好是一个 lane 的份额，整行一趟做完）。
+    //
+    // 16 个元素一定落在同一个 scale 块内（blockSize 是 16 或 32），所以整行每个 lane
+    // 只做一次数据读（FP4 8 字节 / FP8 16 字节）+ 一次 scale 读，再写两个 float4。
+    // 要求 (d0 & 15) == 0、dst 16 字节对齐、行首 16 字节对齐（dim = 512 的三种
+    // rowBytes 288 / 272 / 528 都是 16 的倍数，配合 256 字节对齐的基址成立；
+    // 调用方在主机侧检查了这一点）。
+    // 数值与 V41LoadKvRow8Bf16 / 逐元素解包逐 bit 相同。
+    __device__ __forceinline__ void V41LoadKvRow16Bf16(const uint8_t *row, int dim, int d0,
+                                                       int quantMode, __nv_bfloat16 *dst) {
+        uint32_t o[8];
+        if (quantMode == 1) {
+            const float scale = ldexpf(1.0f, (int)row[dim + (d0 >> 5)] - 127);
+            const uint4 w = *(const uint4*)(row + d0);
+            const uint32_t ws[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+            for (int g = 0; g < 4; g++) {
+#pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    const int sh = h * 16;
+                    __nv_fp8_e4m3 c0, c1;
+                    c0.__x = (unsigned char)((ws[g] >> sh) & 0xFF);
+                    c1.__x = (unsigned char)((ws[g] >> (sh + 8)) & 0xFF);
+                    o[g * 2 + h] = V41Pack2Bf16((float)c0 * scale, (float)c1 * scale);
+                }
+            }
+        } else {
+            const uint8_t *scales = row + (dim >> 1);
+            float scale;
+            if (quantMode == 3) {
+                __nv_fp8_e4m3 sq;
+                sq.__x = scales[d0 >> 4];
+                scale = (float)sq;
+            } else {
+                scale = ldexpf(1.0f, (int)scales[d0 >> 5] - 127);
+            }
+            const uint2 packed = *(const uint2*)(row + (d0 >> 1));
+            const uint32_t ps[2] = {packed.x, packed.y};
+#pragma unroll
+            for (int q = 0; q < 2; q++) {
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int byte = (int)((ps[q] >> (e * 8)) & 0xFF);
+                    o[q * 4 + e] = V41Pack2Bf16(V41DecodeFp4Dev(byte & 0xF) * scale,
+                                                V41DecodeFp4Dev(byte >> 4) * scale);
+                }
+            }
+        }
+        float4 *out4 = (float4*)dst;
+        out4[0] = make_float4(__uint_as_float(o[0]), __uint_as_float(o[1]),
+                              __uint_as_float(o[2]), __uint_as_float(o[3]));
+        out4[1] = make_float4(__uint_as_float(o[4]), __uint_as_float(o[5]),
+                              __uint_as_float(o[6]), __uint_as_float(o[7]));
     }
 
     // (quantMode, blockSize) -> 每行字节数；与 CPU 侧 V41KvRowBytes 一致
@@ -537,6 +648,92 @@ namespace {
         V41Store<T>(y, idx, v);
     }
 
+    // ---------------- HcApplyPre + RMSNorm 融合 ----------------
+    //
+    // V4.1 每个子层的入口都是「HcApplyPre(curHidden, pre) -> x -> RMSNorm(x) -> 子层输入」，
+    // 中间的 x 只被紧接着的 RMSNorm 读一次。融合后省掉 x 的一次写 + 一次读，
+    // 以及一次 kernel 启动（40 层 x 2 次）。
+    //
+    // 数值必须与「HcApplyPre 写 BF16」+「FastllmRMSNormKernelInner1<T> 的 BF16 版本」
+    // 逐 bit 相同，因此这里照抄两边的顺序：
+    //   * 折叠按 h 从小到大 FP32 累加，写进中间结果前先舍入到 BF16（HcApplyPre 的 V41Store）；
+    //   * 平方和按 i = tid, tid + T, ... 的顺序累加，warp shuffle-down 归约树、
+    //     跨 warp 的 warp_sums 归约、rsqrtf(val / channels + eps) 与写出的 lo * s * w
+    //     都与 RMSNorm kernel 一致。
+    // 所以 THREAD_PER_BLOCK 必须与 LaunchFastllmRMSNormBFloat16 对同一个 channels 的选择相同。
+    template <int THREAD_PER_BLOCK, int MAX_ITER>
+    __global__ void __launch_bounds__(THREAD_PER_BLOCK)
+    V41HcPreNormKernel(const __nv_bfloat16 *x, const float *pre, const float *weight,
+                       __nv_bfloat16 *out, int hcMult, int channels, float eps) {
+        constexpr int WARP_SIZE = 32;
+        constexpr int NUM_WARPS = THREAD_PER_BLOCK / WARP_SIZE;
+        __shared__ float warp_sums[NUM_WARPS];
+        __shared__ float scale;
+
+        const int o = blockIdx.x;
+        const int bf2 = channels / 2;
+        const __nv_bfloat162 *xb = reinterpret_cast<const __nv_bfloat162*>(x) + (uint64_t)o * hcMult * bf2;
+        const float *preRow = pre + (uint64_t)o * hcMult;
+        __nv_bfloat162 *outb = reinterpret_cast<__nv_bfloat162*>(out) + (uint64_t)o * bf2;
+
+        const unsigned tid = threadIdx.x;
+        const int warp_id = (int)tid / WARP_SIZE, lane_id = (int)tid % WARP_SIZE;
+
+        float2 cache[MAX_ITER];
+        float sum2 = 0.0f;
+#pragma unroll
+        for (int k = 0; k < MAX_ITER; k++) {
+            const int i = (int)tid + k * THREAD_PER_BLOCK;
+            if (i < bf2) {
+                float lo = 0.0f, hi = 0.0f;
+                for (int h = 0; h < hcMult; h++) {
+                    const __nv_bfloat162 v = xb[(uint64_t)h * bf2 + i];
+                    const float p = preRow[h];
+                    lo += p * __bfloat162float(v.x);
+                    hi += p * __bfloat162float(v.y);
+                }
+                lo = __bfloat162float(__float2bfloat16_rn(lo));
+                hi = __bfloat162float(__float2bfloat16_rn(hi));
+                cache[k] = make_float2(lo, hi);
+                sum2 += lo * lo + hi * hi;
+            }
+        }
+
+#pragma unroll
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            sum2 += __shfl_down_sync(0xffffffff, sum2, offset);
+        }
+        if (lane_id == 0) {
+            warp_sums[warp_id] = sum2;
+        }
+        __syncthreads();
+        if (warp_id == 0) {
+            float val = (lane_id < NUM_WARPS) ? warp_sums[lane_id] : 0.0f;
+#pragma unroll
+            for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+                val += __shfl_down_sync(0xffffffff, val, offset);
+            }
+            if (lane_id == 0) {
+                scale = rsqrtf(val / channels + eps);
+            }
+        }
+        __syncthreads();
+
+        const float s = scale;
+#pragma unroll
+        for (int k = 0; k < MAX_ITER; k++) {
+            const int i = (int)tid + k * THREAD_PER_BLOCK;
+            if (i < bf2) {
+                const float w0 = __ldg(&weight[i * 2]);
+                const float w1 = __ldg(&weight[i * 2 + 1]);
+                __nv_bfloat162 ov;
+                ov.x = __float2bfloat16_rn(cache[k].x * s * w0);
+                ov.y = __float2bfloat16_rn(cache[k].y * s * w1);
+                outb[i] = ov;
+            }
+        }
+    }
+
     // ---------------- EngramApply ----------------
 
     constexpr int kEngramThreads = 256;
@@ -576,11 +773,12 @@ namespace {
 
     // ---------------- RotaryQuant ----------------
 
-    // 一个 block 处理一行，blockDim = dim（<= 1024）
+    // 旧实现：一个 block 处理一行，blockDim = dim（<= 1024）。
+    // 保留作为 FASTLLM_DSV41_LEGACY_ROTARY=1 的对比基准。
     template <typename T>
-    __global__ void V41RotaryQuantKernel(T *x, int rowsPerToken, int dim, V41RopeTable rope,
-                                         int ropeDim, int startPos, int posStep, int inverse,
-                                         int quantMode, int quantDim, int quantBlock) {
+    __global__ void V41RotaryQuantLegacyKernel(T *x, int rowsPerToken, int dim, V41RopeTable rope,
+                                               int ropeDim, int startPos, int posStep, int inverse,
+                                               int quantMode, int quantDim, int quantBlock) {
         extern __shared__ float row[];
         const int r = blockIdx.x;
         const int token = r / rowsPerToken;
@@ -617,6 +815,81 @@ namespace {
             }
             (void)group;
             float scale = V41QuantScaleDev(a, quantMode);
+            v = V41QuantValueDev(v, scale, quantMode);
+        }
+        V41Store<T>(base, d, v);
+    }
+
+    // quantMode == 0（q / 注意力输出的逆旋转）：只有末尾 ropeDim 个元素会变，
+    // 旧 kernel 却把整行 load 到共享内存再原样写回（dim = 512、ropeDim = 128 时白读写 75%）。
+    // 这里一个 block 处理多行的若干个旋转对，只碰真正需要旋转的元素。
+    template <typename T>
+    __global__ void V41RotaryOnlyKernel(T *x, int rowsPerToken, int dim, V41RopeTable rope,
+                                        int ropeDim, int startPos, int posStep, int inverse,
+                                        uint64_t totalPairs) {
+        const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= totalPairs) {
+            return;
+        }
+        const int pairs = ropeDim >> 1;
+        const int r = (int)(idx / (uint64_t)pairs);
+        const int d = (int)(idx - (uint64_t)r * pairs);
+        const int token = r / rowsPerToken;
+        T *base = x + (uint64_t)r * dim + (dim - ropeDim) + 2 * d;
+        const float pos = (float)(startPos + (long long)token * posStep);
+        const float ang = pos * rope.invFreq[d];
+        float c = cosf(ang), s = sinf(ang);
+        if (inverse) {
+            s = -s;
+        }
+        const float a = V41Load<T>(base, 0), b = V41Load<T>(base, 1);
+        V41Store<T>(base, 0, a * c - b * s);
+        V41Store<T>(base, 1, a * s + b * c);
+    }
+
+    // quantMode > 0：一个线程一个元素，旋转对通过相邻 lane 的 __shfl_xor 交换，
+    // 因此不再需要共享内存与两次 __syncthreads，一个 block 可以处理 rowsPerBlock 行
+    // （dim = 128 时旧实现只有 128 个线程一个 block）。
+    // 块内 amax 的语义不变：仍是 warp 内连续 quantBlock（16 / 32）个 lane 的归约。
+    template <typename T>
+    __global__ void V41RotaryQuantKernel(T *x, int rowsPerToken, int dim, V41RopeTable rope,
+                                         int ropeDim, int startPos, int posStep, int inverse,
+                                         int quantMode, int quantDim, int quantBlock,
+                                         int rowsPerBlock, int rows) {
+        const int sub = threadIdx.x / dim;
+        const int d = (int)threadIdx.x - sub * dim;
+        const int r = blockIdx.x * rowsPerBlock + sub;
+        if (r >= rows) {
+            return;     // dim 是 32 的倍数，整个 warp 一起返回
+        }
+        const int token = r / rowsPerToken;
+        T *base = x + (uint64_t)r * dim;
+        float v = V41Load<T>(base, d);
+        // 旋转对 (off + 2p, off + 2p + 1) 是相邻的两个 lane；off 是偶数，所以配对与
+        // lane 的奇偶一致。shuffle 放在分支外，保证整个 warp 都参与。
+        const float other = __shfl_xor_sync(0xffffffff, v, 1);
+        const int off = dim - ropeDim;
+        if (d >= off) {
+            const int k = d - off;
+            const float pos = (float)(startPos + (long long)token * posStep);
+            const float ang = pos * rope.invFreq[k >> 1];
+            float c = cosf(ang), s = sinf(ang);
+            if (inverse) {
+                s = -s;
+            }
+            v = (k & 1) ? (other * s + v * c) : (v * c - other * s);
+        }
+        if (d < quantDim) {
+            float a = fabsf(v);
+            if (quantBlock == 16) {
+                a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, 8));
+                a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, 4));
+                a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, 2));
+                a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, 1));
+            } else {
+                a = V41WarpMax(a);
+            }
+            const float scale = V41QuantScaleDev(a, quantMode);
             v = V41QuantValueDev(v, scale, quantMode);
         }
         V41Store<T>(base, d, v);
@@ -764,7 +1037,7 @@ namespace {
     __global__ void __launch_bounds__(kIdxMmaThreads)
     V41IndexerScoreMmaKernel(const __nv_bfloat16 *q, const float *weights, const __nv_bfloat16 *k,
                              int seqlen, int heads, int m, int ratio, int startPos, float *out,
-                             const uint8_t *k8, int kMode, int kRowBytes) {
+                             const uint8_t *k8, int kMode, int kRowBytes, int vecUnpack) {
 #if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800)
         __shared__ V41IdxShared sh;
         const int j0 = blockIdx.x * kIdxBJ;
@@ -794,9 +1067,13 @@ namespace {
             } else if (k8 != nullptr) {
                 // 量化 key：就地解到 BF16 片段再进 mma（FP4 的值在 BF16 上是精确的）
                 const uint8_t *krow8 = k8 + ((uint64_t)b * m + j0 + jj) * kRowBytes;
+                if (vecUnpack) {
+                    V41LoadKvRow8Bf16(krow8, kIdxDim, dv * 8, kMode, &sh.ks[jj][dv * 8]);
+                } else {
 #pragma unroll
-                for (int e = 0; e < 8; e++) {
-                    sh.ks[jj][dv * 8 + e] = __float2bfloat16_rn(V41LoadKvRow(krow8, kIdxDim, dv * 8 + e, kMode));
+                    for (int e = 0; e < 8; e++) {
+                        sh.ks[jj][dv * 8 + e] = __float2bfloat16_rn(V41LoadKvRow(krow8, kIdxDim, dv * 8 + e, kMode));
+                    }
                 }
             } else {
                 *((float4*)&sh.ks[jj][dv * 8]) =
@@ -1011,7 +1288,7 @@ namespace {
 
     // ---------------- IndexerTopK ----------------
 
-    __global__ void V41TopKKernel(const float *score, const uint8_t *candidates, int seqlen, int m,
+    __global__ void V41TopKKernelLegacy(const float *score, const uint8_t *candidates, int seqlen, int m,
                                   int numBlocks, int blockSize, int topK, int width, int ratio, int startPos,
                                   int32_t *out) {
         typedef cub::BlockScan<int, kSelThreads> BlockScan;
@@ -1102,6 +1379,213 @@ namespace {
         for (int p = keep + threadIdx.x; p < width; p += kSelThreads) {
             orow[p] = -1;
         }
+    }
+
+    // 新 top-k：输出与 V41TopKKernelLegacy 逐字节相同（升序、并列按下标从小到大、
+    // 不足 width 补 -1），但把「11 趟全量扫描」降到 3 趟：
+    //
+    //   1. 有候选掩码时先把候选块下标升序压缩进共享内存，之后所有扫描都只在
+    //      候选块内进行（两级 top-k 下 visible 远大于候选集，上下文越长省得越多）；
+    //   2. radix select 从 4 bit 8 趟改成 8 bit 4 趟，且只有第 1 趟是全量的：
+    //      第 1 趟顺带把落在选中桶里的 key 压缩进共享内存，后 3 趟只扫这几百个 key；
+    //   3. 「严格大于阈值的个数」不再单独扫一趟：radix select 结束时的 remaining
+    //      恰好是需要从等于阈值的元素里取的个数（tieBudget）；
+    //   4. 写出阶段把两次 BlockScan 合成一次（greater / tie 的前缀和打包进一个 int），
+    //      输出位置 = 前面 greater 的个数 + min(tieBudget, 前面 tie 的个数)。
+    //
+    // 共享内存里的候选块下标由 candList（动态共享内存）承载，listCap == 0 表示不压缩。
+    constexpr int kTopKSurvivorCap = 1024;
+
+    __global__ void V41TopKKernel(const float *score, const uint8_t *candidates, int seqlen, int m,
+                                  int numBlocks, int blockSize, int blockShift, int width,
+                                  int ratio, int startPos, int listCap, int32_t *out) {
+        typedef cub::BlockScan<int, kSelThreads> BlockScan;
+        __shared__ typename BlockScan::TempStorage scanStorage;
+        __shared__ unsigned hist[256];
+        __shared__ unsigned survivors[kTopKSurvivorCap];
+        __shared__ int meta[4];             // 0: digit, 1: remaining, 2: 候选块个数
+        extern __shared__ int candList[];
+
+        const int t = blockIdx.x;
+        const int i = t % seqlen;
+        const int visible = min(m, (startPos + i + 1) / ratio);
+        const float *row = score + (uint64_t)t * m;
+        const uint8_t *cand = candidates == nullptr ? nullptr : candidates + (uint64_t)t * numBlocks;
+        int32_t *orow = out + (uint64_t)t * width;
+        const unsigned negInf = V41FloatKey(-INFINITY);
+
+        // ---- 候选块下标的升序压缩 ----
+        const bool canCompact = cand != nullptr && listCap > 0 && blockShift >= 0;
+        int nCandBlocks = 0;
+        if (canCompact) {
+            int running = 0;
+            for (int st = 0; st < numBlocks; st += kSelThreads) {
+                const int blk = st + threadIdx.x;
+                const int keepIt = (blk < numBlocks && cand[blk] != 0 && (blk << blockShift) < visible) ? 1 : 0;
+                int rank = 0, tot = 0;
+                BlockScan(scanStorage).ExclusiveSum(keepIt, rank, tot);
+                __syncthreads();
+                if (keepIt && running + rank < listCap) {
+                    candList[running + rank] = blk;
+                }
+                running += tot;
+            }
+            nCandBlocks = running;
+        }
+        // 候选块个数超出压缩表容量时退回逐 j 查掩码（结果不变，只是多扫一些）
+        const bool compact = canCompact && nCandBlocks <= listCap;
+        const int nDomain = compact ? (nCandBlocks << blockShift) : visible;
+
+        // p（压缩域下标）-> j（原始候选下标）；compact 时 j 一定落在候选块内
+#define V41_TOPK_INDEX(p) (compact ? ((candList[(p) >> blockShift] << blockShift) | ((p) & (blockSize - 1))) : (p))
+#define V41_TOPK_OK(j)    ((j) < visible && (compact || cand == nullptr || \
+                           ((j) / blockSize < numBlocks && cand[(j) / blockSize] != 0)))
+
+        // ---- 第 1 趟：全量直方图（高 8 bit），同时得到可用元素总数 ----
+        hist[threadIdx.x] = 0;
+        __syncthreads();
+        for (int p = threadIdx.x; p < nDomain; p += kSelThreads) {
+            const int j = V41_TOPK_INDEX(p);
+            if (V41_TOPK_OK(j)) {
+                atomicAdd(&hist[V41FloatKey(row[j]) >> 24], 1u);
+            }
+        }
+        __syncthreads();
+        int binCount = (int)hist[threadIdx.x], binPrefix = 0, total = 0;
+        BlockScan(scanStorage).ExclusiveSum(binCount, binPrefix, total);
+        __syncthreads();
+
+        const int keep = min(width, total);
+        unsigned threshold = 0;
+        int tieBudget = 0;
+        const bool selectAll = total <= width;
+        if (!selectAll) {
+            if (threadIdx.x == 0) {
+                int cnt = width, digit = 255;
+                for (; digit >= 0; digit--) {
+                    const int c = (int)hist[digit];
+                    if (cnt <= c) {
+                        break;
+                    }
+                    cnt -= c;
+                }
+                if (digit < 0) {
+                    digit = 0;
+                }
+                meta[0] = digit;
+                meta[1] = cnt;
+                meta[2] = (int)hist[digit];
+            }
+            __syncthreads();
+            int digit = meta[0];
+            int remaining = meta[1];
+            const int survivorCount = meta[2];
+            unsigned prefix = (unsigned)digit << 24;
+            const bool useShared = survivorCount <= kTopKSurvivorCap;
+            __syncthreads();
+            if (useShared) {
+                // 第 2 趟：把落在选中桶里的 key 压缩进共享内存
+                if (threadIdx.x == 0) {
+                    meta[3] = 0;
+                }
+                __syncthreads();
+                for (int p = threadIdx.x; p < nDomain; p += kSelThreads) {
+                    const int j = V41_TOPK_INDEX(p);
+                    if (V41_TOPK_OK(j)) {
+                        const unsigned key = V41FloatKey(row[j]);
+                        if ((key >> 24) == (unsigned)digit) {
+                            const unsigned pos = atomicAdd((unsigned*)&meta[3], 1u);
+                            if (pos < (unsigned)kTopKSurvivorCap) {
+                                survivors[pos] = key;
+                            }
+                        }
+                    }
+                }
+                __syncthreads();
+            }
+            for (int shift = 16; shift >= 0; shift -= 8) {
+                hist[threadIdx.x] = 0;
+                __syncthreads();
+                const unsigned mask = 0xffffffffu << (shift + 8);
+                if (useShared) {
+                    for (int s = threadIdx.x; s < survivorCount; s += kSelThreads) {
+                        const unsigned key = survivors[s];
+                        if ((key & mask) == prefix) {
+                            atomicAdd(&hist[(key >> shift) & 255], 1u);
+                        }
+                    }
+                } else {
+                    for (int p = threadIdx.x; p < nDomain; p += kSelThreads) {
+                        const int j = V41_TOPK_INDEX(p);
+                        if (V41_TOPK_OK(j)) {
+                            const unsigned key = V41FloatKey(row[j]);
+                            if ((key & mask) == prefix) {
+                                atomicAdd(&hist[(key >> shift) & 255], 1u);
+                            }
+                        }
+                    }
+                }
+                __syncthreads();
+                if (threadIdx.x == 0) {
+                    int cnt = remaining, d = 255;
+                    for (; d >= 0; d--) {
+                        const int c = (int)hist[d];
+                        if (cnt <= c) {
+                            break;
+                        }
+                        cnt -= c;
+                    }
+                    if (d < 0) {
+                        d = 0;
+                    }
+                    meta[0] = d;
+                    meta[1] = cnt;
+                }
+                __syncthreads();
+                digit = meta[0];
+                remaining = meta[1];
+                prefix |= (unsigned)digit << shift;
+                __syncthreads();
+            }
+            threshold = prefix;
+            // radix select 结束时的 remaining 就是等于阈值的元素里要取的个数
+            tieBudget = remaining;
+        }
+
+        // ---- 最后一趟：按升序写出 ----
+        int runningGreater = 0, runningTie = 0;
+        for (int st = 0; st < nDomain; st += kSelThreads) {
+            const int p = st + threadIdx.x;
+            const int j = p < nDomain ? V41_TOPK_INDEX(p) : -1;
+            const bool ok = j >= 0 && V41_TOPK_OK(j);
+            const unsigned key = ok ? V41FloatKey(row[j]) : negInf;
+            int isGreater = 0, isTie = 0;
+            if (ok && key > negInf) {
+                if (selectAll || key > threshold) {
+                    isGreater = 1;
+                } else if (key == threshold) {
+                    isTie = 1;
+                }
+            }
+            int packedPrefix = 0, packedTotal = 0;
+            BlockScan(scanStorage).ExclusiveSum(isGreater * 1024 + isTie, packedPrefix, packedTotal);
+            __syncthreads();
+            const int gBefore = runningGreater + (packedPrefix >> 10);
+            const int tBefore = runningTie + (packedPrefix & 1023);
+            if (isGreater || (isTie && tBefore < tieBudget)) {
+                const int pos = gBefore + min(tieBudget, tBefore);
+                if (pos < width) {
+                    orow[pos] = j;
+                }
+            }
+            runningGreater += packedTotal >> 10;
+            runningTie += packedTotal & 1023;
+        }
+        for (int p = keep + threadIdx.x; p < width; p += kSelThreads) {
+            orow[p] = -1;
+        }
+#undef V41_TOPK_INDEX
+#undef V41_TOPK_OK
     }
 
     // ---------------- SparseAttention ----------------
@@ -1251,7 +1735,7 @@ namespace {
                                 const int32_t *cmpIdx, const float *sink, int seqlen, int heads,
                                 int windowSize, int cap, int topWidth, int startPos, float scale,
                                 __nv_bfloat16 *out, float *partAcc, float *partMx, float *partL,
-                                int ringMode, int ringRowBytes, int cmpMode, int cmpRowBytes) {
+                                int ringMode, int ringRowBytes, int cmpMode, int cmpRowBytes, int vecUnpack) {
 #if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800)
         extern __shared__ char v41MmaSharedRaw[];
         V41MmaShared &sh = *reinterpret_cast<V41MmaShared*>(v41MmaSharedRaw);
@@ -1339,8 +1823,14 @@ namespace {
                     }
                 } else if (src8 != nullptr) {
                     // 就地解到 BF16 片段再进 mma；FP4 的值在 BF16 上是精确的
-                    for (int d = lane; d < kMmaDim; d += 32) {
-                        sh.kvs[slot][d] = __float2bfloat16_rn(V41LoadKvRow(src8, kMmaDim, d, src8Mode));
+                    if (vecUnpack) {
+                        // 一个 lane 负责 16 个值（head_dim 512 / 32 lane），整行一趟：
+                        // 一次数据读 + 一次 scale 读 -> 两个 float4 写进 mma 片段
+                        V41LoadKvRow16Bf16(src8, kMmaDim, lane * 16, src8Mode, &sh.kvs[slot][lane * 16]);
+                    } else {
+                        for (int d = lane; d < kMmaDim; d += 32) {
+                            sh.kvs[slot][d] = __float2bfloat16_rn(V41LoadKvRow(src8, kMmaDim, d, src8Mode));
+                        }
                     }
                 } else {
                     for (int v = lane; v < kMmaDim / 8; v += 32) {
@@ -1534,6 +2024,22 @@ namespace {
     bool V41EnvOn(const char *name) {
         const char *v = getenv(name);
         return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }
+
+    // 量化 KV 行的向量化解包（一次 4 字节 / 8 个 FP4 值）；
+    // FASTLLM_DSV41_LEGACY_FP4_UNPACK=1 退回逐元素解包做对比。
+    bool V41Fp4VecUnpack() {
+        return !V41EnvOn("FASTLLM_DSV41_LEGACY_FP4_UNPACK");
+    }
+
+    // FASTLLM_DSV41_LEGACY_ROTARY=1 退回「一行一个 block + 共享内存」的旧旋转/量化 kernel
+    bool V41LegacyRotary() {
+        return V41EnvOn("FASTLLM_DSV41_LEGACY_ROTARY");
+    }
+
+    // FASTLLM_DSV41_LEGACY_TOPK=1 退回逐 visible 元素扫描的旧 top-k kernel
+    bool V41LegacyTopK() {
+        return V41EnvOn("FASTLLM_DSV41_LEGACY_TOPK");
     }
 
     // ---------------- QuantizeKV ----------------
@@ -1747,6 +2253,63 @@ extern "C" bool FastllmCudaDeepSeekV41HcApplyPre(const fastllm::Data &x, const f
     return V41CheckLaunch("HcApplyPre");
 }
 
+extern "C" bool FastllmCudaDeepSeekV41HcPreNorm(const fastllm::Data &x, const fastllm::Data &pre,
+                                               fastllm::Data &normWeight, float eps, fastllm::Data &output) {
+    if (V41EnvOn("FASTLLM_DSV41_DISABLE_HCPRENORM")) {
+        return false;
+    }
+    if (!V41OnCuda(x) || !V41OnCuda(pre) || x.dims.size() != 4 || x.dataType != DataType::BFLOAT16 ||
+        pre.dataType != DataType::FLOAT32 || x.multiDeviceData || pre.multiDeviceData ||
+        normWeight.multiDeviceData) {
+        return false;
+    }
+    const int bsz = x.dims[0], seqlen = x.dims[1], hcMult = x.dims[2], channels = x.dims[3];
+    const int tokens = bsz * seqlen;
+    if (tokens <= 0 || hcMult <= 0 || channels <= 0 || (channels & 1) != 0) {
+        return false;
+    }
+    if (pre.Count(0) != (uint64_t)tokens * hcMult) {
+        return false;
+    }
+    normWeight.ToDevice(DataDevice::CUDA);
+    if (normWeight.dataType != DataType::FLOAT32 || normWeight.dims.size() != 1 ||
+        normWeight.dims[0] != channels || normWeight.cudaData == nullptr) {
+        return false;
+    }
+    // THREAD_PER_BLOCK 必须与 LaunchFastllmRMSNormBFloat16 的选择一致，否则归约树不同、
+    // 结果不再逐 bit 相同。channels == 3072 走的是另一个专用 kernel，这里不接管。
+    if (channels == 3072) {
+        return false;
+    }
+    const int threads = channels < 512 ? 64 : (channels < 4096 ? 512 : 1024);
+    const int bf2 = channels / 2;
+    const int maxIter = (bf2 + threads - 1) / threads;
+    if (!V41PrepareOutput(output, DataType::BFLOAT16, {bsz, seqlen, channels})) {
+        return false;
+    }
+    const __nv_bfloat16 *xp = (const __nv_bfloat16*)x.cudaData;
+    const float *prep = (const float*)pre.cudaData;
+    const float *wp = (const float*)normWeight.cudaData;
+    __nv_bfloat16 *op = (__nv_bfloat16*)output.cudaData;
+#define V41_HCPRENORM_LAUNCH(T)                                                                     \
+    switch (maxIter) {                                                                              \
+        case 1: V41HcPreNormKernel<T, 1><<<tokens, T>>>(xp, prep, wp, op, hcMult, channels, eps); break;  \
+        case 2: V41HcPreNormKernel<T, 2><<<tokens, T>>>(xp, prep, wp, op, hcMult, channels, eps); break;  \
+        case 3: V41HcPreNormKernel<T, 3><<<tokens, T>>>(xp, prep, wp, op, hcMult, channels, eps); break;  \
+        case 4: V41HcPreNormKernel<T, 4><<<tokens, T>>>(xp, prep, wp, op, hcMult, channels, eps); break;  \
+        default: return false;                                                                      \
+    }
+    if (threads == 64) {
+        V41_HCPRENORM_LAUNCH(64)
+    } else if (threads == 512) {
+        V41_HCPRENORM_LAUNCH(512)
+    } else {
+        V41_HCPRENORM_LAUNCH(1024)
+    }
+#undef V41_HCPRENORM_LAUNCH
+    return V41CheckLaunch("HcPreNorm");
+}
+
 extern "C" bool FastllmCudaDeepSeekV41EngramApply(fastllm::Data &hidden, const fastllm::Data &kv,
                                                   fastllm::Data &qWeight, fastllm::Data &kWeight,
                                                   const fastllm::Data *mask, float eps, float clampValue) {
@@ -1794,23 +2357,60 @@ extern "C" bool FastllmCudaDeepSeekV41RotaryQuant(fastllm::Data &x, int ropeDim,
     if (quantDim <= 0) {
         quantDim = dim;
     }
-    if (dim > 1024 || dim % 32 != 0 || ropeDim <= 0 || ropeDim > 128 || ropeDim > dim ||
+    if (dim > 1024 || dim % 32 != 0 || ropeDim <= 0 || ropeDim > 128 || ropeDim > dim || (ropeDim & 1) != 0 ||
         (quantMode > 0 && ((quantBlock != 16 && quantBlock != 32) || quantDim % 32 != 0))) {
         return false;
     }
     int rowsPerToken = x.dims.size() == 4 ? x.dims[2] : 1;
     int rows = (int)(x.Count(0) / dim);
+    if (rows <= 0) {
+        return true;
+    }
     V41RopeTable rope = V41BuildRope(ropeDim, ropeBase, originalSeqLen, ropeFactor, betaFast, betaSlow);
-    size_t shared = (size_t)dim * sizeof(float);
+    if (V41LegacyRotary()) {
+        size_t shared = (size_t)dim * sizeof(float);
+        if (x.dataType == DataType::BFLOAT16) {
+            V41RotaryQuantLegacyKernel<__nv_bfloat16><<<rows, dim, shared>>>((__nv_bfloat16*)x.cudaData, rowsPerToken,
+                dim, rope, ropeDim, startPos, posStep, inverse ? 1 : 0, quantMode, quantDim, quantBlock);
+        } else if (x.dataType == DataType::FLOAT16) {
+            V41RotaryQuantLegacyKernel<half><<<rows, dim, shared>>>((half*)x.cudaData, rowsPerToken, dim, rope,
+                ropeDim, startPos, posStep, inverse ? 1 : 0, quantMode, quantDim, quantBlock);
+        } else {
+            V41RotaryQuantLegacyKernel<float><<<rows, dim, shared>>>((float*)x.cudaData, rowsPerToken, dim, rope,
+                ropeDim, startPos, posStep, inverse ? 1 : 0, quantMode, quantDim, quantBlock);
+        }
+        return V41CheckLaunch("RotaryQuant");
+    }
+    if (quantMode <= 0) {
+        // 只旋转，不量化：按「行 x 旋转对」展开，一个 block 256 个对
+        const uint64_t totalPairs = (uint64_t)rows * (uint64_t)(ropeDim >> 1);
+        const int threads = 256;
+        const uint64_t blocks = (totalPairs + threads - 1) / threads;
+        if (x.dataType == DataType::BFLOAT16) {
+            V41RotaryOnlyKernel<__nv_bfloat16><<<(unsigned)blocks, threads>>>((__nv_bfloat16*)x.cudaData,
+                rowsPerToken, dim, rope, ropeDim, startPos, posStep, inverse ? 1 : 0, totalPairs);
+        } else if (x.dataType == DataType::FLOAT16) {
+            V41RotaryOnlyKernel<half><<<(unsigned)blocks, threads>>>((half*)x.cudaData,
+                rowsPerToken, dim, rope, ropeDim, startPos, posStep, inverse ? 1 : 0, totalPairs);
+        } else {
+            V41RotaryOnlyKernel<float><<<(unsigned)blocks, threads>>>((float*)x.cudaData,
+                rowsPerToken, dim, rope, ropeDim, startPos, posStep, inverse ? 1 : 0, totalPairs);
+        }
+        return V41CheckLaunch("RotaryQuant");
+    }
+    // 量化：一个 block 处理 rowsPerBlock 行，目标 blockDim 512
+    const int rowsPerBlock = std::max(1, 512 / dim);
+    const int threads = rowsPerBlock * dim;
+    const int blocks = (rows + rowsPerBlock - 1) / rowsPerBlock;
     if (x.dataType == DataType::BFLOAT16) {
-        V41RotaryQuantKernel<__nv_bfloat16><<<rows, dim, shared>>>((__nv_bfloat16*)x.cudaData, rowsPerToken, dim, rope,
-            ropeDim, startPos, posStep, inverse ? 1 : 0, quantMode, quantDim, quantBlock);
+        V41RotaryQuantKernel<__nv_bfloat16><<<blocks, threads>>>((__nv_bfloat16*)x.cudaData, rowsPerToken, dim, rope,
+            ropeDim, startPos, posStep, inverse ? 1 : 0, quantMode, quantDim, quantBlock, rowsPerBlock, rows);
     } else if (x.dataType == DataType::FLOAT16) {
-        V41RotaryQuantKernel<half><<<rows, dim, shared>>>((half*)x.cudaData, rowsPerToken, dim, rope,
-            ropeDim, startPos, posStep, inverse ? 1 : 0, quantMode, quantDim, quantBlock);
+        V41RotaryQuantKernel<half><<<blocks, threads>>>((half*)x.cudaData, rowsPerToken, dim, rope,
+            ropeDim, startPos, posStep, inverse ? 1 : 0, quantMode, quantDim, quantBlock, rowsPerBlock, rows);
     } else {
-        V41RotaryQuantKernel<float><<<rows, dim, shared>>>((float*)x.cudaData, rowsPerToken, dim, rope,
-            ropeDim, startPos, posStep, inverse ? 1 : 0, quantMode, quantDim, quantBlock);
+        V41RotaryQuantKernel<float><<<blocks, threads>>>((float*)x.cudaData, rowsPerToken, dim, rope,
+            ropeDim, startPos, posStep, inverse ? 1 : 0, quantMode, quantDim, quantBlock, rowsPerBlock, rows);
     }
     return V41CheckLaunch("RotaryQuant");
 }
@@ -1878,7 +2478,8 @@ extern "C" bool FastllmCudaDeepSeekV41IndexerScore(const fastllm::Data &q, const
         V41IndexerScoreMmaKernel<<<mmaGrid, kIdxMmaThreads>>>(
             (const __nv_bfloat16*)q.cudaData, (const float*)weights.cudaData,
             kQuant ? nullptr : (const __nv_bfloat16*)k.cudaData,
-            seqlen, heads, m, ratio, startPos, (float*)output.cudaData, k8, kMode, kRowBytes);
+            seqlen, heads, m, ratio, startPos, (float*)output.cudaData, k8, kMode, kRowBytes,
+            V41Fp4VecUnpack() ? 1 : 0);
         return V41CheckLaunch("IndexerScoreMma");
     }
 
@@ -1961,9 +2562,30 @@ extern "C" bool FastllmCudaDeepSeekV41IndexerTopK(const fastllm::Data &score, co
     if (width == 0) {
         return true;
     }
-    V41TopKKernel<<<bsz * seqlen, kSelThreads>>>((const float*)score.cudaData, cand, seqlen, m, numBlocks,
-                                                 std::max(1, blockSize), topK, width, ratio, startPos,
-                                                 (int32_t*)output.cudaData);
+    const int bs = std::max(1, blockSize);
+    if (V41LegacyTopK()) {
+        V41TopKKernelLegacy<<<bsz * seqlen, kSelThreads>>>((const float*)score.cudaData, cand, seqlen, m, numBlocks,
+                                                           bs, topK, width, ratio, startPos,
+                                                           (int32_t*)output.cudaData);
+        return V41CheckLaunch("IndexerTopK");
+    }
+    // blockSize 是 2 的幂时才走候选块压缩（下标换算只用移位）
+    int blockShift = -1;
+    for (int s = 0; s < 31; s++) {
+        if ((1 << s) == bs) {
+            blockShift = s;
+            break;
+        }
+    }
+    // 候选块下标的压缩表放动态共享内存。容量按 numBlocks 取，但封顶 4096（16 KB）：
+    // 真实配置里候选块数是 candidate_topk_blocks（2048）量级，远小于长上下文的 numBlocks，
+    // 所以封顶后绝大多数情况仍然能压缩；真的装不下时 kernel 内部会退回逐 j 查掩码。
+    const int kListCap = 4096;
+    const int listCap = (cand != nullptr && blockShift >= 0 && numBlocks > 0)
+                        ? std::min(numBlocks, kListCap) : 0;
+    V41TopKKernel<<<bsz * seqlen, kSelThreads, (size_t)listCap * sizeof(int)>>>(
+        (const float*)score.cudaData, cand, seqlen, m, numBlocks, bs, blockShift, width,
+        ratio, startPos, listCap, (int32_t*)output.cudaData);
     return V41CheckLaunch("IndexerTopK");
 }
 
@@ -1996,6 +2618,8 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
     }
     const int ringRowBytes = hasRing && ringFp8 ? ringKV->dims[2] : 0;
     const int cmpRowBytes = hasCmp && cmpFp8 ? compressedKV->dims[2] : 0;
+    // 向量化解包按 16 字节一组读缓存行，需要行宽是 16 的倍数（现有三种布局都满足）
+    const bool vecUnpack = V41Fp4VecUnpack() && (ringRowBytes % 16 == 0) && (cmpRowBytes % 16 == 0);
     if (!hasRing && startPos > 0) {
         return false;
     }
@@ -2076,7 +2700,7 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
             hasCmp ? (const int32_t*)cmpIdx->cudaData : nullptr,
             (const float*)attnSink.cudaData, seqlen, heads, windowSize, cap, topWidth, startPos,
             softmaxScale, (__nv_bfloat16*)output.cudaData, partAcc, partMx, partL,
-            ringMode, ringRowBytes, cmpMode, cmpRowBytes);
+            ringMode, ringRowBytes, cmpMode, cmpRowBytes, vecUnpack ? 1 : 0);
         if (splits > 1) {
             V41SparseMergeKernel<<<tokens * heads, 128>>>(partAcc, partMx, partL, tokens, heads, splits,
                                                           (__nv_bfloat16*)output.cudaData);

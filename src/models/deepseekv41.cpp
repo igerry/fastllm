@@ -103,7 +103,8 @@ namespace fastllm {
 
         // ---------------- Engram 计时 ----------------
         // FASTLLM_DSV41_ENGRAM_PROFILE=1 累计统计，=2 额外逐次打印。
-        // 三段分别是：hash（算行号）、gather（读表 + FP8→BF16）、wkv（投影）、apply（门控写回）。
+        // 分成：hash（算行号）、prep（准备输出 Data）、gather（读表 + FP8→BF16）、
+        // wkv（投影）、apply（门控写回）。
         // wkv / apply 落在 GPU 上且是异步下发的，要拿到真实耗时必须同时设 FASTLLM_CUDA_SYNC=1，
         // 否则这两项只反映 kernel launch 的时间。
         // FASTLLM_DSV41_ENGRAM_PROFILE_EVERY=N 控制每累计 N 次打印一行（默认 64，0 表示只在退出时打印）。

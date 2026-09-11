@@ -4498,9 +4498,30 @@ namespace fastllm {
             Data &output = *datas.at("output");
             int groups = intParams.at("groups");
             int oRank = intParams.at("oRank");
-            AssertInFastLLM(input.IsTensorParallelSharded() && input.multiDeviceData &&
-                            input.dims.size() == 4 && input.tpAxis == 2,
-                            "DeepSeekV4WoA MultiCuda requires query-head sharding.\n");
+            if (!(input.IsTensorParallelSharded() && input.multiDeviceData &&
+                  input.dims.size() == 4 && input.tpAxis == 2)) {
+                // 注意力没有按 head 切分时（例如每卡 head 数不满足 kernel 的 32 对齐，
+                // 模型侧退回复制布局），两张卡各算一份完整的 wo_a。
+                AssertInFastLLM(input.multiDeviceData && input.IsTensorParallelReplicated(),
+                                "DeepSeekV4WoA MultiCuda requires query-head sharding or a replicated input.\n");
+                EnsureReplicatedMultiCudaTensor(input, devices, true);
+                SyncReplicatedLocalShapeFromRoot(input, devices);
+                EnsureReplicatedMultiCudaTensor(weight, devices, true);
+                EnsureReplicatedMultiCudaTensor(output, devices, false);
+                std::vector<MultiThreadBaseOp*> replicatedOps;
+                for (int device : devices) {
+                    DataDict localDatas = {
+                        {"input", input.multiDeviceDatas.at(device)},
+                        {"weight", weight.multiDeviceDatas.at(device)},
+                        {"output", output.multiDeviceDatas.at(device)}
+                    };
+                    replicatedOps.push_back(new MultiCudaDelegatedCudaOp(
+                        cudaOp, opType, localDatas, floatParams, intParams, device));
+                }
+                RunMultiCudaDeviceOpsAndDelete(devices, replicatedOps);
+                SyncReplicatedRootMetaFromDevice0(output, devices);
+                return;
+            }
             int heads = input.dims[2];
             int headsPerGroup = heads / groups;
             AssertInFastLLM(groups > 0 && heads % groups == 0 && headsPerGroup > 0,

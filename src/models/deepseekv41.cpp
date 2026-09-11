@@ -164,6 +164,40 @@ namespace fastllm {
             return false;
         }
 
+        // 从 deviceMap 的 key（如 "multicuda:0,1"）直接数出 TP rank 数。
+        // InitParams 阶段执行器还没设置过 multicuda 设备表，只能这样拿。
+        int V41MultiCudaRankCount(const std::map<std::string, int> &deviceMap) {
+            for (const auto &it : deviceMap) {
+                if (!V41DeviceSpecUsesType(it.first, "multicuda")) {
+                    continue;
+                }
+                size_t pos = it.first.find(':');
+                if (pos == std::string::npos) {
+#ifdef USE_CUDA
+                    return std::max(1, FastllmCudaGetDeviceCount());
+#else
+                    return 1;
+#endif
+                }
+                int count = 0;
+                std::string spec = it.first.substr(pos + 1);
+                size_t start = 0;
+                while (start <= spec.size()) {
+                    size_t end = spec.find(',', start);
+                    std::string item = spec.substr(start, end == std::string::npos ? std::string::npos : end - start);
+                    if (!item.empty()) {
+                        count++;
+                    }
+                    if (end == std::string::npos) {
+                        break;
+                    }
+                    start = end + 1;
+                }
+                return std::max(1, count);
+            }
+            return 1;
+        }
+
         // 返回当前生效的多卡设备列表；不是多卡张量并行时返回空
         std::vector<int> V41TpDevices(const std::map<std::string, int> &deviceMap) {
             std::vector<int> devices;
@@ -895,6 +929,65 @@ namespace fastllm {
             this->cantQuantLinears.insert(pre + ".attn.indexer.wk.weight");
             this->cantQuantLinears.insert(pre + ".attn.indexer.weights_proj.weight");
             this->cantQuantLinears.insert(pre + ".ffn.gate.weight");
+        }
+
+        // 注意力的 head 切分有硬约束（CUDA 稀疏注意力 kernel 每 block 32 个 head，
+        // wo_a 要求区间对齐到 o_group）。不满足时撤销 DeepSeekV4Model::InitParams
+        // 注册的注意力 TP 权重，让它们整块加载，前向里注意力也退回复制布局。
+        if (V41DeviceMapUsesMultiCuda(this->deviceMap)) {
+            const int ranks = V41MultiCudaRankCount(this->deviceMap);
+            const bool aligned =
+                ranks > 1 && o_groups > 0 &&
+                num_attention_heads % ranks == 0 &&
+                (num_attention_heads / ranks) % 32 == 0 &&
+                num_attention_heads % o_groups == 0 &&
+                (num_attention_heads / ranks) % (num_attention_heads / o_groups) == 0;
+            if (!aligned) {
+                // 注意力切不开时整体退回单卡：只切 FFN / head 的"半 TP"没有可验证的
+                // 收益（注意力仍要在每张卡上各算一份），而视觉编码器也还不是 TP 感知的。
+                for (int i = 0; i < block_cnt; i++) {
+                    for (const char *suffix : {".attn.wq_b.weight", ".attn.wo_a.weight",
+                                               ".attn.wo_b.weight"}) {
+                        std::string name = "layers." + std::to_string(i) + suffix;
+                        this->specialWeights.erase(name);
+                        this->specialWeightLayerIds.erase(name);
+                    }
+                }
+                this->specialWeights.erase("head.weight");
+                this->specialWeightLayerIds.erase("head.weight");
+                std::string fallbackDevice = "cuda";
+                for (const auto &it : this->deviceMap) {
+                    if (!V41DeviceSpecUsesType(it.first, "multicuda")) {
+                        continue;
+                    }
+                    size_t pos = it.first.find(':');
+                    if (pos != std::string::npos) {
+                        std::string spec = it.first.substr(pos + 1);
+                        size_t comma = spec.find(',');
+                        std::string first = comma == std::string::npos ? spec : spec.substr(0, comma);
+                        size_t slash = first.find('/');
+                        if (slash != std::string::npos) {
+                            first = first.substr(0, slash);
+                        }
+                        if (!first.empty()) {
+                            fallbackDevice = "cuda:" + first;
+                        }
+                    }
+                    break;
+                }
+                printf("[Fastllm] DeepSeek-V4.1 tensor parallel needs num_attention_heads / tp to be a "
+                       "multiple of 32 and aligned to o_groups (got %d heads, %d ranks, o_groups=%d); "
+                       "falling back to %s.\n",
+                       num_attention_heads, ranks, o_groups, fallbackDevice.c_str());
+                fflush(stdout);
+                this->deviceMap = std::map<std::string, int>{{fallbackDevice, 1}};
+                if (V41DeviceMapUsesMultiCuda(this->moeDeviceMap)) {
+                    this->moeDeviceMap = this->deviceMap;
+                }
+                if (V41DeviceMapUsesMultiCuda(this->layeredMoeDeviceMap)) {
+                    this->layeredMoeDeviceMap = this->deviceMap;
+                }
+            }
         }
 
         LoadEngramMeta();
@@ -2041,9 +2134,31 @@ namespace fastllm {
         ApplyDeviceMap(this->deviceMap, 1, block_cnt);
         const std::vector<int> tpDevices = V41TpDevices(this->deviceMap);
         const bool tp = !tpDevices.empty();
+        // 注意力能否按 head 切分：CUDA 稀疏注意力 kernel 每个 block 处理 32 个 head，
+        // 要求每张卡分到的 head 数是 32 的倍数；wo_a 又要求 head 区间对齐到 o_group。
+        // 不满足时（例如 32 头的迷你模型、或 64 头开 TP=4）注意力退回"每卡各算一份"，
+        // 稠密 FFN / head 仍然切分。
+        const int tpRanks = (int)tpDevices.size();
+        const bool tpHeadsAligned =
+            tpRanks > 0 && o_groups > 0 &&
+            num_attention_heads % tpRanks == 0 &&
+            (num_attention_heads / tpRanks) % 32 == 0 &&
+            num_attention_heads % o_groups == 0 &&
+            (num_attention_heads / tpRanks) % (num_attention_heads / o_groups) == 0;
+        if (tp && !tpHeadsAligned) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                printf("[Fastllm] DeepSeek-V4.1 tensor parallel: %d heads over %d ranks can't be split "
+                       "(need a multiple of 32 per rank, aligned to o_groups=%d); attention stays replicated.\n",
+                       num_attention_heads, tpRanks, o_groups);
+                fflush(stdout);
+            }
+        }
         // 排查用开关：关掉注意力 head 切分 / 共享专家切分后，全部算子退化为"两卡各算一份"，
         // 可以把数值问题定位到切分路径还是复制路径。
-        const bool tpAttention = tp && !V41EnvFlag("FASTLLM_DSV41_DISABLE_TP_ATTENTION");
+        const bool tpAttention = tp && tpHeadsAligned &&
+                                 !V41EnvFlag("FASTLLM_DSV41_DISABLE_TP_ATTENTION");
         const bool tpSharedExpert = tp && !V41EnvFlag("FASTLLM_DSV41_DISABLE_TP_SHARED_EXPERT");
         if (std::getenv("FASTLLM_TRACE_OPS") != nullptr) {
             static bool printed = false;
@@ -2245,7 +2360,9 @@ namespace fastllm {
             if (tpAttention) {
                 weight[pre + ".attn.wq_b.weight"].tpLinearType = TP_LINEAR_ROW;
             }
-            Linear(qNorm, weight[pre + ".attn.wq_b.weight"], Data(), q);
+            // 不切分注意力时 wq_b 也必须显式走复制布局：否则 MultiCudaLinearOp 会按
+            // "大权重通用切分 + gather"处理，而那条路径读的是复制张量已失效的 root。
+            Linear(qNorm, weight[pre + ".attn.wq_b.weight"], Data(), q, tp && !tpAttention);
             q.Reshape({1, seqlen, num_attention_heads, headDim});
 
             Linear(attnInput, weight[pre + ".attn.wkv.weight"], Data(), kv, tp);
@@ -2506,7 +2623,10 @@ namespace fastllm {
                 weight[pre + ".attn.wo_b.weight"].tpLinearType = TP_LINEAR_COLUMN;
             }
             DeepSeekV4WoA(*attnOutAll, weight[pre + ".attn.wo_a.weight"], o_groups, o_lora_rank, woAOut);
-            Linear(woAOut, weight[pre + ".attn.wo_b.weight"], Data(), attnProj);
+            // 切分时 woAOut 是分片的，MultiCudaLinearOp 自动走 column + all-reduce；
+            // 不切分时 woAOut 是复制的，必须显式要求复制布局，否则会退回单卡 CUDA
+            // 读到已经失效的 root。
+            Linear(woAOut, weight[pre + ".attn.wo_b.weight"], Data(), attnProj, tp && !tpAttention);
             if (dumpDebug) {
                 V41DumpTensor(attnInput, "fl_layer" + std::to_string(layer) + "_attn_in" + dumpSuffix);
                 V41DumpTensor(*attnOutAll, "fl_layer" + std::to_string(layer) + "_attn_o" + dumpSuffix);

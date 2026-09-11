@@ -379,7 +379,11 @@ namespace fastllm {
                 }
                 static const bool traceOps = std::getenv("FASTLLM_TRACE_OPS") != nullptr;
                 if (traceOps) {
-                    fprintf(stderr, "[op] %s on %s\n", opType.c_str(), device->deviceType.c_str());
+                    auto wIt = datas.find("weight");
+                    const char *wName = (wIt != datas.end() && wIt->second != nullptr &&
+                                         !wIt->second->name.empty()) ? wIt->second->name.c_str() : "";
+                    fprintf(stderr, "[op] %s on %s %s\n", opType.c_str(),
+                            device->deviceType.c_str(), wName);
                     fflush(stderr);
                 }
                 device->Reshape(opType, datas, floatParams, intParams);

@@ -231,6 +231,99 @@ V4.1 的压缩 KV 是跨层共享的：`kv_source_layer_ids` 的层算出的 cac
 建议：长上下文 / prefill 为主用 `--tp 2`；要显存（给 KV cache 或专家缓存腾地方）、
 或者以 decode 吞吐为主，用按层切分。两者目前是二选一。
 
+## prefill 的多卡专家流（`FT_MOE_ASSIST_DEVICES`）
+
+`--moe_device numa` 下，一个 prefill 分块要把**全部**路由专家的权重过一遍，专家权重是从主机内存
+流式送到 GPU 的，不需要张量并行分片。所以瓶颈是「主机内存 -> GPU」这条链路的带宽，而不是算力：
+多一张卡就多一条链路。但 `GetNumasMoeCudaAssistDevices()` 原本只返回承载稠密层的那张卡，
+模型放得下单卡的机器上第二张卡在 prefill 期间完全闲置。
+
+```bash
+FT_MOE_ASSIST_DEVICES=0,1 ftllm server ... --device cuda --moe_device numa
+```
+
+把额外的 CUDA 设备加进专家流。默认为空，行为不变。每张卡拿到一份输入激活的副本、一组不相交的
+专家，各自算出一份 partial，最后在 root 卡（产出这一层激活的那张）上相加。
+
+### 与之配套的重叠开关
+
+只把第二张卡加进来是不够的：每层会多出两段**只在主线程上串行**的搬运，正好把算子级省下来的时间
+还回去。
+
+| 变量 | 作用 |
+| --- | --- |
+| `FT_MOE_ASSIST_OVERLAP=1` | assist 卡的输入 staging 与 partial 归约改成事件依赖，从主线程关键路径上移走 |
+| `FT_MOE_ASSIST_BALANCE=1` | 按各卡实测的「每专家毫秒」分配 GPU 专家，而不是按 route 数均分 |
+| `FT_EXPERT_LIMIT_AUTO=1` | 用真实层反馈出的 CPU / GPU 速度算 expertLimit，取代单专家合成 benchmark |
+
+`FT_MOE_ASSIST_OVERLAP` 具体改了两处：
+
+- **输入 staging**：原来是「`waitForCpuInput()` 等输入的 D2H 落到 pinned host」+「一次阻塞的 H2D
+  把整块激活推上第二张卡」，两步都压在主线程上，既不与 root 卡的专家计算重叠、也不与 CPU 专家重叠。
+  现在主线程只准备副本缓冲，搬运挪进该卡的 worker 线程、排在它自己的 per-thread stream 上：
+  优先 `cudaMemcpyPeerAsync` 直接从产出激活的那张卡拉（这台机器上两张 3090 Ti 之间是 NVLink），
+  拉不动再退回「等 `inputCopyStream` 上的 D2H 完成事件 + pinned H2D」。后续 compute 走同一条 stream，
+  顺序天然成立，主机侧一次都不用同步。
+- **partial 归约**：原来是所有 worker join 之后才开始跨卡搬运，每搬一块 `AddTo` 一次、再
+  `cudaStreamSynchronize` 一次。现在跨卡搬运同样放进 worker 线程，落到每卡独立的 root 侧缓冲，
+  与 root 卡剩余的专家、以及主线程的 CPU 专家重叠；主线程只在 root stream 上等事件、做 `AddTo`，
+  中间的逐块同步全部去掉，末尾统一同步一次再释放 partial。
+
+事件、归约缓冲、pinned 中转缓冲都按设备缓存在每层的 MoE manager 上，跨层复用。
+
+### expertLimit 的选择
+
+`expertLimit` 是「一个专家至少要有多少 route 才值得送上 GPU」的阈值：低于它的专家留在 CPU 上算，
+和 GPU 并行，理想情况下两边同时结束。默认由 `MoeExpertSpeedEstimator` 在第一次 prefill 时跑一个
+合成 benchmark 推出来——**每轮只跑一个专家、每轮 sync**。这样量到的 GPU 每专家耗时里含着
+无法摊掉的固定开销（workspace 准备、stream 创建、启动延迟），也拿不到真实层里跨专家的
+「copy(i+1) 与 compute(i) 重叠」，会系统性高估 GPU，把过多 route 留在 CPU 上。
+
+`FT_EXPERT_LIMIT_AUTO=1` 改成用真实层反馈的两个系数直接算 makespan 最优点：
+
+- 每张卡的「每专家毫秒」= worker 线程墙钟 ÷ 分到的专家数（EMA）。因为是两张卡并发跑时量的，
+  跨专家流水重叠、两卡争抢主存带宽的影响都已经算进去。
+- CPU 的「每 route 毫秒」= CPU 专家段墙钟 ÷ 落在 CPU 上的 route 数（EMA）。
+
+然后枚举阈值 t，用与实际分配一致的贪心把 GPU 专家摊到各卡上，取 `max(cpuMs, gpuMs)` 最小的 t。
+样本不足（前几层）时退回原来的合成估计。`FT_EXPERT_LIMIT=<n>` 的显式覆盖优先级最高，
+两种自动估计都不会执行。
+
+### 实测（2 x RTX 3090 Ti，NVLink，6 层真实 MoE 尺寸的模型）
+
+模型：hidden 5120 / moe_intermediate_size 2304 / top-6 / 64 个路由专家 + 1 个共享专家，
+路由专家 NVFP4 block-32（每专家约 18.8 MB），16384 token prefill、4096 分块（共 4 个 chunk x 6 层）。
+「ms/层」是后两个 chunk 共 12 次调用的均值（前两层要首触 CPU scratch，不计入），3 次运行汇总；
+e2e 取 3 次的中位数。
+
+| 配置 | stage | reduce | cpu | join | ms/层 | e2e |
+| --- | --- | --- | --- | --- | --- | --- |
+| 单卡（现状） | 0.01 | 0.78 | 44.88 | 8.64 | **55.00** | 5.76 s |
+| + `FT_MOE_ASSIST_DEVICES=0,1` | 1.75 | 5.44 | 35.09 | 6.89 | **49.95** | 5.42 s |
+| + `FT_MOE_ASSIST_OVERLAP=1` | 0.02 | 1.60 | 36.14 | 1.95 | **40.49** | 5.36 s |
+| + `FT_EXPERT_LIMIT_AUTO=1` | 0.01 | 0.33 | 10.58 | 25.72 | **37.18** | 3.06 s |
+
+三步合计 **55.00 -> 37.18 ms/层（1.48x）**，端到端 **5.76 -> 3.06 s（1.88x）**。
+
+分开看每一步：
+
+- **只加第二张卡**，算子级确实变快（55.00 -> 49.95），但每层多出 1.75 ms 的输入 staging
+  与 5.44 ms 的归约，全部串在主线程上，把省下来的吃掉大半，端到端只从 5.76 降到 5.42 s。
+- **加上重叠**后这两项变成 0.02 ms 与 1.60 ms（剩下的 1.60 ms 是 CPU partial 那 42 MB 的
+  pinned H2D——它只能在 CPU 专家算完之后才发得出去，属于固有开销）。把 expertLimit
+  固定成 115（去掉合成 benchmark 这个变量）单独对比这一项：42.66 -> 40.55 ms/层，
+  主线程上的串行搬运 7.49 -> 1.22 ms/层。
+- **最大的一笔其实是 expertLimit 的合成 benchmark**：`MoeExpertSpeedEstimator` 在第一次
+  prefill 里要 2.2-2.6 s（而且后面某层 maxTaskSize 变大时会重建一次，一次 prefill 付两遍），
+  相比之下稳态每层才 40 ms。`FT_EXPERT_LIMIT_AUTO=1` 不跑它，用探针 + 实测反馈，
+  在第二个 chunk 内收敛到 `expertLimit=1`（predict_cpu=0、predict_gpu=29 ms），
+  与手工试出来的最优值一致；手工 `FT_EXPERT_LIMIT=1` 是 39.66 ms/层 / 2.88 s，
+  自动档 37.18 ms/层 / 3.06 s（e2e 多出的 0.2 s 是探针那两个 CPU 专家触发的一次性 scratch 首触）。
+
+`FT_MOE_ASSIST_BALANCE=1` 在这台机器上是中性的（37.18 vs 38.31 ms/层）：两张卡型号相同、
+挂在同一个 root complex 上，实测每专家耗时几乎一致，没有可纠正的不对称。它是给异构
+或链路不对称的机器准备的。
+
 ## KV 缓存存储精度（`--kv_cache_dtype`）
 
 长期 KV 缓存只有两部分：**压缩 KV**（`kv_source_layer_ids` 各层，每 `compress_ratio` 个 token 一行，
@@ -575,3 +668,6 @@ indexer 分数矩阵的分块效果（65536 token prefill，扣掉同卡其它�
 | `FASTLLM_TRACE_OPS` | 逐算子打印"算子名 / 落在哪个设备 / 权重名"（排查 TP 落点用） |
 | `FASTLLM_DSV41_DISABLE_PREFIX_CACHE` 等 | 前缀缓存相关，见"多请求与前缀缓存" |
 | `FASTLLM_DSPARK_*` | DSpark 投机解码相关，见"DSpark 投机解码" |
+| `FT_MOE_ASSIST_DEVICES` / `FT_MOE_ASSIST_OVERLAP` / `FT_MOE_ASSIST_BALANCE` / `FT_EXPERT_LIMIT_AUTO` | NUMA MoE 的多卡专家流，见"prefill 的多卡专家流" |
+| `FASTLLM_NUMAS_MOE_ASSIST_PROFILE` | 按层打印 NUMA MoE prefill 的分阶段耗时（stage / limit / prep / cpu / join / reduce） |
+| `FASTLLM_NUMAS_MOE_GPU_TRACE` | 打印每层的 CPU / GPU 专家划分与各卡拿到的专家数 |

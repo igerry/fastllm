@@ -601,6 +601,34 @@ namespace fastllm {
             }, {}, {});
         }
 
+#ifdef USE_CUDA
+        // 融合 kernel 是**直接调用**的，不经过执行器，所以不会像普通算子那样自动把
+        // 输入搬到本层所属的卡上。按层切分时，stage 边界那一层的 hidden / pre 还在
+        // 上一张卡，而本层的 norm 权重已经加载到下一张卡，混着用直接触发
+        // Warp MMU Fault（现场会以 "moving bias to device" 之类的无关报错浮现）。
+        // 因此只有当所有张量都和当前 CUDA 设备一致时才走融合路径。
+        // 用 dataDeviceIds 判断而不是 cudaPointerGetAttributes：后者每次都是一次
+        // runtime 调用，这个函数每层要走两次。
+        bool V41FusedPreNormSameDevice(const Data &input, const Data &pre, const Data &normWeight) {
+            const int current = FastllmCudaGetDevice();
+            if (current < 0) {
+                return false;
+            }
+            auto deviceOf = [](const Data &data) -> int {
+                if (data.dataDevice != DataDevice::CUDA || data.dataDeviceIds.empty()) {
+                    return -1;
+                }
+                return data.dataDeviceIds[0];
+            };
+            if (deviceOf(input) != current || deviceOf(pre) != current) {
+                return false;
+            }
+            // 还在 CPU 上的 norm 权重会被 kernel 内部搬到当前卡，是安全的
+            const int weightDevice = deviceOf(normWeight);
+            return weightDevice < 0 || weightDevice == current;
+        }
+#endif
+
         // 子层入口的「HcApplyPre -> RMSNorm」：中间张量只被紧接着的 RMSNorm 读一次，
         // 单卡 CUDA 上用融合 kernel 一次算完（结果逐 bit 相同）；其余情况退回两步。
         void V41HcApplyPreNorm(const Data &input, const Data &pre, Data &normWeight, float eps,
@@ -608,6 +636,7 @@ namespace fastllm {
 #ifdef USE_CUDA
             static const bool disableFused = V41EnvFlag("FASTLLM_DSV41_DISABLE_HCPRENORM");
             if (!disableFused && input.dataDevice == DataDevice::CUDA && !input.multiDeviceData &&
+                V41FusedPreNormSameDevice(input, pre, normWeight) &&
                 FastllmCudaDeepSeekV41HcPreNorm(input, pre, normWeight, eps, output)) {
                 return;
             }

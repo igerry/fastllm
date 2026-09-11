@@ -706,6 +706,18 @@ namespace fastllm {
             }, {}, {{"startPos", startPos}, {"windowSize", windowSize}});
         }
 
+        // 缓存在 axis=1 上的行容量。expansionDims 为空表示"没有富余容量"，
+        // 此时容量就等于逻辑行数（而不是一个越界读到的垃圾值）。
+        int V41CacheRowCapacity(const Data &cache) {
+            if (cache.expansionDims.size() >= 2) {
+                return cache.expansionDims[1];
+            }
+            if (cache.dims.size() >= 2) {
+                return cache.dims[1];
+            }
+            return 0;
+        }
+
         // 在 axis=1 上追加行（预扩容 + CatDirect），cache 需为 [b, cap, d]
         // 张量并行时缓存是每卡一份：扩容必须逐卡执行，root 只保留形状信息。
         void V41AppendRows(Data &cache, const Data &rows,
@@ -730,9 +742,13 @@ namespace fastllm {
             }
             tp = tp && cache.multiDeviceData && cache.IsTensorParallelReplicated();
 #endif
-            while ((cache.dims.size() == 0 &&
-                    (cache.expansionDims.size() == 0 || rows.dims[1] > cache.expansionDims[1])) ||
-                   (cache.dims.size() > 0 && cache.dims[1] + rows.dims[1] > cache.expansionDims[1])) {
+            // 已有行数与需要的总容量。注意 expansionDims 可能是空的：Data::CopyFrom 在
+            // 源张量没有富余容量时会 clear() 掉它（前缀缓存恢复、以及 CopyToMultiDevices
+            // 的 CPU 分支建出来的副本都是这种），原来的写法直接读 expansionDims[1] 属于
+            // 越界读——读到的垃圾值偏大时就不扩容，CatDirect 直接写出界。
+            const int haveRows = cache.dims.size() >= 2 ? cache.dims[1] : 0;
+            const int needRows = haveRows + rows.dims[1];
+            while (V41CacheRowCapacity(cache) < needRows) {
                 std::vector<int> newDims;
                 if (cache.Count(0) == 0 || cache.dims.size() == 0) {
                     newDims = {rows.dims[0], ((rows.dims[1] - 1) / unitLen + 1) * unitLen, rows.dims[2]};
@@ -755,6 +771,24 @@ namespace fastllm {
 #endif
                 cache.Expansion(newDims);
             }
+#ifdef USE_CUDA
+            // 追加前把容量 / 行宽 / 类型核一遍。越界写在 CUDA 上只会在之后某个
+            // 不相关的地方报 illegal address，这里提前拦住并说清是哪一项不对。
+            if (tp) {
+                for (int device : tpDevices) {
+                    Data *local = cache.multiDeviceDatas.at(device);
+                    AssertInFastLLM(
+                        local != nullptr && local->dataType == rows.dataType &&
+                        (local->dims.size() == 0 || local->dims[2] == rows.dims[2]) &&
+                        V41CacheRowCapacity(*local) >= needRows,
+                        "DeepSeekV41: TP cache replica on device " + std::to_string(device) +
+                        " can't take " + std::to_string(rows.dims[1]) + " more rows of width " +
+                        std::to_string(rows.dims[2]) + " (capacity " +
+                        std::to_string(V41CacheRowCapacity(*local)) + " rows, need " +
+                        std::to_string(needRows) + ").");
+                }
+            }
+#endif
             CatDirect(cache, rows, 1);
         }
 

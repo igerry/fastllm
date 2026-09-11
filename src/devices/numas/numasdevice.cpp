@@ -351,6 +351,29 @@ namespace fastllm {
         return config;
     }
 
+    // 自举用的「探针」阈值：让最小的 probeExperts 个活跃专家落到 CPU 上，
+    // 其余全部上 GPU。代价有界（这几个专家本来 route 就最少），一层就能同时
+    // 拿到 CPU 与 GPU 的耗时样本，不需要跑合成 benchmark。
+    static int ComputeNumasMoeProbeExpertLimit(
+            const std::vector<std::vector<std::pair<int, float> > >
+                &expertTasks,
+            Data **weights, int weightsBatch, int probeExperts) {
+        std::vector<int> sizes;
+        for (int e = 0; e < (int)expertTasks.size(); e++) {
+            if (e * 2 >= weightsBatch || weights[e * 2] == nullptr ||
+                expertTasks[e].empty()) {
+                continue;
+            }
+            sizes.push_back((int)expertTasks[e].size());
+        }
+        if ((int)sizes.size() <= probeExperts) {
+            return 1;
+        }
+        std::sort(sizes.begin(), sizes.end());
+        // +1 保证即使有并列也至少有一个专家落到 CPU 上，否则永远拿不到样本。
+        return sizes[probeExperts - 1] + 1;
+    }
+
     // 每张卡跑一个 GPU 专家的实测耗时（毫秒，EMA）。assist 卡与承载稠密层的卡
     // 共享同一条主存通路，实际吞吐不一定相同，按 route 数均分会让快卡空等慢卡。
     // 这里用真实层的耗时反馈，不做额外的合成 benchmark。
@@ -8266,7 +8289,15 @@ namespace fastllm {
                         PredictExpertLimit(
                             expertTasks, weights, weightsBatch, gpuDevices,
                             expertLimit, 4, &predictCpuMs, &predictGpuMs);
-                    if (measuredLimit > 0 && assistConfig.profile) {
+                    if (measuredLimit <= 0) {
+                        // 还没有样本。合成 benchmark 在这台机器上要 2.2 s，
+                        // 比它省下来的还多，所以不跑它：改成用一个「探针」
+                        // 阈值，只把最小的两个专家放到 CPU 上，代价有界，
+                        // 同时一次就拿到 CPU 与 GPU 两边的样本。
+                        measuredLimit = ComputeNumasMoeProbeExpertLimit(
+                            expertTasks, weights, weightsBatch, 2);
+                    }
+                    if (assistConfig.profile) {
                         printf(
                             "[fastllm-profile-numas-moe-assist] layer=%d "
                             "measured_limit=%d predict_cpu=%.2fms "
@@ -8504,6 +8535,11 @@ namespace fastllm {
                                     "NUMA MergeMOE failed to stage the assist "
                                     "input replica.");
                             }
+                            // 只在 worker 线程内等 staging 落地：主线程与 root
+                            // 卡都不受影响，但下面的耗时采样就只包含真正的专家
+                            // 计算，不会把 staging 记到这张卡的「每专家毫秒」上
+                            // （否则 assist 卡会被误判成慢卡而越分越少）。
+                            FastllmCudaSyncCurrentThreadStream();
                         }
                         auto workerStart =
                             std::chrono::steady_clock::now();

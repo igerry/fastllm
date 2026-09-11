@@ -176,6 +176,37 @@ namespace fastllm {
             }
         }
 
+        // Extra MoE-assist GPUs.  The list above only ever contains the GPUs
+        // that hold dense layers, so a machine whose model fits on cuda:0
+        // leaves every other GPU idle during prefill even though routed
+        // experts are streamed from host memory and need no tensor-parallel
+        // shard.  FT_MOE_ASSIST_DEVICES=0,1 lets a deployment hand those GPUs
+        // to the expert stream; each one adds its own PCIe link, which is the
+        // actual limit for a chunk that has to pull every expert once.
+        static const std::vector<int> extraDevices = []() {
+            std::vector<int> parsed;
+            const char *env = std::getenv("FT_MOE_ASSIST_DEVICES");
+            if (env == nullptr) {
+                return parsed;
+            }
+            std::string spec(env);
+            std::string token;
+            for (size_t i = 0; i <= spec.size(); i++) {
+                if (i == spec.size() || spec[i] == ',' || spec[i] == ' ') {
+                    if (!token.empty()) {
+                        parsed.push_back(atoi(token.c_str()));
+                        token.clear();
+                    }
+                    continue;
+                }
+                token.push_back(spec[i]);
+            }
+            return parsed;
+        }();
+        for (int device : extraDevices) {
+            appendDevice(device);
+        }
+
         std::sort(devices.begin(), devices.end());
         return devices;
     }

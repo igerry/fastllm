@@ -555,6 +555,57 @@ indexer 分数矩阵的分块效果（65536 token prefill，扣掉同卡其它�
 按 token 分块后峰值显存 1832 MiB，不分块（`FASTLLM_DSV41_INDEX_SCORE_MB` 设得很大）是 3770 MiB，
 两者输出逐 token 相同，prefill 耗时 2.87 s vs 2.69 s（分块多约 7%）。
 
+### 长上下文 prefill 的第二轮 kernel 优化
+
+上面的 mma kernel 上线后，32k / 64k prefill 的次要热点变成了 indexer top-k、旋转/伪量化，
+以及 FP4 KV 存储引入的解包开销。四处改动（都有环境变量可以逐个退回旧实现）：
+
+- **量化 KV 行的向量化解包**：读路径原来是逐元素解 nibble（一次一个 4 bit），
+  现在一个 lane 一次解 16 个连续值——`head_dim` 是 512，一个 warp 正好每人 16 个，
+  而 16 个值一定落在同一个 scale 块内（`blockSize` 16 / 32），所以整行每个 lane 只做
+  一次数据读（FP4 8 字节 / FP8 16 字节）+ 一次 scale 读，解完直接按 `float4` 写进
+  BF16 mma 片段。E2M1 解码也从查表改成纯位运算。
+- **indexer top-k**（`V41TopKKernel`）：原来每个 token 对全部 visible 候选做 8 轮 4-bit
+  radix select，加上「统计可用数」「统计严格大于阈值的个数」和写出，共 11 趟全量扫描。
+  现在降到 3 趟：候选块下标先升序压缩进共享内存（两级 top-k 下只有候选块内的才合格）；
+  radix select 改成 8 bit 一位共 4 趟，且只有第 1 趟是全量的，之后只扫压缩进共享内存的
+  几百个 key；「严格大于阈值的个数」直接取 radix select 结束时的 `remaining`；
+  写出阶段把两次 `BlockScan` 合成一次。输出与 CPU 参考实现逐字节相同（含并列规则）。
+- **旋转 / 伪量化**（`V41RotaryQuant`）：原来一行一个 block、`blockDim = dim`，整行 load 进
+  共享内存再原样写回。`quantMode == 0`（q 与注意力输出的逆旋转，`rows = seqlen x heads`）
+  拆成只碰末尾 `ropeDim` 个元素的 kernel；`quantMode > 0` 的旋转对改用相邻 lane 的
+  `__shfl_xor` 交换，去掉共享内存与两次 `__syncthreads`，一个 block 处理多行。
+  四种 `quantMode` 的块内 amax 语义不变。
+- **HcApplyPre + RMSNorm 融合**：每个子层入口的中间张量只被紧接着的 RMSNorm 读一次，
+  融合后省掉它的一次写 + 一次读和一次 kernel 启动。折叠的 BF16 舍入与 RMSNorm 的
+  归约树都与原来两步逐 bit 一致（`THREAD_PER_BLOCK` 按 `LaunchFastllmRMSNormBFloat16`
+  的同一条规则选；`channels == 3072` 走的是另一个专用 kernel，不接管）。
+
+3090 Ti、`--perf-config`、32768 token prefill（`--chunked-prefill 4096`）的算子耗时
+（`FASTLLM_PRINT_PROFILE=1 FASTLLM_CUDA_SYNC=1`，单位 ms）：
+
+| 算子 | BF16 KV 旧 | BF16 KV 新 | `fp4_e2m1` 旧 | `fp4_e2m1` 新 |
+| --- | --- | --- | --- | --- |
+| `DeepSeekV41SparseAttention` | 270 | 268 | 839 | 341 |
+| `DeepSeekV41IndexerTopK` | 81 | 35 | 80 | 35 |
+| `DeepSeekV41RotaryQuant` | 74 | 17 | 72 | 16 |
+| `DeepSeekV41HcApplyPre` + `RMSNorm` | 2.3 + 3.8 | 0.5 + 2.3 | 2.4 + 3.7 | 0.5 + 2.1 |
+| 全部算子合计 | 1079 | 966 | 1639 | 1040 |
+
+端到端（同一配置，取两次运行的稳定值）：
+
+| 上下文 | KV | prefill 旧 | prefill 新 | decode 旧 | decode 新 |
+| --- | --- | --- | --- | --- | --- |
+| 32768 | BF16 | 1.08 s | 0.98 s | 177 tok/s | 186 tok/s |
+| 32768 | `fp4_e2m1` | 1.64 s | 1.04 s | 212 tok/s | 229 tok/s |
+| 65536 | BF16 | 2.49 s | 2.15 s | 119 tok/s | 129 tok/s |
+| 65536 | `fp4_e2m1` | 3.66 s | 2.30 s | 157 tok/s | 172 tok/s |
+
+也就是说 **FP4 KV 相对 BF16 KV 的 prefill 代价从 +52% / +47% 降到 +6% / +7%**，
+而 logits 仍与 BF16 存储逐 bit 相同。剩下的差距全部在稀疏注意力里
+（341 ms vs 268 ms）：解包本身已经不是 ALU 瓶颈（把 FP32 乘 + 转换换成 BF16 上的
+`__hmul2` 没有任何变化），要再往下压得靠 KV tile 的双缓冲，那要重排整个 mma kernel。
+
 ## 调试环境变量
 
 | 变量 | 作用 |
@@ -562,6 +613,10 @@ indexer 分数矩阵的分块效果（65536 token prefill，扣掉同卡其它�
 | `FASTLLM_DSV41_LEGACY_ATTN` | 稀疏注意力退回 FP32 标量 kernel（对比 / 排查用） |
 | `FASTLLM_DSV41_LEGACY_INDEXER` | indexer 打分退回 FP32 标量 kernel |
 | `FASTLLM_DSV41_LEGACY_HCMIX` | HC 混合系数退回旧 kernel |
+| `FASTLLM_DSV41_LEGACY_FP4_UNPACK` | 量化 KV 缓存行退回逐元素解包（不再按 4 字节一组批量展开） |
+| `FASTLLM_DSV41_LEGACY_TOPK` | indexer top-k 退回旧的「全 visible 扫描 + 8 轮 4-bit radix」kernel |
+| `FASTLLM_DSV41_LEGACY_ROTARY` | 旋转 / 伪量化退回旧的「一行一个 block + 共享内存」kernel |
+| `FASTLLM_DSV41_DISABLE_HCPRENORM` | 不融合 HcApplyPre 与 RMSNorm，退回两个算子分开做 |
 | `FASTLLM_DSV41_ATTN_SPLITS` | 手动指定稀疏注意力候选维的 split-K 份数（默认自动） |
 | `FASTLLM_DSV41_INDEX_SCORE_MB` | indexer 分数矩阵的显存预算（MB，默认 128），决定 token 维分块大小 |
 | `FASTLLM_DSV41_INDEX_CHUNK` | 直接指定 indexer 的 token 分块大小（覆盖上面的预算推算） |

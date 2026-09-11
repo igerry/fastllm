@@ -1147,7 +1147,7 @@ namespace {
 
     // ---------------- IndexerTopK ----------------
 
-    __global__ void V41TopKKernel(const float *score, const uint8_t *candidates, int seqlen, int m,
+    __global__ void V41TopKKernelLegacy(const float *score, const uint8_t *candidates, int seqlen, int m,
                                   int numBlocks, int blockSize, int topK, int width, int ratio, int startPos,
                                   int32_t *out) {
         typedef cub::BlockScan<int, kSelThreads> BlockScan;
@@ -1238,6 +1238,211 @@ namespace {
         for (int p = keep + threadIdx.x; p < width; p += kSelThreads) {
             orow[p] = -1;
         }
+    }
+
+    // 新 top-k：输出与 V41TopKKernelLegacy 逐字节相同（升序、并列按下标从小到大、
+    // 不足 width 补 -1），但把「11 趟全量扫描」降到 3 趟：
+    //
+    //   1. 有候选掩码时先把候选块下标升序压缩进共享内存，之后所有扫描都只在
+    //      候选块内进行（两级 top-k 下 visible 远大于候选集，上下文越长省得越多）；
+    //   2. radix select 从 4 bit 8 趟改成 8 bit 4 趟，且只有第 1 趟是全量的：
+    //      第 1 趟顺带把落在选中桶里的 key 压缩进共享内存，后 3 趟只扫这几百个 key；
+    //   3. 「严格大于阈值的个数」不再单独扫一趟：radix select 结束时的 remaining
+    //      恰好是需要从等于阈值的元素里取的个数（tieBudget）；
+    //   4. 写出阶段把两次 BlockScan 合成一次（greater / tie 的前缀和打包进一个 int），
+    //      输出位置 = 前面 greater 的个数 + min(tieBudget, 前面 tie 的个数)。
+    //
+    // 共享内存里的候选块下标由 candList（动态共享内存）承载，listCap == 0 表示不压缩。
+    constexpr int kTopKSurvivorCap = 1024;
+
+    __global__ void V41TopKKernel(const float *score, const uint8_t *candidates, int seqlen, int m,
+                                  int numBlocks, int blockSize, int blockShift, int width,
+                                  int ratio, int startPos, int listCap, int32_t *out) {
+        typedef cub::BlockScan<int, kSelThreads> BlockScan;
+        __shared__ typename BlockScan::TempStorage scanStorage;
+        __shared__ unsigned hist[256];
+        __shared__ unsigned survivors[kTopKSurvivorCap];
+        __shared__ int meta[4];             // 0: digit, 1: remaining, 2: 候选块个数
+        extern __shared__ int candList[];
+
+        const int t = blockIdx.x;
+        const int i = t % seqlen;
+        const int visible = min(m, (startPos + i + 1) / ratio);
+        const float *row = score + (uint64_t)t * m;
+        const uint8_t *cand = candidates == nullptr ? nullptr : candidates + (uint64_t)t * numBlocks;
+        int32_t *orow = out + (uint64_t)t * width;
+        const unsigned negInf = V41FloatKey(-INFINITY);
+
+        // ---- 候选块下标的升序压缩 ----
+        const bool compact = cand != nullptr && listCap > 0 && numBlocks <= listCap && blockShift >= 0;
+        int nCandBlocks = 0;
+        if (compact) {
+            int running = 0;
+            for (int st = 0; st < numBlocks; st += kSelThreads) {
+                const int blk = st + threadIdx.x;
+                const int keepIt = (blk < numBlocks && cand[blk] != 0 && (blk << blockShift) < visible) ? 1 : 0;
+                int rank = 0, tot = 0;
+                BlockScan(scanStorage).ExclusiveSum(keepIt, rank, tot);
+                __syncthreads();
+                if (keepIt) {
+                    candList[running + rank] = blk;
+                }
+                running += tot;
+            }
+            nCandBlocks = running;
+        }
+        const int nDomain = compact ? (nCandBlocks << blockShift) : visible;
+
+        // p（压缩域下标）-> j（原始候选下标）；compact 时 j 一定落在候选块内
+#define V41_TOPK_INDEX(p) (compact ? ((candList[(p) >> blockShift] << blockShift) | ((p) & (blockSize - 1))) : (p))
+#define V41_TOPK_OK(j)    ((j) < visible && (compact || cand == nullptr || \
+                           ((j) / blockSize < numBlocks && cand[(j) / blockSize] != 0)))
+
+        // ---- 第 1 趟：全量直方图（高 8 bit），同时得到可用元素总数 ----
+        hist[threadIdx.x] = 0;
+        __syncthreads();
+        for (int p = threadIdx.x; p < nDomain; p += kSelThreads) {
+            const int j = V41_TOPK_INDEX(p);
+            if (V41_TOPK_OK(j)) {
+                atomicAdd(&hist[V41FloatKey(row[j]) >> 24], 1u);
+            }
+        }
+        __syncthreads();
+        int binCount = (int)hist[threadIdx.x], binPrefix = 0, total = 0;
+        BlockScan(scanStorage).ExclusiveSum(binCount, binPrefix, total);
+        __syncthreads();
+
+        const int keep = min(width, total);
+        unsigned threshold = 0;
+        int tieBudget = 0;
+        const bool selectAll = total <= width;
+        if (!selectAll) {
+            if (threadIdx.x == 0) {
+                int cnt = width, digit = 255;
+                for (; digit >= 0; digit--) {
+                    const int c = (int)hist[digit];
+                    if (cnt <= c) {
+                        break;
+                    }
+                    cnt -= c;
+                }
+                if (digit < 0) {
+                    digit = 0;
+                }
+                meta[0] = digit;
+                meta[1] = cnt;
+                meta[2] = (int)hist[digit];
+            }
+            __syncthreads();
+            int digit = meta[0];
+            int remaining = meta[1];
+            const int survivorCount = meta[2];
+            unsigned prefix = (unsigned)digit << 24;
+            const bool useShared = survivorCount <= kTopKSurvivorCap;
+            __syncthreads();
+            if (useShared) {
+                // 第 2 趟：把落在选中桶里的 key 压缩进共享内存
+                if (threadIdx.x == 0) {
+                    meta[3] = 0;
+                }
+                __syncthreads();
+                for (int p = threadIdx.x; p < nDomain; p += kSelThreads) {
+                    const int j = V41_TOPK_INDEX(p);
+                    if (V41_TOPK_OK(j)) {
+                        const unsigned key = V41FloatKey(row[j]);
+                        if ((key >> 24) == (unsigned)digit) {
+                            const unsigned pos = atomicAdd((unsigned*)&meta[3], 1u);
+                            if (pos < (unsigned)kTopKSurvivorCap) {
+                                survivors[pos] = key;
+                            }
+                        }
+                    }
+                }
+                __syncthreads();
+            }
+            for (int shift = 16; shift >= 0; shift -= 8) {
+                hist[threadIdx.x] = 0;
+                __syncthreads();
+                const unsigned mask = 0xffffffffu << (shift + 8);
+                if (useShared) {
+                    for (int s = threadIdx.x; s < survivorCount; s += kSelThreads) {
+                        const unsigned key = survivors[s];
+                        if ((key & mask) == prefix) {
+                            atomicAdd(&hist[(key >> shift) & 255], 1u);
+                        }
+                    }
+                } else {
+                    for (int p = threadIdx.x; p < nDomain; p += kSelThreads) {
+                        const int j = V41_TOPK_INDEX(p);
+                        if (V41_TOPK_OK(j)) {
+                            const unsigned key = V41FloatKey(row[j]);
+                            if ((key & mask) == prefix) {
+                                atomicAdd(&hist[(key >> shift) & 255], 1u);
+                            }
+                        }
+                    }
+                }
+                __syncthreads();
+                if (threadIdx.x == 0) {
+                    int cnt = remaining, d = 255;
+                    for (; d >= 0; d--) {
+                        const int c = (int)hist[d];
+                        if (cnt <= c) {
+                            break;
+                        }
+                        cnt -= c;
+                    }
+                    if (d < 0) {
+                        d = 0;
+                    }
+                    meta[0] = d;
+                    meta[1] = cnt;
+                }
+                __syncthreads();
+                digit = meta[0];
+                remaining = meta[1];
+                prefix |= (unsigned)digit << shift;
+                __syncthreads();
+            }
+            threshold = prefix;
+            // radix select 结束时的 remaining 就是等于阈值的元素里要取的个数
+            tieBudget = remaining;
+        }
+
+        // ---- 最后一趟：按升序写出 ----
+        int runningGreater = 0, runningTie = 0;
+        for (int st = 0; st < nDomain; st += kSelThreads) {
+            const int p = st + threadIdx.x;
+            const int j = p < nDomain ? V41_TOPK_INDEX(p) : -1;
+            const bool ok = j >= 0 && V41_TOPK_OK(j);
+            const unsigned key = ok ? V41FloatKey(row[j]) : negInf;
+            int isGreater = 0, isTie = 0;
+            if (ok && key > negInf) {
+                if (selectAll || key > threshold) {
+                    isGreater = 1;
+                } else if (key == threshold) {
+                    isTie = 1;
+                }
+            }
+            int packedPrefix = 0, packedTotal = 0;
+            BlockScan(scanStorage).ExclusiveSum(isGreater * 1024 + isTie, packedPrefix, packedTotal);
+            __syncthreads();
+            const int gBefore = runningGreater + (packedPrefix >> 10);
+            const int tBefore = runningTie + (packedPrefix & 1023);
+            if (isGreater || (isTie && tBefore < tieBudget)) {
+                const int pos = gBefore + min(tieBudget, tBefore);
+                if (pos < width) {
+                    orow[pos] = j;
+                }
+            }
+            runningGreater += packedTotal >> 10;
+            runningTie += packedTotal & 1023;
+        }
+        for (int p = keep + threadIdx.x; p < width; p += kSelThreads) {
+            orow[p] = -1;
+        }
+#undef V41_TOPK_INDEX
+#undef V41_TOPK_OK
     }
 
     // ---------------- SparseAttention ----------------
@@ -1688,6 +1893,11 @@ namespace {
     // FASTLLM_DSV41_LEGACY_ROTARY=1 退回「一行一个 block + 共享内存」的旧旋转/量化 kernel
     bool V41LegacyRotary() {
         return V41EnvOn("FASTLLM_DSV41_LEGACY_ROTARY");
+    }
+
+    // FASTLLM_DSV41_LEGACY_TOPK=1 退回逐 visible 元素扫描的旧 top-k kernel
+    bool V41LegacyTopK() {
+        return V41EnvOn("FASTLLM_DSV41_LEGACY_TOPK");
     }
 
     // ---------------- QuantizeKV ----------------
@@ -2153,9 +2363,28 @@ extern "C" bool FastllmCudaDeepSeekV41IndexerTopK(const fastllm::Data &score, co
     if (width == 0) {
         return true;
     }
-    V41TopKKernel<<<bsz * seqlen, kSelThreads>>>((const float*)score.cudaData, cand, seqlen, m, numBlocks,
-                                                 std::max(1, blockSize), topK, width, ratio, startPos,
-                                                 (int32_t*)output.cudaData);
+    const int bs = std::max(1, blockSize);
+    if (V41LegacyTopK()) {
+        V41TopKKernelLegacy<<<bsz * seqlen, kSelThreads>>>((const float*)score.cudaData, cand, seqlen, m, numBlocks,
+                                                           bs, topK, width, ratio, startPos,
+                                                           (int32_t*)output.cudaData);
+        return V41CheckLaunch("IndexerTopK");
+    }
+    // blockSize 是 2 的幂时才走候选块压缩（下标换算只用移位）
+    int blockShift = -1;
+    for (int s = 0; s < 31; s++) {
+        if ((1 << s) == bs) {
+            blockShift = s;
+            break;
+        }
+    }
+    // 候选块下标的压缩表放动态共享内存；太大就不压缩（改为逐 j 查掩码）
+    const int kListCap = 4096;
+    const int listCap = (cand != nullptr && blockShift >= 0 && numBlocks > 0 && numBlocks <= kListCap)
+                        ? numBlocks : 0;
+    V41TopKKernel<<<bsz * seqlen, kSelThreads, (size_t)listCap * sizeof(int)>>>(
+        (const float*)score.cudaData, cand, seqlen, m, numBlocks, bs, blockShift, width,
+        ratio, startPos, listCap, (int32_t*)output.cudaData);
     return V41CheckLaunch("IndexerTopK");
 }
 

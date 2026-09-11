@@ -217,34 +217,37 @@ namespace fastllm {
     // quantMode: 1 = FP8 E4M3 + UE8M0 scale（act_quant, 每 blockSize 一组）
     //            2 = FP4 E2M1 + UE8M0 scale（fp4_act_quant scale_dtype=e8m0）
     //            3 = FP4 E2M1 + E4M3 scale（fp4_act_quant scale_dtype=e4m3, 压缩 KV）
+    float DeepSeekV41QuantMax(int quantMode) {
+        return quantMode == 1 ? 448.0f : 6.0f;
+    }
+
+    // 由块内 amax 推出该块的 scale。FP4 存储与伪量化共用这一份推导，
+    // 保证「先伪量化再按 FP4 存储」是幂等的（存储无损）。
+    float DeepSeekV41BlockScale(float amax, int quantMode) {
+        if (quantMode == 1) {
+            amax = std::max(amax, 1e-4f);
+            return V41Pow2Ceil(amax * (1.0f / 448.0f));
+        } else if (quantMode == 2) {
+            amax = std::max(amax, 6.0f * std::ldexp(1.0f, -126));
+            return V41Pow2Ceil(amax * (1.0f / 6.0f));
+        }
+        amax = std::max(amax, 6.0f * std::ldexp(1.0f, -9));
+        float scale = V41FP8RoundTrip(amax / 6.0f);
+        return scale > 0.0f ? scale : std::ldexp(1.0f, -9);
+    }
+
     void DeepSeekV41FakeQuantRow(float *row, int len, int quantMode, int blockSize) {
         if (quantMode <= 0) {
             return;
         }
+        const float qmax = DeepSeekV41QuantMax(quantMode);
         for (int start = 0; start < len; start += blockSize) {
             int end = std::min(start + blockSize, len);
             float amax = 0.0f;
             for (int i = start; i < end; i++) {
                 amax = std::max(amax, std::fabs(row[i]));
             }
-            float scale;
-            float qmax;
-            if (quantMode == 1) {
-                qmax = 448.0f;
-                amax = std::max(amax, 1e-4f);
-                scale = V41Pow2Ceil(amax * (1.0f / qmax));
-            } else if (quantMode == 2) {
-                qmax = 6.0f;
-                amax = std::max(amax, 6.0f * std::ldexp(1.0f, -126));
-                scale = V41Pow2Ceil(amax * (1.0f / qmax));
-            } else {
-                qmax = 6.0f;
-                amax = std::max(amax, 6.0f * std::ldexp(1.0f, -9));
-                scale = V41FP8RoundTrip(amax / qmax);
-                if (!(scale > 0.0f)) {
-                    scale = std::ldexp(1.0f, -9);
-                }
-            }
+            float scale = DeepSeekV41BlockScale(amax, quantMode);
             for (int i = start; i < end; i++) {
                 float q = std::max(-qmax, std::min(qmax, row[i] / scale));
                 if (quantMode == 1) {
@@ -257,8 +260,16 @@ namespace fastllm {
         }
     }
 
-    // ---------------- FP8 KV 存储 ----------------
-    // 行布局：[dim 个 FP8 E4M3 字节][dim / 32 个 UE8M0 scale 字节]，值 = fp8 * 2^(scale - 127)
+    // ---------------- 量化 KV 存储 ----------------
+    //
+    // 缓存行统一放在 INT8 的 Data 里，[b, rows, rowBytes]；三种行布局按 (quantMode, blockSize)
+    // 区分，与写入 cache 前的伪量化 (DeepSeekV41FakeQuantRow) 严格同构：
+    //
+    //   quantMode 1, block 32 : [dim 个 FP8 E4M3][dim/32 个 UE8M0]        滑窗 KV，dim + dim/32 字节
+    //   quantMode 3, block 16 : [dim 个 FP4 E2M1（打包）][dim/16 个 E4M3]  压缩 KV，dim/2 + dim/16 字节
+    //   quantMode 2, block 32 : [dim 个 FP4 E2M1（打包）][dim/32 个 UE8M0] indexer key，dim/2 + dim/32 字节
+    //
+    // FP4 打包：一个字节放两个 code，低 4 位是偶数下标。UE8M0 的值 = 2^(byte - 127)。
 
     inline float V41DecodeFp8E4M3(uint8_t c) {
         int e = (c >> 3) & 0xF, m = c & 7;
@@ -304,65 +315,145 @@ namespace fastllm {
         return sign | (uint8_t)(((E + 7) << 3) | m);
     }
 
+    // E2M1 编码：bit3 符号，bit2..0 是网格下标（值表见下）。r 必须已经在 E2M1 网格上。
+    static const float kV41Fp4Grid[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+
+    inline uint8_t V41EncodeFp4E2M1(float r) {
+        uint8_t sign = std::signbit(r) ? 8 : 0;
+        float a = std::fabs(r);
+        int idx = 0;
+        for (int i = 7; i >= 1; i--) {
+            if (kV41Fp4Grid[i] <= a) {
+                idx = i;
+                break;
+            }
+        }
+        return sign | (uint8_t)idx;
+    }
+
+    inline float V41DecodeFp4E2M1(uint8_t c) {
+        float v = kV41Fp4Grid[c & 7];
+        return (c & 8) ? -v : v;
+    }
+
     inline int V41Fp8RowBytes(int dim) {
         return dim + dim / 32;
     }
 
-    // 把 [rows, dim] 的 float 行量化成 FP8 + UE8M0（每 32 个一组，与 act_quant 的 scale 规则一致）
-    void V41QuantizeFp8Row(const float *row, int dim, uint8_t *dst) {
-        uint8_t *scales = dst + dim;
-        for (int start = 0; start < dim; start += 32) {
+    // (quantMode, blockSize) -> 每行字节数
+    inline int V41KvRowBytes(int dim, int quantMode, int blockSize) {
+        return (quantMode == 1 ? dim : dim / 2) + dim / blockSize;
+    }
+
+    // 由行宽反推布局；dim >= 32 时三种布局的行宽两两不同
+    inline bool V41ParseKvRow(int dim, int rowBytes, int *quantMode, int *blockSize) {
+        if (rowBytes == V41KvRowBytes(dim, 1, 32)) {
+            *quantMode = 1; *blockSize = 32; return true;
+        }
+        if (rowBytes == V41KvRowBytes(dim, 3, 16)) {
+            *quantMode = 3; *blockSize = 16; return true;
+        }
+        if (rowBytes == V41KvRowBytes(dim, 2, 32)) {
+            *quantMode = 2; *blockSize = 32; return true;
+        }
+        return false;
+    }
+
+    // 把一行 float 按 (quantMode, blockSize) 量化进缓存行。scale 的推导与 DeepSeekV41FakeQuantRow
+    // 共用 DeepSeekV41BlockScale，因此对已伪量化过的行是幂等的（存储无损）。
+    void V41QuantizeKvRow(const float *row, int dim, int quantMode, int blockSize, uint8_t *dst) {
+        const bool fp8 = quantMode == 1;
+        const float qmax = DeepSeekV41QuantMax(quantMode);
+        uint8_t *scales = dst + (fp8 ? dim : dim / 2);
+        for (int start = 0; start < dim; start += blockSize) {
             float amax = 0.0f;
-            for (int i = start; i < start + 32; i++) {
+            for (int i = start; i < start + blockSize; i++) {
                 amax = std::max(amax, std::fabs(row[i]));
             }
-            float scale = V41Pow2Ceil(std::max(amax, 1e-4f) * (1.0f / 448.0f));
-            int e;
-            std::frexp(scale, &e);            // scale = 0.5 * 2^e = 2^(e - 1)
-            scales[start / 32] = (uint8_t)(e - 1 + 127);
-            for (int i = start; i < start + 32; i++) {
-                float q = std::max(-448.0f, std::min(448.0f, row[i] / scale));
-                dst[i] = V41EncodeFp8E4M3(V41FP8RoundTrip(q));
+            float scale = DeepSeekV41BlockScale(amax, quantMode);
+            if (quantMode == 3) {
+                scales[start / blockSize] = V41EncodeFp8E4M3(scale);
+            } else {
+                int e;
+                std::frexp(scale, &e);        // scale = 0.5 * 2^e = 2^(e - 1)
+                scales[start / blockSize] = (uint8_t)(e - 1 + 127);
+            }
+            for (int i = start; i < start + blockSize; i++) {
+                float q = std::max(-qmax, std::min(qmax, row[i] / scale));
+                if (fp8) {
+                    dst[i] = V41EncodeFp8E4M3(V41FP8RoundTrip(q));
+                } else {
+                    uint8_t code = V41EncodeFp4E2M1(V41FP4RoundTrip(q));
+                    if ((i & 1) == 0) {
+                        dst[i >> 1] = code;
+                    } else {
+                        dst[i >> 1] |= (uint8_t)(code << 4);
+                    }
+                }
             }
         }
     }
 
-    void V41DequantFp8Rows(const Data &data, int dim, std::vector<float> &out) {
-        const int rowBytes = V41Fp8RowBytes(dim);
-        uint64_t rows = data.Count(0) / rowBytes;
-        out.resize(rows * dim);
-        for (uint64_t r = 0; r < rows; r++) {
-            const uint8_t *src = data.cpuData + r * rowBytes;
-            const uint8_t *scales = src + dim;
-            float *dst = out.data() + r * dim;
-            for (int d = 0; d < dim; d++) {
-                dst[d] = V41DecodeFp8E4M3(src[d]) * std::ldexp(1.0f, (int)scales[d / 32] - 127);
+    void V41DequantKvRow(const uint8_t *src, int dim, int quantMode, int blockSize, float *dst) {
+        const uint8_t *scales = src + (quantMode == 1 ? dim : dim / 2);
+        for (int d = 0; d < dim; d++) {
+            uint8_t sb = scales[d / blockSize];
+            float scale = quantMode == 3 ? V41DecodeFp8E4M3(sb) : std::ldexp(1.0f, (int)sb - 127);
+            if (quantMode == 1) {
+                dst[d] = V41DecodeFp8E4M3(src[d]) * scale;
+            } else {
+                uint8_t byte = src[d >> 1];
+                dst[d] = V41DecodeFp4E2M1((d & 1) ? (byte >> 4) : (byte & 0xF)) * scale;
             }
         }
+    }
+
+    // 把整块量化缓存解成 float [rows, dim]，布局由行宽自动识别
+    void V41DequantKvRows(const Data &data, int dim, std::vector<float> &out) {
+        const int rowBytes = data.dims.back();
+        int quantMode = 1, blockSize = 32;
+        AssertInFastLLM(V41ParseKvRow(dim, rowBytes, &quantMode, &blockSize),
+                        "DeepSeekV41: unknown quantized KV row layout.\n");
+        uint64_t rows = data.Count(0) / rowBytes;
+        out.resize(rows * dim);
+        V41ParallelFor((int)rows, [&](int st, int end) {
+            for (int r = st; r < end; r++) {
+                V41DequantKvRow(data.cpuData + (uint64_t)r * rowBytes, dim, quantMode, blockSize,
+                                out.data() + (uint64_t)r * dim);
+            }
+        }, 8);
     }
 
     void CpuDeepSeekV41QuantizeKVOp::Reshape(const std::string &opType, const DataDict &datas,
                                              const FloatDict &floatParams, const IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
-        AssertInFastLLM(input.dims.size() == 3 && input.dims[2] % 32 == 0 && V41IsFloatType(input.dataType),
-                        "DeepSeekV41QuantizeKV error: input should be float [b, s, d] with d % 32 == 0.\n");
+        int quantMode = V41Int(intParams, "quantMode", 1);
+        int blockSize = V41Int(intParams, "quantBlock", 32);
+        AssertInFastLLM(input.dims.size() == 3 && V41IsFloatType(input.dataType) &&
+                        blockSize > 0 && input.dims[2] % blockSize == 0 &&
+                        (quantMode == 1 || ((quantMode == 2 || quantMode == 3) && input.dims[2] % 2 == 0)),
+                        "DeepSeekV41QuantizeKV error: input should be float [b, s, d] with d % block == 0.\n");
         output.dataType = DataType::INT8;
-        output.Resize({input.dims[0], input.dims[1], V41Fp8RowBytes(input.dims[2])});
+        output.Resize({input.dims[0], input.dims[1], V41KvRowBytes(input.dims[2], quantMode, blockSize)});
     }
 
     void CpuDeepSeekV41QuantizeKVOp::Run(const std::string &opType, const DataDict &datas,
                                          const FloatDict &floatParams, const IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
         Data &output = *(datas.find("output")->second);
+        int quantMode = V41Int(intParams, "quantMode", 1);
+        int blockSize = V41Int(intParams, "quantBlock", 32);
         output.Allocate();
         const int dim = input.dims[2];
         const int rows = input.dims[0] * input.dims[1];
+        const int rowBytes = V41KvRowBytes(dim, quantMode, blockSize);
         std::vector<float> values;
         V41ReadFloat(input, values);
         V41ParallelFor(rows, [&](int st, int end) {
             for (int r = st; r < end; r++) {
-                V41QuantizeFp8Row(values.data() + (uint64_t)r * dim, dim, output.cpuData + (uint64_t)r * V41Fp8RowBytes(dim));
+                V41QuantizeKvRow(values.data() + (uint64_t)r * dim, dim, quantMode, blockSize,
+                                 output.cpuData + (uint64_t)r * rowBytes);
             }
         });
     }
@@ -741,7 +832,10 @@ namespace fastllm {
         Data &q = *(datas.find("q")->second);
         Data &k = *(datas.find("k")->second);
         Data &output = *(datas.find("output")->second);
-        AssertInFastLLM(q.dims.size() == 4 && k.dims.size() == 3 && q.dims[3] == k.dims[2] && q.dims[0] == k.dims[0],
+        int qm = 1, qb = 32;
+        AssertInFastLLM(q.dims.size() == 4 && k.dims.size() == 3 && q.dims[0] == k.dims[0] &&
+                        (k.dataType == DataType::INT8 ? V41ParseKvRow(q.dims[3], k.dims[2], &qm, &qb)
+                                                      : q.dims[3] == k.dims[2]),
                         "DeepSeekV41IndexerScore error: q should be [b, s, h, d], k should be [b, m, d].\n");
         output.dataType = DataType::FLOAT32;
         output.Resize({q.dims[0], q.dims[1], k.dims[1]});
@@ -760,7 +854,11 @@ namespace fastllm {
         std::vector<float> qv, wv, kvv;
         V41ReadFloat(q, qv);
         V41ReadFloat(weights, wv);
-        V41ReadFloat(k, kvv);
+        if (k.dataType == DataType::INT8) {
+            V41DequantKvRows(k, dim, kvv);      // indexer key 可以是打包 FP4 的缓存行
+        } else {
+            V41ReadFloat(k, kvv);
+        }
         output.Allocate();
         float *out = (float*)output.cpuData;
         int tokens = bsz * seqlen;
@@ -943,29 +1041,32 @@ namespace fastllm {
         int ringRows = hasRing ? ringKV->dims[1] : 0;
         int cap = hasCompressed ? compressedKV->dims[1] : 0;
         int topWidth = hasCompressed ? cmpIdx->dims[2] : 0;
-        // 缓存行可以是 BF16/FP32 [.., dim]，也可以是 FP8 + UE8M0 的 INT8 [.., dim + dim / 32]
-        bool ringFp8 = hasRing && ringKV->dataType == DataType::INT8;
-        bool compFp8 = hasCompressed && compressedKV->dataType == DataType::INT8;
+        // 缓存行可以是 BF16/FP32 [.., dim]，也可以是量化的 INT8 行（FP8 或打包 FP4，见上面的布局说明）
+        bool ringQuant = hasRing && ringKV->dataType == DataType::INT8;
+        bool compQuant = hasCompressed && compressedKV->dataType == DataType::INT8;
+        int qm = 1, qb = 32;
         AssertInFastLLM(!hasRing || (ringKV->dims[0] == bsz && ringRows == windowSize &&
-                                     ringKV->dims[2] == (ringFp8 ? V41Fp8RowBytes(dim) : dim)),
+                                     (ringQuant ? V41ParseKvRow(dim, ringKV->dims[2], &qm, &qb)
+                                                : ringKV->dims[2] == dim)),
                         "DeepSeekV41SparseAttention error: ring shape mismatch.\n");
         AssertInFastLLM(!hasCompressed || (cmpIdx->dataType == DataType::INT32 && cmpIdx->dims.size() == 3 &&
                                            cmpIdx->dims[0] == bsz && cmpIdx->dims[1] == seqlen &&
-                                           compressedKV->dims[2] == (compFp8 ? V41Fp8RowBytes(dim) : dim)),
+                                           (compQuant ? V41ParseKvRow(dim, compressedKV->dims[2], &qm, &qb)
+                                                      : compressedKV->dims[2] == dim)),
                         "DeepSeekV41SparseAttention error: compressed shape mismatch.\n");
         std::vector<float> qv, chunk, ring, comp, sink;
         V41ReadFloat(q, qv);
         V41ReadFloat(chunkKV, chunk);
         if (hasRing) {
-            if (ringFp8) {
-                V41DequantFp8Rows(*ringKV, dim, ring);
+            if (ringQuant) {
+                V41DequantKvRows(*ringKV, dim, ring);
             } else {
                 V41ReadFloat(*ringKV, ring);
             }
         }
         if (hasCompressed) {
-            if (compFp8) {
-                V41DequantFp8Rows(*compressedKV, dim, comp);
+            if (compQuant) {
+                V41DequantKvRows(*compressedKV, dim, comp);
             } else {
                 V41ReadFloat(*compressedKV, comp);
             }

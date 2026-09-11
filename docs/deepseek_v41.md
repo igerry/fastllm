@@ -82,9 +82,8 @@ ftllm server /path/to/DeepSeek-V4.1-Flash \
 ```
 
 - 没有 FP8 tensor core 的 GPU（如 SM86）请使用 `--dtype float16`，稠密 FP8 权重会在加载时按 32x32 块 scale 反量化；
-- `--kv_cache_dtype fp8_e4m3` 让滑窗 KV 与压缩 KV 以 FP8 E4M3 + UE8M0 块 scale（每 32 个一组）存储，
-  每行 528 B（BF16 为 1024 B）。滑窗 KV 本身就在 FP8 网格上，存储无损；压缩 KV 为 FP4 网格，FP8 存储带来
-  不超过 2^-4 的相对舍入（迷你模型上开启伪量化时，与 BF16 存储的逐步 cos 相当）。默认仍为 BF16；
+- `--kv_cache_dtype` 控制长期 KV 缓存（压缩 KV + indexer key）的存储精度，见下面的“KV 缓存存储精度”一节。
+  默认 BF16，可选 `fp8_e4m3`（1650 B/token）与 `fp4_e2m1`（890 B/token，与官方一致，且数值无损）；
 - `ftllm` launcher 的自动配置按 config 计算 V4.1 的常驻内存下界（FP4 专家约 289 GB + Engram 表约 203 GB +
   稠密部分），权重文件不全时也不会低估；主机内存不足以放下专家与 Engram 表时会退到 `moe_device=disk`；
 - 单路 CPU 机器可用 `--moe_device cpu`；
@@ -231,6 +230,75 @@ V4.1 的压缩 KV 是跨层共享的：`kv_source_layer_ids` 的层算出的 cac
 
 建议：长上下文 / prefill 为主用 `--tp 2`；要显存（给 KV cache 或专家缓存腾地方）、
 或者以 decode 吞吐为主，用按层切分。两者目前是二选一。
+
+## KV 缓存存储精度（`--kv_cache_dtype`）
+
+长期 KV 缓存只有两部分：**压缩 KV**（`kv_source_layer_ids` 各层，每 `compress_ratio` 个 token 一行，
+`head_dim` = 512）与 **indexer key**（同样的层，`index_head_dim` = 128）。滑窗缓存长度固定为
+`sliding_window`，不随上下文增长，不计入每 token 开销。
+
+写进缓存之前，这两者都已经过与官方一致的伪量化（`DeepSeekV41RotaryQuant` 的 `quantMode`）：
+
+| 张量 | 伪量化网格 | 分组 | scale 编码 |
+| --- | --- | --- | --- |
+| 压缩 KV | FP4 E2M1 | 每 16 个通道 | E4M3 |
+| indexer key | FP4 E2M1 | 每 32 个通道 | UE8M0（2 的幂） |
+| 滑窗 KV | FP8 E4M3 | 每 32 个通道 | UE8M0 |
+
+也就是说值本来就落在 FP4 / FP8 网格上，**按 FP4 存储是无损的**。三档存储的行布局与开销：
+
+| `--kv_cache_dtype` | 压缩 KV 行 | indexer key 行 | 每 token | 相对 BF16 | 精度 |
+| --- | --- | --- | --- | --- | --- |
+| 默认（BF16） | 1024 B | 256 B | **3200 B** | 1.00x | 基准 |
+| `fp8_e4m3` | 528 B（512 E4M3 + 16 UE8M0） | 132 B | **1650 B** | 0.52x | 压缩 KV 有不超过 2^-4 的相对舍入 |
+| `fp4_e2m1` | 288 B（256 打包 E2M1 + 32 E4M3） | 68 B（64 打包 E2M1 + 4 UE8M0） | **890 B** | 0.28x | **逐 bit 无损** |
+
+890 B/token 与官方实现一致。每 token 2.5 行压缩 KV（层 2/8/14 的 `compress_ratio` 是 2，层 20 是 1）：
+`2.5 x 288 + 2.5 x 68 = 890`。
+
+- **FP4 无损的原因**：`DeepSeekV41QuantizeKV` 的块 scale 推导（`DeepSeekV41BlockScale`）与伪量化
+  (`DeepSeekV41FakeQuantRow`) 是同一份代码，分组大小与 scale 编码也完全对齐，所以对已经伪量化过的行
+  是幂等的；而 `q * scale`（q 至多 3 个有效位、scale 是 E4M3 或 2 的幂）在 BF16 上也是精确的。
+  实测：开启伪量化时 FP4 存储与 BF16 存储的 logits **逐 bit 相同**（`test/basic/deepseek_v41_kv_cache_dtype.py`）。
+- **FP8 为什么有损**：压缩 KV 的网格是「FP4 值 x E4M3 scale」，而 FP8 存储用的是 2 的幂块 scale，
+  两者的网格对不上，会引入一次真实的舍入。它的用途是在不支持 FP4 打包读取的场合省一半显存。
+- 滑窗 KV 在 `fp8_e4m3` 与 `fp4_e2m1` 两档下**都按 FP8 存储**（它本来就在 FP8 网格上，改 FP4 会真的损失精度），
+  三种行布局可以在同一次前向里混用，读路径按行宽自动识别。
+- 缓存行统一放在 `INT8` 的 `Data` 里，形状 `[b, rows, rowBytes]`；FP4 打包为一个字节两个 code，
+  低 4 位是偶数下标。CUDA 侧在把候选装进共享内存时就地解成 BF16 片段，再进 `mma.sync`，
+  `FASTLLM_DSV41_LEGACY_ATTN` / `FASTLLM_DSV41_LEGACY_INDEXER` 的标量回退路径同样支持。
+
+### 怎么选
+
+- **长上下文 / 高并发**：用 `fp4_e2m1`。同样显存能装的上下文约为 BF16 的 3.6 倍，且数值与 BF16 完全一致，
+  没有任何精度代价；长上下文下稀疏注意力每步读取的字节数同比下降，decode 也有正收益。
+- **默认（BF16）**：短上下文、显存不紧张时省掉打包/解包的一点开销。
+- `fp8_e4m3`：介于两者之间，但既比 FP4 大又比 FP4 差，现在没有明显适用场景，保留是为了兼容既有部署。
+
+### 实测（迷你模型，KV 几何与真实 config 相同：`kv_source_layer_ids` [2, 8, 14, 20]、ratio 2/2/2/1，单卡 3090 Ti）
+
+`test/basic/deepseek_v41_kv_cache_dtype.py` 用同一段提示词跑三档，实测的长期 KV 占用与逐 bit 比较：
+
+| | 每 token | 32k 上下文的实际缓存 | 1 GiB 能装的上下文 | 与 BF16 的 logits |
+| --- | --- | --- | --- | --- |
+| BF16 | 3200 B | 102.6 MB | 33.5 万 token | 基准 |
+| `fp8_e4m3` | 1650 B | 52.9 MB | 65.1 万 token | 有差（压缩 KV 有舍入） |
+| `fp4_e2m1` | 890 B | 28.5 MB | **120.6 万 token** | **逐 bit 相同** |
+
+速度（同一台机器，prefill / decode）：
+
+| 上下文 | BF16 | `fp4_e2m1` |
+| --- | --- | --- |
+| 1000 | 0.32 s / 9.35 ms per token | 0.32 s / 9.64 ms |
+| 8000 | 0.56 s / 10.12 ms | 0.64 s / 9.41 ms |
+| 32000 | 1.53 s / 12.32 ms | 2.03 s / 10.09 ms |
+
+上下文越长，decode 越占便宜（32k 时快 18%），因为稀疏注意力与 indexer 每步读取的字节数减半以上。
+prefill 反过来会慢一些（32k 时慢约 30%）：迷你模型里 MoE 很小，FP4 的逐元素解包（相对 BF16 的
+`float4` 整块搬运）成了可见开销；真实模型的 prefill 由 MoE 主导，这部分占比会小得多。
+把解包改成按 4 字节一组的向量化 nibble 展开可以再优化，尚未做。
+
+`FASTLLM_DSV41_KV_STATS=1` 会在每次前向后打印实际占用的长期 KV 字节数与每 token 均值，便于核对。
 
 ## 多请求与前缀缓存
 

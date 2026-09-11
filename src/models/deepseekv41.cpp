@@ -509,9 +509,13 @@ namespace fastllm {
                               {{"windowSize", windowSize}, {"startPos", startPos}});
         }
 
-        // BF16 KV 行 -> FP8 E4M3 + UE8M0（每 32 个一组）的 INT8 行，用于 FP8 KV 缓存存储
-        void V41QuantizeKV(const Data &input, Data &output) {
-            V41Executor().Run("DeepSeekV41QuantizeKV", {{"input", (Data*)&input}, {"output", &output}}, {}, {});
+        // float KV 行 -> 量化缓存行（INT8 Data）。(quantMode, quantBlock) 与写入前的伪量化一致：
+        //   1 / 32：FP8 E4M3 + UE8M0      （滑窗 KV）
+        //   3 / 16：FP4 E2M1 + E4M3 scale （压缩 KV）
+        //   2 / 32：FP4 E2M1 + UE8M0      （indexer key）
+        void V41QuantizeKV(const Data &input, Data &output, int quantMode = 1, int quantBlock = 32) {
+            V41Executor().Run("DeepSeekV41QuantizeKV", {{"input", (Data*)&input}, {"output", &output}}, {},
+                              {{"quantMode", quantMode}, {"quantBlock", quantBlock}});
         }
 
         void V41WindowStore(const Data &chunkKV, Data &ring, int startPos, int windowSize) {
@@ -2509,8 +2513,16 @@ namespace fastllm {
                 }
             }
         }
-        // --kv_cache_dtype fp8_e4m3：滑窗 KV 与压缩 KV 以 FP8 + UE8M0 块 scale 存储（默认 BF16）
+        // --kv_cache_dtype 控制长期 KV 的存储精度（默认 BF16）：
+        //   fp8_e4m3：滑窗 / 压缩 KV 为 FP8 + UE8M0，indexer key 为 FP8 + UE8M0
+        //   fp4_e2m1：滑窗 KV 仍为 FP8（它本来就在 FP8 网格上），压缩 KV 为 FP4 + E4M3（每 16 个一组），
+        //             indexer key 为 FP4 + UE8M0（每 32 个一组），与伪量化的网格 / 分组完全一致
         const bool fp8KV = this->kvCacheDataType == DataType::FP8_E4M3;
+        const bool fp4KV = this->kvCacheDataType == DataType::FP4_E2M1;
+        const bool quantKV = fp8KV || fp4KV;
+        // (quantMode, quantBlock)：压缩 KV 与 indexer key
+        const int cmpQuantMode = fp4KV ? 3 : 1, cmpQuantBlock = fp4KV ? 16 : 32;
+        const int idxQuantMode = fp4KV ? 2 : 1, idxQuantBlock = 32;
 
         // ---- 张量并行 ----
         // deviceMap 为 multicuda 且不止一张卡时启用：q / attn_sink / 注意力输出 / wo_a
@@ -3084,13 +3096,19 @@ namespace fastllm {
                                 V41RMSNormBF16(kIdx, weight[ipre + ".k_norm.weight"], rms_norm_eps, kIdx);
                                 kIdx.Reshape({1, blocks, index_head_dim});
                                 V41RotaryQuant(kIdx, rope, blockStart * ratio, ratio, false, 2, 32);
-                                V41AppendRows(cache.indexK, kIdx, tpDevices);
+                                if (quantKV) {
+                                    Data kIdxQ;
+                                    V41QuantizeKV(kIdx, kIdxQ, idxQuantMode, idxQuantBlock);
+                                    V41AppendRows(cache.indexK, kIdxQ, tpDevices);
+                                } else {
+                                    V41AppendRows(cache.indexK, kIdx, tpDevices);
+                                }
                             }
                             V41RotaryQuant(latent, rope, blockStart * ratio, ratio, false, 3, 16);
-                            if (fp8KV) {
-                                Data latent8;
-                                V41QuantizeKV(latent, latent8);
-                                V41AppendRows(cache.compressedKV, latent8, tpDevices);
+                            if (quantKV) {
+                                Data latentQ;
+                                V41QuantizeKV(latent, latentQ, cmpQuantMode, cmpQuantBlock);
+                                V41AppendRows(cache.compressedKV, latentQ, tpDevices);
                             } else {
                                 V41AppendRows(cache.compressedKV, latent, tpDevices);
                             }
@@ -3217,8 +3235,9 @@ namespace fastllm {
                 }
                 Data kvSeg8;
                 const Data *windowRows = kvSeg;
-                if (fp8KV) {
-                    V41QuantizeKV(*kvSeg, kvSeg8);
+                if (quantKV) {
+                    // 滑窗 KV 在两档下都用 FP8：它本来就在 FP8 网格上，改 FP4 会真的损失精度
+                    V41QuantizeKV(*kvSeg, kvSeg8, 1, 32);
                     windowRows = &kvSeg8;
                 }
                 if (seg.spec != nullptr && seg.spec->deferWindow) {
@@ -3619,6 +3638,27 @@ namespace fastllm {
         for (auto &seg : segments) {
             seg.state->totalLen += seg.seqlen;
         }
+        // FASTLLM_DSV41_KV_STATS=1：打印实际占用的长期 KV 字节数（用于核对每 token 的缓存开销）
+        static const bool kvStats = V41EnvFlag("FASTLLM_DSV41_KV_STATS");
+        if (kvStats && !segments.empty() && segments[0].state != nullptr) {
+            const DeepSeekV41RequestState *st = segments[0].state.get();
+            long long cmpBytes = 0, idxBytes = 0, winBytes = 0;
+            auto usedBytes = [](const Data &d, int rows) -> long long {
+                if (d.dims.size() != 3 || rows <= 0) {
+                    return 0;
+                }
+                return (long long)rows * d.dims[2] * d.unitSize / d.unitSizeDiv;
+            };
+            for (const auto &layer : st->layers) {
+                cmpBytes += usedBytes(layer.compressedKV, layer.compressedBlocks);
+                idxBytes += usedBytes(layer.indexK, layer.compressedBlocks);
+                winBytes += usedBytes(layer.windowKV, layer.windowKV.dims.size() == 3 ? layer.windowKV.dims[1] : 0);
+            }
+            printf("[V41 KV] tokens=%d compressedKV=%lld B indexK=%lld B (long-term %lld B, %.1f B/token) window=%lld B model-estimate=%lld B/token\n",
+                   st->totalLen, cmpBytes, idxBytes, cmpBytes + idxBytes,
+                   st->totalLen > 0 ? (double)(cmpBytes + idxBytes) / st->totalLen : 0.0,
+                   winBytes, KVCacheBytesPerToken());
+        }
         return ret;
     }
 
@@ -3639,23 +3679,45 @@ namespace fastllm {
         }
         this->kvCacheId = 0;
         // 占位 KV 不反映真实占用；按模型几何估算每个 token 的长期缓存字节数
-        // （压缩 KV + indexer key，均为 BF16；滑窗缓存长度固定，不计入），
+        // （压缩 KV + indexer key；滑窗缓存长度固定，不计入），
         // 折算成 kvCacheDataType 的元素数供调度器估算上下文预算。
+        const long long bytesPerToken = std::max(1LL, KVCacheBytesPerToken());
+        // 调度器算的是 GetDataBytes(kvCacheDataType, 1, elementsInKVCachePerToken)，这里反解元素数
+        if (this->kvCacheDataType == DataType::FP4_E2M1) {
+            elementsInKVCachePerToken = ((bytesPerToken + 8) / 9) * 16;      // 每 16 个元素 9 字节
+        } else if (this->kvCacheDataType == DataType::FP8_E4M3) {
+            elementsInKVCachePerToken = bytesPerToken;
+        } else {
+            long long unitBytes = std::max(1LL, (long long)GetDataBytes(this->kvCacheDataType, 1, 1));
+            elementsInKVCachePerToken = (bytesPerToken + unitBytes - 1) / unitBytes;
+        }
+        elementsInKVCachePerToken = std::max(1LL, elementsInKVCachePerToken);
+        printf("finish.\n");
+    }
+
+    // 每个 token 的长期 KV 缓存字节数（压缩 KV + indexer key，按 kv_source 层与 compress_ratio 累加）
+    long long DeepSeekV41Model::KVCacheBytesPerToken() const {
+        const bool fp8KV = this->kvCacheDataType == DataType::FP8_E4M3;
+        const bool fp4KV = this->kvCacheDataType == DataType::FP4_E2M1;
+        auto rowBytes = [](int dim, int quantMode, int blockSize) -> long long {
+            if (quantMode <= 0) {
+                return (long long)dim * 2;                                  // BF16
+            }
+            return (quantMode == 1 ? dim : dim / 2) + dim / blockSize;
+        };
+        const long long cmpRow = rowBytes(head_dim_full, fp4KV ? 3 : (fp8KV ? 1 : 0), fp4KV ? 16 : 32);
+        const long long idxRow = rowBytes(index_head_dim, fp4KV ? 2 : (fp8KV ? 1 : 0), 32);
         long long bytesPerToken = 0;
-        const long long kvRowBytes = this->kvCacheDataType == DataType::FP8_E4M3 ?
-                                     (long long)head_dim_full + head_dim_full / 32 : (long long)head_dim_full * 2;
         for (int layer = 0; layer < block_cnt; layer++) {
             if (!isKvSource[layer]) {
                 continue;
             }
             int ratio = std::max(1, compress_ratios[layer]);
-            bytesPerToken += kvRowBytes / ratio;
+            bytesPerToken += cmpRow / ratio;
             if (isIndexSource[layer]) {
-                bytesPerToken += (long long)index_head_dim * 2 / ratio;
+                bytesPerToken += idxRow / ratio;
             }
         }
-        long long unitBytes = std::max(1LL, (long long)GetDataBytes(this->kvCacheDataType, 1, 1));
-        elementsInKVCachePerToken = std::max(1LL, (bytesPerToken + unitBytes - 1) / unitBytes);
-        printf("finish.\n");
+        return bytesPerToken;
     }
 }

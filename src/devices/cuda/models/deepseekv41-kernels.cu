@@ -226,6 +226,61 @@ namespace {
                                       __uint_as_float(o[2]), __uint_as_float(o[3]));
     }
 
+    // 一次展开 16 个连续元素（head_dim = 512 时正好是一个 lane 的份额，整行一趟做完）。
+    //
+    // 16 个元素一定落在同一个 scale 块内（blockSize 是 16 或 32），所以整行每个 lane
+    // 只做一次数据读（FP4 8 字节 / FP8 16 字节）+ 一次 scale 读，再写两个 float4。
+    // 要求 (d0 & 15) == 0、dst 16 字节对齐、行首 16 字节对齐（dim = 512 的三种
+    // rowBytes 288 / 272 / 528 都是 16 的倍数，配合 256 字节对齐的基址成立；
+    // 调用方在主机侧检查了这一点）。
+    // 数值与 V41LoadKvRow8Bf16 / 逐元素解包逐 bit 相同。
+    __device__ __forceinline__ void V41LoadKvRow16Bf16(const uint8_t *row, int dim, int d0,
+                                                       int quantMode, __nv_bfloat16 *dst) {
+        uint32_t o[8];
+        if (quantMode == 1) {
+            const float scale = ldexpf(1.0f, (int)row[dim + (d0 >> 5)] - 127);
+            const uint4 w = *(const uint4*)(row + d0);
+            const uint32_t ws[4] = {w.x, w.y, w.z, w.w};
+#pragma unroll
+            for (int g = 0; g < 4; g++) {
+#pragma unroll
+                for (int h = 0; h < 2; h++) {
+                    const int sh = h * 16;
+                    __nv_fp8_e4m3 c0, c1;
+                    c0.__x = (unsigned char)((ws[g] >> sh) & 0xFF);
+                    c1.__x = (unsigned char)((ws[g] >> (sh + 8)) & 0xFF);
+                    o[g * 2 + h] = V41Pack2Bf16((float)c0 * scale, (float)c1 * scale);
+                }
+            }
+        } else {
+            const uint8_t *scales = row + (dim >> 1);
+            float scale;
+            if (quantMode == 3) {
+                __nv_fp8_e4m3 sq;
+                sq.__x = scales[d0 >> 4];
+                scale = (float)sq;
+            } else {
+                scale = ldexpf(1.0f, (int)scales[d0 >> 5] - 127);
+            }
+            const uint2 packed = *(const uint2*)(row + (d0 >> 1));
+            const uint32_t ps[2] = {packed.x, packed.y};
+#pragma unroll
+            for (int q = 0; q < 2; q++) {
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const int byte = (int)((ps[q] >> (e * 8)) & 0xFF);
+                    o[q * 4 + e] = V41Pack2Bf16(V41DecodeFp4Dev(byte & 0xF) * scale,
+                                                V41DecodeFp4Dev(byte >> 4) * scale);
+                }
+            }
+        }
+        float4 *out4 = (float4*)dst;
+        out4[0] = make_float4(__uint_as_float(o[0]), __uint_as_float(o[1]),
+                              __uint_as_float(o[2]), __uint_as_float(o[3]));
+        out4[1] = make_float4(__uint_as_float(o[4]), __uint_as_float(o[5]),
+                              __uint_as_float(o[6]), __uint_as_float(o[7]));
+    }
+
     // (quantMode, blockSize) -> 每行字节数；与 CPU 侧 V41KvRowBytes 一致
     inline int V41KvRowBytesHost(int dim, int quantMode, int blockSize) {
         return (quantMode == 1 ? dim : dim / 2) + dim / blockSize;
@@ -1769,10 +1824,9 @@ namespace {
                 } else if (src8 != nullptr) {
                     // 就地解到 BF16 片段再进 mma；FP4 的值在 BF16 上是精确的
                     if (vecUnpack) {
-                        // 一个 lane 一次解 8 个值（打包 FP4 只读 4 字节），直接写成 16 字节片段
-                        for (int v = lane; v < kMmaDim / 8; v += 32) {
-                            V41LoadKvRow8Bf16(src8, kMmaDim, v * 8, src8Mode, &sh.kvs[slot][v * 8]);
-                        }
+                        // 一个 lane 负责 16 个值（head_dim 512 / 32 lane），整行一趟：
+                        // 一次数据读 + 一次 scale 读 -> 两个 float4 写进 mma 片段
+                        V41LoadKvRow16Bf16(src8, kMmaDim, lane * 16, src8Mode, &sh.kvs[slot][lane * 16]);
                     } else {
                         for (int d = lane; d < kMmaDim; d += 32) {
                             sh.kvs[slot][d] = __float2bfloat16_rn(V41LoadKvRow(src8, kMmaDim, d, src8Mode));
@@ -2564,6 +2618,8 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
     }
     const int ringRowBytes = hasRing && ringFp8 ? ringKV->dims[2] : 0;
     const int cmpRowBytes = hasCmp && cmpFp8 ? compressedKV->dims[2] : 0;
+    // 向量化解包按 16 字节一组读缓存行，需要行宽是 16 的倍数（现有三种布局都满足）
+    const bool vecUnpack = V41Fp4VecUnpack() && (ringRowBytes % 16 == 0) && (cmpRowBytes % 16 == 0);
     if (!hasRing && startPos > 0) {
         return false;
     }
@@ -2644,7 +2700,7 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
             hasCmp ? (const int32_t*)cmpIdx->cudaData : nullptr,
             (const float*)attnSink.cudaData, seqlen, heads, windowSize, cap, topWidth, startPos,
             softmaxScale, (__nv_bfloat16*)output.cudaData, partAcc, partMx, partL,
-            ringMode, ringRowBytes, cmpMode, cmpRowBytes, V41Fp4VecUnpack() ? 1 : 0);
+            ringMode, ringRowBytes, cmpMode, cmpRowBytes, vecUnpack ? 1 : 0);
         if (splits > 1) {
             V41SparseMergeKernel<<<tokens * heads, 128>>>(partAcc, partMx, partL, tokens, heads, splits,
                                                           (__nv_bfloat16*)output.cudaData);

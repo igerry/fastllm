@@ -1274,9 +1274,9 @@ namespace {
         const unsigned negInf = V41FloatKey(-INFINITY);
 
         // ---- 候选块下标的升序压缩 ----
-        const bool compact = cand != nullptr && listCap > 0 && numBlocks <= listCap && blockShift >= 0;
+        const bool canCompact = cand != nullptr && listCap > 0 && blockShift >= 0;
         int nCandBlocks = 0;
-        if (compact) {
+        if (canCompact) {
             int running = 0;
             for (int st = 0; st < numBlocks; st += kSelThreads) {
                 const int blk = st + threadIdx.x;
@@ -1284,13 +1284,15 @@ namespace {
                 int rank = 0, tot = 0;
                 BlockScan(scanStorage).ExclusiveSum(keepIt, rank, tot);
                 __syncthreads();
-                if (keepIt) {
+                if (keepIt && running + rank < listCap) {
                     candList[running + rank] = blk;
                 }
                 running += tot;
             }
             nCandBlocks = running;
         }
+        // 候选块个数超出压缩表容量时退回逐 j 查掩码（结果不变，只是多扫一些）
+        const bool compact = canCompact && nCandBlocks <= listCap;
         const int nDomain = compact ? (nCandBlocks << blockShift) : visible;
 
         // p（压缩域下标）-> j（原始候选下标）；compact 时 j 一定落在候选块内
@@ -2378,10 +2380,12 @@ extern "C" bool FastllmCudaDeepSeekV41IndexerTopK(const fastllm::Data &score, co
             break;
         }
     }
-    // 候选块下标的压缩表放动态共享内存；太大就不压缩（改为逐 j 查掩码）
+    // 候选块下标的压缩表放动态共享内存。容量按 numBlocks 取，但封顶 4096（16 KB）：
+    // 真实配置里候选块数是 candidate_topk_blocks（2048）量级，远小于长上下文的 numBlocks，
+    // 所以封顶后绝大多数情况仍然能压缩；真的装不下时 kernel 内部会退回逐 j 查掩码。
     const int kListCap = 4096;
-    const int listCap = (cand != nullptr && blockShift >= 0 && numBlocks > 0 && numBlocks <= kListCap)
-                        ? numBlocks : 0;
+    const int listCap = (cand != nullptr && blockShift >= 0 && numBlocks > 0)
+                        ? std::min(numBlocks, kListCap) : 0;
     V41TopKKernel<<<bsz * seqlen, kSelThreads, (size_t)listCap * sizeof(int)>>>(
         (const float*)score.cudaData, cand, seqlen, m, numBlocks, bs, blockShift, width,
         ratio, startPos, listCap, (int32_t*)output.cudaData);

@@ -87,10 +87,10 @@ FP8→BF16）、`wkv`（投影）、`apply`（门控写回）。后两段在 GPU
 
 | 开关 | 作用 |
 |---|---|
-| `FASTLLM_DSV41_ENGRAM_POOL=1` | 查表改用 fastllm 的常驻线程池，替掉每次调用现场 create/join 最多 32 个 `std::thread` 的写法。输出逐位相同，prefill 收益最明显。 |
+| `FASTLLM_DSV41_ENGRAM_POOL`（默认开，=0 关） | 查表改用 fastllm 的常驻线程池，替掉每次调用现场 create/join 最多 32 个 `std::thread` 的写法。输出逐位相同，prefill 收益最明显。 |
 | `FASTLLM_DSV41_ENGRAM_PREFETCH=1` | 跨层预取。n-gram 哈希只依赖 token 历史，两个 Engram 层（默认层 1 与层 14）的行号在进入第 0 层之前就已经全部确定，所以可以在前一个 Engram 层计算时用后台线程把下一层的行号算好、并把要用的表行摸进 cache。后台线程只看历史窗口的快照，不引用请求状态。 |
 | `FASTLLM_DSV41_ENGRAM_MADVISE=random / hugepage / both` | 表是纯随机访问：`random` 打 `MADV_RANDOM` 关掉内核预读（mmap 模式下最有用）；`hugepage` 让常驻表改用匿名 mmap + `MADV_HUGEPAGE` 分配（100 GB 用 4 KB 页要 2500 万个 PTE，随机查表几乎每次 TLB miss），顺带省掉 `std::vector` 的 100 GB 清零，加载也更快。 |
-| `FASTLLM_DSV41_ENGRAM_WKV_FP8=1` | `layers.{1,14}.engram.wkv.weight` 在真实权重里本来就是 F8_E4M3 + UE8M0 块 scale（`[25600, 6144]`，block 32x32），默认会被解量化成启动 dtype（float16），每层 157 MB 变 314 MB。打开后按原样保留 FP8，**不做任何重量化**——权重数值就是 checkpoint 里的那份，比解成 float16 还少一次舍入；省下每层 157 MB 显存与同样多的每步带宽。只有伴随的 `.scale` 张量存在时才切换，权重是 BF16 的迷你模型不受影响。 |
+| `FASTLLM_DSV41_ENGRAM_WKV_FP8`（默认开，=0 关） | `layers.{1,14}.engram.wkv.weight` 在真实权重里本来就是 F8_E4M3 + UE8M0 块 scale（`[25600, 6144]`，block 32x32），默认会被解量化成启动 dtype（float16），每层 157 MB 变 314 MB。打开后按原样保留 FP8，**不做任何重量化**——权重数值就是 checkpoint 里的那份，比解成 float16 还少一次舍入；省下每层 157 MB 显存与同样多的每步带宽。只有伴随的 `.scale` 张量存在时才切换，权重是 BF16 的迷你模型不受影响。 |
 
 ## 启动
 

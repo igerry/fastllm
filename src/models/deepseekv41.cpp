@@ -101,6 +101,12 @@ namespace fastllm {
             return v != nullptr && v[0] != '\0' && strcmp(v, "0") != 0;
         }
 
+        // 默认开启的开关：显式设成 0 才关掉
+        bool V41EnvFlagOn(const char *name) {
+            const char *v = std::getenv(name);
+            return v == nullptr || v[0] == '\0' || strcmp(v, "0") != 0;
+        }
+
         // ---------------- Engram 计时 ----------------
         // FASTLLM_DSV41_ENGRAM_PROFILE=1 累计统计，=2 额外逐次打印。
         // 分成：hash（算行号）、prep（准备输出 Data）、gather（读表 + FP8→BF16）、
@@ -1313,7 +1319,9 @@ namespace fastllm {
         // FASTLLM_DSV41_ENGRAM_WKV_FP8=1 时按原样保留 FP8，不做任何重量化，
         // 数值上就是 checkpoint 里的那份权重（比解成 float16 少一次舍入）。
         // 只有伴随 .scale 张量存在时才生效，BF16 权重的迷你模型不受影响。
-        static const bool wkvFp8 = V41EnvFlag("FASTLLM_DSV41_ENGRAM_WKV_FP8");
+        // 默认开启：保留 checkpoint 里的 FP8 比解量化成 float16 少一次舍入，且省约 300 MB 显存。
+        // FASTLLM_DSV41_ENGRAM_WKV_FP8=0 可退回解量化。
+        static const bool wkvFp8 = V41EnvFlagOn("FASTLLM_DSV41_ENGRAM_WKV_FP8");
         std::set<std::string> tensorNameSet;
         if (wkvFp8) {
             tensorNameSet.insert(tensorNames.begin(), tensorNames.end());
@@ -1663,8 +1671,8 @@ namespace fastllm {
         };
         // FASTLLM_DSV41_ENGRAM_POOL=1：改用 fastllm 常驻线程池。原来的实现每次调用都
         // 现场 create/join 最多 32 个 std::thread，prefill 时这笔固定开销比查表本身还大。
-        // 结果逐位相同（只是换了执行 worker 的线程），默认仍走旧路径。
-        static const bool usePool = V41EnvFlag("FASTLLM_DSV41_ENGRAM_POOL");
+        // 结果逐位相同（只是换了执行 worker 的线程），默认开启；=0 可退回每次现场建线程。
+        static const bool usePool = V41EnvFlagOn("FASTLLM_DSV41_ENGRAM_POOL");
         if (usePool) {
             AliveThreadPool *pool = GetAlivePool();
             int threadSt = pool->curActivateThreadInterval.first;

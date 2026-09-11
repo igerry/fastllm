@@ -6893,10 +6893,14 @@ namespace fastllm {
         Data &q = *(datas.find("q")->second);
         Data &k = *(datas.find("k")->second);
         Data &weights = *(datas.find("weights")->second);
-        return q.dims.size() == 4 && k.dims.size() == 3 && q.dims[3] == 128 && k.dims[2] == 128 &&
+        // k 可以是 BF16/FP32 的 [b, m, 128]，也可以是量化缓存行（INT8，行宽 132 / 72 / 68）
+        const bool kQuant = k.dataType == DataType::INT8 &&
+                            (k.dims[2] == 132 || k.dims[2] == 72 || k.dims[2] == 68);
+        return q.dims.size() == 4 && k.dims.size() == 3 && q.dims[3] == 128 &&
                weights.dataType == DataType::FLOAT32 &&
                (q.dataType == DataType::BFLOAT16 || q.dataType == DataType::FLOAT32) &&
-               (k.dataType == DataType::BFLOAT16 || k.dataType == DataType::FLOAT32);
+               (kQuant || (k.dims[2] == 128 &&
+                           (k.dataType == DataType::BFLOAT16 || k.dataType == DataType::FLOAT32)));
     }
 
     void CudaDeepSeekV41IndexerScoreOp::Run(const std::string &opType, const fastllm::DataDict &datas,
@@ -6986,14 +6990,21 @@ namespace fastllm {
     bool CudaDeepSeekV41QuantizeKVOp::CanRun(const std::string &opType, const fastllm::DataDict &datas,
                                              const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
         Data &input = *(datas.find("input")->second);
-        return input.dims.size() == 3 && input.dims[2] % 32 == 0 &&
+        auto blockIt = intParams.find("quantBlock");
+        int quantBlock = blockIt == intParams.end() ? 32 : blockIt->second;
+        return input.dims.size() == 3 && quantBlock > 0 && input.dims[2] % quantBlock == 0 &&
                (input.dataType == DataType::BFLOAT16 || input.dataType == DataType::FLOAT32 ||
                 input.dataType == DataType::FLOAT16);
     }
 
     void CudaDeepSeekV41QuantizeKVOp::Run(const std::string &opType, const fastllm::DataDict &datas,
                                           const fastllm::FloatDict &floatParams, const fastllm::IntDict &intParams) {
-        if (!FastllmCudaDeepSeekV41QuantizeKV(*(datas.find("input")->second), *(datas.find("output")->second))) {
+        auto modeIt = intParams.find("quantMode");
+        auto blockIt = intParams.find("quantBlock");
+        int quantMode = modeIt == intParams.end() ? 1 : modeIt->second;
+        int quantBlock = blockIt == intParams.end() ? 32 : blockIt->second;
+        if (!FastllmCudaDeepSeekV41QuantizeKV(*(datas.find("input")->second), *(datas.find("output")->second),
+                                              quantMode, quantBlock)) {
             ErrorInFastLLM("DeepSeekV41QuantizeKV CUDA error: kernel rejected input.\n");
         }
     }

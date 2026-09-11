@@ -124,6 +124,71 @@ namespace {
         return q * scale;
     }
 
+    // E2M1 编码：bit3 符号，bit2..0 是网格下标。r 必须已在 E2M1 网格上。
+    __device__ __forceinline__ uint8_t V41EncodeFp4Dev(float r) {
+        const float grid[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+        uint8_t sign = signbit(r) ? 8 : 0;
+        float a = fabsf(r);
+        int idx = 0;
+#pragma unroll
+        for (int i = 1; i < 8; i++) {
+            if (grid[i] <= a) {
+                idx = i;
+            }
+        }
+        return sign | (uint8_t)idx;
+    }
+
+    __device__ __forceinline__ float V41DecodeFp4Dev(int code) {
+        const float grid[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+        float v = grid[code & 7];
+        return (code & 8) ? -v : v;
+    }
+
+    // 量化缓存行的解码（布局见 cpu/deepseekv41ops.cpp 顶部的说明）：
+    //   quantMode 1：[dim 个 E4M3][dim/32 个 UE8M0]
+    //   quantMode 3：[dim/2 字节打包 E2M1][dim/16 个 E4M3]
+    //   quantMode 2：[dim/2 字节打包 E2M1][dim/32 个 UE8M0]
+    __device__ __forceinline__ float V41LoadFp8Row(const uint8_t *row, int dim, int d) {
+        __nv_fp8_e4m3 c;
+        c.__x = row[d];
+        return (float)c * ldexpf(1.0f, (int)row[dim + (d >> 5)] - 127);
+    }
+
+    __device__ __forceinline__ float V41LoadKvRow(const uint8_t *row, int dim, int d, int quantMode) {
+        if (quantMode == 1) {
+            return V41LoadFp8Row(row, dim, d);
+        }
+        const uint8_t *scales = row + (dim >> 1);
+        const uint8_t packed = row[d >> 1];
+        const float v = V41DecodeFp4Dev((d & 1) ? (packed >> 4) : (packed & 0xF));
+        if (quantMode == 3) {
+            __nv_fp8_e4m3 s;
+            s.__x = scales[d >> 4];
+            return v * (float)s;
+        }
+        return v * ldexpf(1.0f, (int)scales[d >> 5] - 127);
+    }
+
+    // (quantMode, blockSize) -> 每行字节数；与 CPU 侧 V41KvRowBytes 一致
+    inline int V41KvRowBytesHost(int dim, int quantMode, int blockSize) {
+        return (quantMode == 1 ? dim : dim / 2) + dim / blockSize;
+    }
+
+    // 由行宽反推布局
+    inline bool V41ParseKvRowHost(int dim, int rowBytes, int *quantMode, int *blockSize) {
+        if (rowBytes == V41KvRowBytesHost(dim, 1, 32)) {
+            *quantMode = 1; *blockSize = 32; return true;
+        }
+        if (rowBytes == V41KvRowBytesHost(dim, 3, 16)) {
+            *quantMode = 3; *blockSize = 16; return true;
+        }
+        if (rowBytes == V41KvRowBytesHost(dim, 2, 32)) {
+            *quantMode = 2; *blockSize = 32; return true;
+        }
+        return false;
+    }
+
     struct V41RopeTable {
         float invFreq[64];
         int pairs;
@@ -596,9 +661,11 @@ namespace {
 
     constexpr int kIdxThreads = 128;
 
+    // k8 != nullptr 时 key 来自量化缓存行（打包 FP4 或 FP8），逐元素解码后参与点积
     template <typename QT, typename KT>
     __global__ void V41IndexerScoreKernel(const QT *q, const float *weights, const KT *k,
-                                          int seqlen, int heads, int dim, int m, float *out) {
+                                          int seqlen, int heads, int dim, int m, float *out,
+                                          const uint8_t *k8 = nullptr, int kMode = 1, int kRowBytes = 0) {
         extern __shared__ float qs[];   // heads * dim + heads
         const int t = blockIdx.y;       // b * seqlen + i
         const int b = t / seqlen;
@@ -614,10 +681,17 @@ namespace {
         if (j >= m) {
             return;
         }
-        const KT *krow = k + ((uint64_t)b * m + j) * dim;
         float kvals[128];
-        for (int d = 0; d < dim; d++) {
-            kvals[d] = V41Load<KT>(krow, d);
+        if (k8 != nullptr) {
+            const uint8_t *krow8 = k8 + ((uint64_t)b * m + j) * kRowBytes;
+            for (int d = 0; d < dim; d++) {
+                kvals[d] = V41LoadKvRow(krow8, dim, d, kMode);
+            }
+        } else {
+            const KT *krow = k + ((uint64_t)b * m + j) * dim;
+            for (int d = 0; d < dim; d++) {
+                kvals[d] = V41Load<KT>(krow, d);
+            }
         }
         float total = 0.0f;
         for (int h = 0; h < heads; h++) {
@@ -689,7 +763,8 @@ namespace {
 
     __global__ void __launch_bounds__(kIdxMmaThreads)
     V41IndexerScoreMmaKernel(const __nv_bfloat16 *q, const float *weights, const __nv_bfloat16 *k,
-                             int seqlen, int heads, int m, int ratio, int startPos, float *out) {
+                             int seqlen, int heads, int m, int ratio, int startPos, float *out,
+                             const uint8_t *k8, int kMode, int kRowBytes) {
 #if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800)
         __shared__ V41IdxShared sh;
         const int j0 = blockIdx.x * kIdxBJ;
@@ -714,11 +789,18 @@ namespace {
 
         for (int v = threadIdx.x; v < kIdxBJ * (kIdxDim / 8); v += kIdxMmaThreads) {
             int jj = v / (kIdxDim / 8), dv = v % (kIdxDim / 8);
-            if (j0 + jj < m) {
+            if (j0 + jj >= m) {
+                *((float4*)&sh.ks[jj][dv * 8]) = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            } else if (k8 != nullptr) {
+                // 量化 key：就地解到 BF16 片段再进 mma（FP4 的值在 BF16 上是精确的）
+                const uint8_t *krow8 = k8 + ((uint64_t)b * m + j0 + jj) * kRowBytes;
+#pragma unroll
+                for (int e = 0; e < 8; e++) {
+                    sh.ks[jj][dv * 8 + e] = __float2bfloat16_rn(V41LoadKvRow(krow8, kIdxDim, dv * 8 + e, kMode));
+                }
+            } else {
                 *((float4*)&sh.ks[jj][dv * 8]) =
                     *((const float4*)(k + ((uint64_t)b * m + j0 + jj) * kIdxDim) + dv);
-            } else {
-                *((float4*)&sh.ks[jj][dv * 8]) = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             }
         }
 
@@ -1028,12 +1110,6 @@ namespace {
     constexpr int kAttnLanes = 8;
     constexpr int kAttnThreads = kAttnHeadsPerBlock * kAttnLanes;   // 256
 
-    // FP8 缓存行：[dim 个 E4M3][dim / 32 个 UE8M0]
-    __device__ __forceinline__ float V41LoadFp8Row(const uint8_t *row, int dim, int d) {
-        __nv_fp8_e4m3 c;
-        c.__x = row[d];
-        return (float)c * ldexpf(1.0f, (int)row[dim + (d >> 5)] - 127);
-    }
 
     template <typename QT>
     __global__ void __launch_bounds__(kAttnThreads)
@@ -1042,7 +1118,8 @@ namespace {
                              const int32_t *cmpIdx,
                              const float *sink, int seqlen, int heads, int dim,
                              int windowSize, int cap, int topWidth, int startPos,
-                             float scale, __nv_bfloat16 *out) {
+                             float scale, __nv_bfloat16 *out,
+                             int ringMode, int ringRowBytes, int cmpMode, int cmpRowBytes) {
         __shared__ float kvRow[512];
         const int t = blockIdx.x;                  // b * seqlen + i
         const int b = t / seqlen, i = t % seqlen;
@@ -1067,16 +1144,17 @@ namespace {
         const int winCount = pos - winStart + 1;
         const int cmpCount = cmpIdx == nullptr ? 0 : topWidth;
         const int32_t *idxRow = cmpIdx == nullptr ? nullptr : cmpIdx + (uint64_t)t * topWidth;
-        const int rowBytes8 = dim + (dim >> 5);
         for (int c = 0; c < winCount + cmpCount; c++) {
             const __nv_bfloat16 *src = nullptr;
             const uint8_t *src8 = nullptr;
+            int src8Mode = 1;
             if (c < winCount) {
                 int p = winStart + c;
                 if (p >= startPos) {
                     src = chunkKV + ((uint64_t)b * seqlen + (p - startPos)) * dim;
                 } else if (ringKV8 != nullptr) {
-                    src8 = ringKV8 + ((uint64_t)b * windowSize + (p % windowSize)) * rowBytes8;
+                    src8 = ringKV8 + ((uint64_t)b * windowSize + (p % windowSize)) * ringRowBytes;
+                    src8Mode = ringMode;
                 } else {
                     src = ringKV + ((uint64_t)b * windowSize + (p % windowSize)) * dim;
                 }
@@ -1086,7 +1164,8 @@ namespace {
                     continue;
                 }
                 if (compressedKV8 != nullptr) {
-                    src8 = compressedKV8 + ((uint64_t)b * cap + idx) * rowBytes8;
+                    src8 = compressedKV8 + ((uint64_t)b * cap + idx) * cmpRowBytes;
+                    src8Mode = cmpMode;
                 } else {
                     src = compressedKV + ((uint64_t)b * cap + idx) * dim;
                 }
@@ -1094,7 +1173,7 @@ namespace {
             __syncthreads();
             if (src8 != nullptr) {
                 for (int d = threadIdx.x; d < dim; d += kAttnThreads) {
-                    kvRow[d] = V41LoadFp8Row(src8, dim, d);
+                    kvRow[d] = V41LoadKvRow(src8, dim, d, src8Mode);
                 }
             } else {
                 for (int d = threadIdx.x; d < dim; d += kAttnThreads) {
@@ -1171,7 +1250,8 @@ namespace {
                                 const __nv_bfloat16 *compressedKV, const uint8_t *ringKV8, const uint8_t *compressedKV8,
                                 const int32_t *cmpIdx, const float *sink, int seqlen, int heads,
                                 int windowSize, int cap, int topWidth, int startPos, float scale,
-                                __nv_bfloat16 *out, float *partAcc, float *partMx, float *partL) {
+                                __nv_bfloat16 *out, float *partAcc, float *partMx, float *partL,
+                                int ringMode, int ringRowBytes, int cmpMode, int cmpRowBytes) {
 #if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800)
         extern __shared__ char v41MmaSharedRaw[];
         V41MmaShared &sh = *reinterpret_cast<V41MmaShared*>(v41MmaSharedRaw);
@@ -1197,7 +1277,6 @@ namespace {
         const int winCount = pos - winStart + 1;
         const int cmpCount = cmpIdx == nullptr ? 0 : topWidth;
         const int32_t *idxRow = cmpIdx == nullptr ? nullptr : cmpIdx + (uint64_t)t * topWidth;
-        const int rowBytes8 = kMmaDim + (kMmaDim >> 5);
         const int totalCand = winCount + cmpCount;
         const int tilesTotal = (totalCand + kMmaNC - 1) / kMmaNC;
         const int tilesPerSplit = (tilesTotal + (int)gridDim.z - 1) / (int)gridDim.z;
@@ -1229,6 +1308,7 @@ namespace {
                 const int c = tileStart + slot;
                 const __nv_bfloat16 *src = nullptr;
                 const uint8_t *src8 = nullptr;
+                int src8Mode = 1;
                 bool ok = c < totalCand;
                 if (ok) {
                     if (c < winCount) {
@@ -1236,7 +1316,8 @@ namespace {
                         if (p >= startPos) {
                             src = chunkKV + ((uint64_t)b * seqlen + (p - startPos)) * kMmaDim;
                         } else if (ringKV8 != nullptr) {
-                            src8 = ringKV8 + ((uint64_t)b * windowSize + (p % windowSize)) * rowBytes8;
+                            src8 = ringKV8 + ((uint64_t)b * windowSize + (p % windowSize)) * ringRowBytes;
+                            src8Mode = ringMode;
                         } else {
                             src = ringKV + ((uint64_t)b * windowSize + (p % windowSize)) * kMmaDim;
                         }
@@ -1245,7 +1326,8 @@ namespace {
                         if (idx < 0 || idx >= cap) {
                             ok = false;
                         } else if (compressedKV8 != nullptr) {
-                            src8 = compressedKV8 + ((uint64_t)b * cap + idx) * rowBytes8;
+                            src8 = compressedKV8 + ((uint64_t)b * cap + idx) * cmpRowBytes;
+                            src8Mode = cmpMode;
                         } else {
                             src = compressedKV + ((uint64_t)b * cap + idx) * kMmaDim;
                         }
@@ -1256,8 +1338,9 @@ namespace {
                         *((float4*)&sh.kvs[slot][v * 8]) = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
                     }
                 } else if (src8 != nullptr) {
+                    // 就地解到 BF16 片段再进 mma；FP4 的值在 BF16 上是精确的
                     for (int d = lane; d < kMmaDim; d += 32) {
-                        sh.kvs[slot][d] = __float2bfloat16_rn(V41LoadFp8Row(src8, kMmaDim, d));
+                        sh.kvs[slot][d] = __float2bfloat16_rn(V41LoadKvRow(src8, kMmaDim, d, src8Mode));
                     }
                 } else {
                     for (int v = lane; v < kMmaDim / 8; v += 32) {
@@ -1457,28 +1540,57 @@ namespace {
 
     constexpr int kKvQuantThreads = 128;
 
-    // 每个 block 处理一行；每个 warp 处理 32 个一组的块，lane 对应块内元素
+    // 每个 block 处理一行；blockSize 个线程为一组处理一个 scale 块，lane 对应块内元素。
+    // scale 的推导（V41QuantScaleDev）与伪量化 (DeepSeekV41FakeQuantRow) 共用，
+    // 因此对已伪量化过的行是幂等的，即 FP4 / FP8 存储无损。
     template <typename T>
-    __global__ void V41QuantizeKVKernel(const T *input, uint8_t *output, int rows, int dim) {
+    __global__ void V41QuantizeKVKernel(const T *input, uint8_t *output, int rows, int dim,
+                                        int quantMode, int blockSize, int rowBytes) {
         const int row = blockIdx.x;
         if (row >= rows) {
             return;
         }
-        const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-        const int nblocks = dim >> 5;
+        const int nblocks = dim / blockSize;
+        const int groups = kKvQuantThreads / blockSize;
+        const int gid = threadIdx.x / blockSize;
+        const int lane = threadIdx.x % blockSize;
         const T *src = input + (uint64_t)row * dim;
-        uint8_t *dst = output + (uint64_t)row * (dim + nblocks);
-        uint8_t *scales = dst + dim;
-        for (int blk = warp; blk < nblocks; blk += kKvQuantThreads / 32) {
-            float v = V41Load<T>(src, blk * 32 + lane);
-            float amax = V41WarpMax(fabsf(v));
-            float scale = V41Pow2CeilDev(fmaxf(amax, 1e-4f) * (1.0f / 448.0f));
-            float q = fminf(448.0f, fmaxf(-448.0f, v / scale));
-            __nv_fp8_e4m3 code(q);
-            dst[blk * 32 + lane] = code.__x;
-            if (lane == 0) {
-                int e = (int)((__float_as_uint(scale) >> 23) & 0xFF);   // scale 为正的 2 的幂
-                scales[blk] = (uint8_t)e;
+        uint8_t *dst = output + (uint64_t)row * rowBytes;
+        uint8_t *scales = dst + (quantMode == 1 ? dim : dim / 2);
+        const float qmax = quantMode == 1 ? 448.0f : 6.0f;
+        // 固定迭代次数，保证组内所有 lane 都参与 __shfl（否则归约会读到未定义值）
+        const int iters = (nblocks + groups - 1) / groups;
+        for (int it = 0; it < iters; it++) {
+            const int blk = it * groups + gid;
+            const int i = blk * blockSize + lane;
+            const bool valid = blk < nblocks;
+            float v = valid ? V41Load<T>(src, i) : 0.0f;
+            float amax = fabsf(v);
+            for (int o = blockSize >> 1; o > 0; o >>= 1) {
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, o));
+            }
+            const float scale = V41QuantScaleDev(amax, quantMode);
+            const float q = fminf(qmax, fmaxf(-qmax, v / scale));
+            if (quantMode == 1) {
+                __nv_fp8_e4m3 code(q);
+                if (valid) {
+                    dst[i] = code.__x;
+                }
+            } else {
+                unsigned code = V41EncodeFp4Dev(V41Fp4RoundTripDev(q));
+                unsigned hi = __shfl_down_sync(0xffffffff, code, 1);
+                if (valid && (lane & 1) == 0) {
+                    dst[i >> 1] = (uint8_t)(code | (hi << 4));
+                }
+            }
+            if (valid && lane == 0) {
+                if (quantMode == 3) {
+                    __nv_fp8_e4m3 sc(scale);            // scale 已在 E4M3 网格上
+                    scales[blk] = sc.__x;
+                } else {
+                    int e = (int)((__float_as_uint(scale) >> 23) & 0xFF);   // scale 为正的 2 的幂
+                    scales[blk] = (uint8_t)e;
+                }
             }
         }
     }
@@ -1739,14 +1851,20 @@ extern "C" bool FastllmCudaDeepSeekV41Compress(const fastllm::Data &kv, const fa
 extern "C" bool FastllmCudaDeepSeekV41IndexerScore(const fastllm::Data &q, const fastllm::Data &weights,
                                                    const fastllm::Data &k, int ratio, int startPos,
                                                    fastllm::Data &output) {
+    const bool kQuant = k.dataType == DataType::INT8;
+    int kMode = 1, kBlock = 32;
     if (!V41OnCuda(q) || !V41OnCuda(weights) || !V41OnCuda(k) || q.dims.size() != 4 || k.dims.size() != 3 ||
-        q.dims[3] != 128 || k.dims[2] != 128 || weights.dataType != DataType::FLOAT32 ||
+        q.dims[3] != 128 || weights.dataType != DataType::FLOAT32 ||
         (q.dataType != DataType::BFLOAT16 && q.dataType != DataType::FLOAT32) ||
-        (k.dataType != DataType::BFLOAT16 && k.dataType != DataType::FLOAT32)) {
+        (kQuant ? !V41ParseKvRowHost(128, k.dims[2], &kMode, &kBlock)
+                : (k.dims[2] != 128 ||
+                   (k.dataType != DataType::BFLOAT16 && k.dataType != DataType::FLOAT32)))) {
         return false;
     }
     int bsz = q.dims[0], seqlen = q.dims[1], heads = q.dims[2], dim = q.dims[3];
     int m = k.dims[1];
+    const uint8_t *k8 = kQuant ? (const uint8_t*)k.cudaData : nullptr;
+    const int kRowBytes = kQuant ? k.dims[2] : 0;
     if (!V41PrepareOutput(output, DataType::FLOAT32, {bsz, seqlen, m})) {
         return false;
     }
@@ -1754,18 +1872,29 @@ extern "C" bool FastllmCudaDeepSeekV41IndexerScore(const fastllm::Data &q, const
         return true;
     }
     // BF16 mma 快速路径（SM80+）；FASTLLM_DSV41_LEGACY_INDEXER=1 退回下面的标量 kernel
-    if (q.dataType == DataType::BFLOAT16 && k.dataType == DataType::BFLOAT16 && dim == kIdxDim &&
+    if (q.dataType == DataType::BFLOAT16 && (kQuant || k.dataType == DataType::BFLOAT16) && dim == kIdxDim &&
         V41MmaSupported() && !V41EnvOn("FASTLLM_DSV41_LEGACY_INDEXER")) {
         dim3 mmaGrid((m + kIdxBJ - 1) / kIdxBJ, (seqlen + kIdxBT - 1) / kIdxBT, bsz);
         V41IndexerScoreMmaKernel<<<mmaGrid, kIdxMmaThreads>>>(
-            (const __nv_bfloat16*)q.cudaData, (const float*)weights.cudaData, (const __nv_bfloat16*)k.cudaData,
-            seqlen, heads, m, ratio, startPos, (float*)output.cudaData);
+            (const __nv_bfloat16*)q.cudaData, (const float*)weights.cudaData,
+            kQuant ? nullptr : (const __nv_bfloat16*)k.cudaData,
+            seqlen, heads, m, ratio, startPos, (float*)output.cudaData, k8, kMode, kRowBytes);
         return V41CheckLaunch("IndexerScoreMma");
     }
 
     dim3 grid((m + kIdxThreads - 1) / kIdxThreads, bsz * seqlen);
     size_t shared = (size_t)(heads * dim + heads) * sizeof(float);
-    if (q.dataType == DataType::BFLOAT16 && k.dataType == DataType::BFLOAT16) {
+    if (kQuant) {
+        if (q.dataType == DataType::BFLOAT16) {
+            V41IndexerScoreKernel<__nv_bfloat16, __nv_bfloat16><<<grid, kIdxThreads, shared>>>(
+                (const __nv_bfloat16*)q.cudaData, (const float*)weights.cudaData, nullptr,
+                seqlen, heads, dim, m, (float*)output.cudaData, k8, kMode, kRowBytes);
+        } else {
+            V41IndexerScoreKernel<float, __nv_bfloat16><<<grid, kIdxThreads, shared>>>(
+                (const float*)q.cudaData, (const float*)weights.cudaData, nullptr,
+                seqlen, heads, dim, m, (float*)output.cudaData, k8, kMode, kRowBytes);
+        }
+    } else if (q.dataType == DataType::BFLOAT16 && k.dataType == DataType::BFLOAT16) {
         V41IndexerScoreKernel<__nv_bfloat16, __nv_bfloat16><<<grid, kIdxThreads, shared>>>(
             (const __nv_bfloat16*)q.cudaData, (const float*)weights.cudaData, (const __nv_bfloat16*)k.cudaData,
             seqlen, heads, dim, m, (float*)output.cudaData);
@@ -1852,19 +1981,21 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
     bool hasRing = ringKV != nullptr && ringKV->dims.size() == 3 && ringKV->Count(0) > 0;
     bool hasCmp = compressedKV != nullptr && cmpIdx != nullptr && compressedKV->dims.size() == 3 &&
                   compressedKV->Count(0) > 0 && cmpIdx->dims.size() == 3;
-    const int rowBytes8 = dim + dim / 32;
     bool ringFp8 = hasRing && ringKV->dataType == DataType::INT8;
     bool cmpFp8 = hasCmp && compressedKV->dataType == DataType::INT8;
+    int ringMode = 1, ringBlock = 32, cmpMode = 1, cmpBlock = 32;
     if (hasRing && (!V41OnCuda(*ringKV) || ringKV->dims[1] != windowSize ||
-                    !(ringFp8 ? ringKV->dims[2] == rowBytes8
+                    !(ringFp8 ? V41ParseKvRowHost(dim, ringKV->dims[2], &ringMode, &ringBlock)
                               : (ringKV->dataType == DataType::BFLOAT16 && ringKV->dims[2] == dim)))) {
         return false;
     }
     if (hasCmp && (!V41OnCuda(*compressedKV) || !V41OnCuda(*cmpIdx) || cmpIdx->dataType != DataType::INT32 ||
-                   !(cmpFp8 ? compressedKV->dims[2] == rowBytes8
+                   !(cmpFp8 ? V41ParseKvRowHost(dim, compressedKV->dims[2], &cmpMode, &cmpBlock)
                             : (compressedKV->dataType == DataType::BFLOAT16 && compressedKV->dims[2] == dim)))) {
         return false;
     }
+    const int ringRowBytes = hasRing && ringFp8 ? ringKV->dims[2] : 0;
+    const int cmpRowBytes = hasCmp && cmpFp8 ? compressedKV->dims[2] : 0;
     if (!hasRing && startPos > 0) {
         return false;
     }
@@ -1944,7 +2075,8 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
             cmpFp8 ? (const uint8_t*)compressedKV->cudaData : nullptr,
             hasCmp ? (const int32_t*)cmpIdx->cudaData : nullptr,
             (const float*)attnSink.cudaData, seqlen, heads, windowSize, cap, topWidth, startPos,
-            softmaxScale, (__nv_bfloat16*)output.cudaData, partAcc, partMx, partL);
+            softmaxScale, (__nv_bfloat16*)output.cudaData, partAcc, partMx, partL,
+            ringMode, ringRowBytes, cmpMode, cmpRowBytes);
         if (splits > 1) {
             V41SparseMergeKernel<<<tokens * heads, 128>>>(partAcc, partMx, partL, tokens, heads, splits,
                                                           (__nv_bfloat16*)output.cudaData);
@@ -1963,7 +2095,7 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
             cmpFp8 ? (const uint8_t*)compressedKV->cudaData : nullptr,
             hasCmp ? (const int32_t*)cmpIdx->cudaData : nullptr,
             (const float*)attnSink.cudaData, seqlen, heads, dim, windowSize, cap, topWidth, startPos,
-            softmaxScale, (__nv_bfloat16*)output.cudaData);
+            softmaxScale, (__nv_bfloat16*)output.cudaData, ringMode, ringRowBytes, cmpMode, cmpRowBytes);
     } else {
         dim3 grid(bsz * seqlen, heads / kAttnHeadsPerBlock);
         V41SparseAttentionKernel<float><<<grid, kAttnThreads>>>(
@@ -1974,7 +2106,7 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
             cmpFp8 ? (const uint8_t*)compressedKV->cudaData : nullptr,
             hasCmp ? (const int32_t*)cmpIdx->cudaData : nullptr,
             (const float*)attnSink.cudaData, seqlen, heads, dim, windowSize, cap, topWidth, startPos,
-            softmaxScale, (__nv_bfloat16*)output.cudaData);
+            softmaxScale, (__nv_bfloat16*)output.cudaData, ringMode, ringRowBytes, cmpMode, cmpRowBytes);
     }
     return V41CheckLaunch("SparseAttention");
 }
@@ -2000,12 +2132,17 @@ extern "C" bool FastllmCudaDeepSeekV41WindowStore(const fastllm::Data &chunk, fa
     return V41CheckLaunch("WindowStore");
 }
 
-extern "C" bool FastllmCudaDeepSeekV41QuantizeKV(const fastllm::Data &input, fastllm::Data &output) {
-    if (!V41OnCuda(input) || input.dims.size() != 3 || input.dims[2] % 32 != 0 || !V41IsFloatType(input.dataType)) {
+extern "C" bool FastllmCudaDeepSeekV41QuantizeKV(const fastllm::Data &input, fastllm::Data &output,
+                                                 int quantMode, int quantBlock) {
+    if (!V41OnCuda(input) || input.dims.size() != 3 || !V41IsFloatType(input.dataType) ||
+        (quantMode != 1 && quantMode != 2 && quantMode != 3) ||
+        (quantBlock != 16 && quantBlock != 32) || input.dims[2] % quantBlock != 0 ||
+        input.dims[2] % 2 != 0 || kKvQuantThreads % quantBlock != 0) {
         return false;
     }
     int rows = input.dims[0] * input.dims[1], dim = input.dims[2];
-    if (!V41PrepareOutput(output, DataType::INT8, {input.dims[0], input.dims[1], dim + dim / 32})) {
+    const int rowBytes = V41KvRowBytesHost(dim, quantMode, quantBlock);
+    if (!V41PrepareOutput(output, DataType::INT8, {input.dims[0], input.dims[1], rowBytes})) {
         return false;
     }
     if (rows == 0) {
@@ -2013,13 +2150,16 @@ extern "C" bool FastllmCudaDeepSeekV41QuantizeKV(const fastllm::Data &input, fas
     }
     if (input.dataType == DataType::BFLOAT16) {
         V41QuantizeKVKernel<__nv_bfloat16><<<rows, kKvQuantThreads>>>(
-            (const __nv_bfloat16*)input.cudaData, (uint8_t*)output.cudaData, rows, dim);
+            (const __nv_bfloat16*)input.cudaData, (uint8_t*)output.cudaData, rows, dim,
+            quantMode, quantBlock, rowBytes);
     } else if (input.dataType == DataType::FLOAT16) {
         V41QuantizeKVKernel<half><<<rows, kKvQuantThreads>>>(
-            (const half*)input.cudaData, (uint8_t*)output.cudaData, rows, dim);
+            (const half*)input.cudaData, (uint8_t*)output.cudaData, rows, dim,
+            quantMode, quantBlock, rowBytes);
     } else {
         V41QuantizeKVKernel<float><<<rows, kKvQuantThreads>>>(
-            (const float*)input.cudaData, (uint8_t*)output.cudaData, rows, dim);
+            (const float*)input.cudaData, (uint8_t*)output.cudaData, rows, dim,
+            quantMode, quantBlock, rowBytes);
     }
     return V41CheckLaunch("QuantizeKV");
 }

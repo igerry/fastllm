@@ -60,6 +60,9 @@ def parse_args():
     parser.add_argument("--moe-inter-dim", type=int, default=-1,
                         help="生成时覆盖 moe_intermediate_size（MoE 测速用）")
     parser.add_argument("--candidate-topk-blocks", type=int, default=-1, help="覆盖 candidate_topk_blocks")
+    parser.add_argument("--layers-config", default="",
+                        help="覆盖层布局，格式 n_layers:compress_ratios:kv_source:index_source:engram_layers:candidate_layer，"
+                             "例如 22:0,0,2,...:2,8,14,20:2,8,14,20:2:14（用于复现真实 config 的 KV 几何）")
     return parser.parse_args()
 
 
@@ -657,6 +660,15 @@ def main():
                          compress_ratios=(0, 2, 1, 1), kv_source_layers=(1, 2), index_source_layers=(1, 2, 3),
                          candidate_source_layer=2, candidate_topk_blocks=2048, candidate_block_size=8,
                          index_n_heads=32, engram_layer_ids=(1,)))
+    if args.layers_config:
+        parts = args.layers_config.split(":")
+        TINY["n_layers"] = int(parts[0])
+        TINY["compress_ratios"] = tuple(int(x) for x in parts[1].split(","))
+        TINY["kv_source_layers"] = tuple(int(x) for x in parts[2].split(","))
+        TINY["index_source_layers"] = tuple(int(x) for x in parts[3].split(","))
+        TINY["engram_layer_ids"] = tuple(int(x) for x in parts[4].split(",")) if parts[4] else ()
+        TINY["candidate_source_layer"] = int(parts[5])
+        assert len(TINY["compress_ratios"]) == TINY["n_layers"], "compress_ratios 长度要等于 n_layers"
     if args.dim > 0:
         TINY["dim"] = args.dim
     if args.moe_inter_dim > 0:

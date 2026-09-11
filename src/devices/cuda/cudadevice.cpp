@@ -7516,6 +7516,12 @@ namespace fastllm {
         std::vector<int> dims = input0.dims;
         std::vector<int> oldDims = dims;
         dims[axis] += input1.dims[axis];
+        // 追加分支原来没有容量检查（上面的"空 input0"分支是有的）。容量不够时
+        // Resize 不会重新分配，下面的 memcpy2D 直接写出界，只会在之后某个不相关的
+        // CUDA 调用上报 illegal address。这里按空分支同样的方式先拦住。
+        AssertInFastLLM(input0.expansionDims.size() == dims.size() &&
+                        dims[axis] <= input0.expansionDims[axis],
+                        "CatDirect Error: input0's expansion size is not enough.\n");
         input0.Resize(dims);
         int outer = input0.Count(0) / input0.Count(axis);
         int input0Stride = input0.Count(axis);

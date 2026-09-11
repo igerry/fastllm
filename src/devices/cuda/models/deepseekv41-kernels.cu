@@ -139,10 +139,16 @@ namespace {
         return sign | (uint8_t)idx;
     }
 
+    // E2M1 -> float，纯位运算（不再查表，省掉每个元素一次 local / constant 访存）：
+    //   c == 0 -> 0；c == 1 -> 0.5（E2M1 的次正规）；c >= 2 -> (1 + 0.5 * (c & 1)) * 2^((c >> 1) - 1)
+    // 与旧的 grid[] 查表逐 bit 相同（含 code == 8 时的 -0.0）。
     __device__ __forceinline__ float V41DecodeFp4Dev(int code) {
-        const float grid[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
-        float v = grid[code & 7];
-        return (code & 8) ? -v : v;
+        const int c = code & 7;
+        uint32_t bits = c == 0 ? 0u
+                               : ((((uint32_t)(126 + (c >> 1))) << 23) |
+                                  ((c >= 2 ? (uint32_t)(c & 1) : 0u) << 22));
+        bits |= ((uint32_t)(code & 8)) << 28;
+        return __uint_as_float(bits);
     }
 
     // 量化缓存行的解码（布局见 cpu/deepseekv41ops.cpp 顶部的说明）：
@@ -168,6 +174,56 @@ namespace {
             return v * (float)s;
         }
         return v * ldexpf(1.0f, (int)scales[d >> 5] - 127);
+    }
+
+    __device__ __forceinline__ uint32_t V41Pack2Bf16(float a, float b) {
+        __nv_bfloat162 v = __halves2bfloat162(__float2bfloat16_rn(a), __float2bfloat16_rn(b));
+        return *reinterpret_cast<const uint32_t*>(&v);
+    }
+
+    // 一次展开 8 个连续元素并直接写成 mma 片段需要的 16 字节 BF16。
+    //
+    // 要求 (d0 & 7) == 0、dst 16 字节对齐。
+    // 8 个元素落在同一个 scale 块内（blockSize 是 16 或 32），所以 scale 只算一次；
+    // 打包 FP4 的 4 个字节按一次 uint32 读出（缓存行起始与 4 字节对齐：三种 rowBytes
+    // 都是 4 的倍数，d0 >> 1 也是 4 的倍数），FP8 按两次 uint32 读出。
+    // 数值与逐元素的 V41LoadKvRow + __float2bfloat16_rn 逐 bit 相同。
+    __device__ __forceinline__ void V41LoadKvRow8Bf16(const uint8_t *row, int dim, int d0,
+                                                      int quantMode, __nv_bfloat16 *dst) {
+        uint32_t o[4];
+        if (quantMode == 1) {
+            const float scale = ldexpf(1.0f, (int)row[dim + (d0 >> 5)] - 127);
+            const uint32_t w0 = *(const uint32_t*)(row + d0);
+            const uint32_t w1 = *(const uint32_t*)(row + d0 + 4);
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const uint32_t w = (e < 2) ? w0 : w1;
+                const int sh = (e & 1) * 16;
+                __nv_fp8_e4m3 c0, c1;
+                c0.__x = (unsigned char)((w >> sh) & 0xFF);
+                c1.__x = (unsigned char)((w >> (sh + 8)) & 0xFF);
+                o[e] = V41Pack2Bf16((float)c0 * scale, (float)c1 * scale);
+            }
+        } else {
+            const uint8_t *scales = row + (dim >> 1);
+            float scale;
+            if (quantMode == 3) {
+                __nv_fp8_e4m3 s;
+                s.__x = scales[d0 >> 4];
+                scale = (float)s;
+            } else {
+                scale = ldexpf(1.0f, (int)scales[d0 >> 5] - 127);
+            }
+            const uint32_t packed = *(const uint32_t*)(row + (d0 >> 1));
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const int byte = (int)((packed >> (e * 8)) & 0xFF);
+                o[e] = V41Pack2Bf16(V41DecodeFp4Dev(byte & 0xF) * scale,
+                                    V41DecodeFp4Dev(byte >> 4) * scale);
+            }
+        }
+        *((float4*)dst) = make_float4(__uint_as_float(o[0]), __uint_as_float(o[1]),
+                                      __uint_as_float(o[2]), __uint_as_float(o[3]));
     }
 
     // (quantMode, blockSize) -> 每行字节数；与 CPU 侧 V41KvRowBytes 一致
@@ -764,7 +820,7 @@ namespace {
     __global__ void __launch_bounds__(kIdxMmaThreads)
     V41IndexerScoreMmaKernel(const __nv_bfloat16 *q, const float *weights, const __nv_bfloat16 *k,
                              int seqlen, int heads, int m, int ratio, int startPos, float *out,
-                             const uint8_t *k8, int kMode, int kRowBytes) {
+                             const uint8_t *k8, int kMode, int kRowBytes, int vecUnpack) {
 #if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800)
         __shared__ V41IdxShared sh;
         const int j0 = blockIdx.x * kIdxBJ;
@@ -794,9 +850,13 @@ namespace {
             } else if (k8 != nullptr) {
                 // 量化 key：就地解到 BF16 片段再进 mma（FP4 的值在 BF16 上是精确的）
                 const uint8_t *krow8 = k8 + ((uint64_t)b * m + j0 + jj) * kRowBytes;
+                if (vecUnpack) {
+                    V41LoadKvRow8Bf16(krow8, kIdxDim, dv * 8, kMode, &sh.ks[jj][dv * 8]);
+                } else {
 #pragma unroll
-                for (int e = 0; e < 8; e++) {
-                    sh.ks[jj][dv * 8 + e] = __float2bfloat16_rn(V41LoadKvRow(krow8, kIdxDim, dv * 8 + e, kMode));
+                    for (int e = 0; e < 8; e++) {
+                        sh.ks[jj][dv * 8 + e] = __float2bfloat16_rn(V41LoadKvRow(krow8, kIdxDim, dv * 8 + e, kMode));
+                    }
                 }
             } else {
                 *((float4*)&sh.ks[jj][dv * 8]) =
@@ -1251,7 +1311,7 @@ namespace {
                                 const int32_t *cmpIdx, const float *sink, int seqlen, int heads,
                                 int windowSize, int cap, int topWidth, int startPos, float scale,
                                 __nv_bfloat16 *out, float *partAcc, float *partMx, float *partL,
-                                int ringMode, int ringRowBytes, int cmpMode, int cmpRowBytes) {
+                                int ringMode, int ringRowBytes, int cmpMode, int cmpRowBytes, int vecUnpack) {
 #if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800)
         extern __shared__ char v41MmaSharedRaw[];
         V41MmaShared &sh = *reinterpret_cast<V41MmaShared*>(v41MmaSharedRaw);
@@ -1339,8 +1399,15 @@ namespace {
                     }
                 } else if (src8 != nullptr) {
                     // 就地解到 BF16 片段再进 mma；FP4 的值在 BF16 上是精确的
-                    for (int d = lane; d < kMmaDim; d += 32) {
-                        sh.kvs[slot][d] = __float2bfloat16_rn(V41LoadKvRow(src8, kMmaDim, d, src8Mode));
+                    if (vecUnpack) {
+                        // 一个 lane 一次解 8 个值（打包 FP4 只读 4 字节），直接写成 16 字节片段
+                        for (int v = lane; v < kMmaDim / 8; v += 32) {
+                            V41LoadKvRow8Bf16(src8, kMmaDim, v * 8, src8Mode, &sh.kvs[slot][v * 8]);
+                        }
+                    } else {
+                        for (int d = lane; d < kMmaDim; d += 32) {
+                            sh.kvs[slot][d] = __float2bfloat16_rn(V41LoadKvRow(src8, kMmaDim, d, src8Mode));
+                        }
                     }
                 } else {
                     for (int v = lane; v < kMmaDim / 8; v += 32) {
@@ -1534,6 +1601,12 @@ namespace {
     bool V41EnvOn(const char *name) {
         const char *v = getenv(name);
         return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }
+
+    // 量化 KV 行的向量化解包（一次 4 字节 / 8 个 FP4 值）；
+    // FASTLLM_DSV41_LEGACY_FP4_UNPACK=1 退回逐元素解包做对比。
+    bool V41Fp4VecUnpack() {
+        return !V41EnvOn("FASTLLM_DSV41_LEGACY_FP4_UNPACK");
     }
 
     // ---------------- QuantizeKV ----------------
@@ -1878,7 +1951,8 @@ extern "C" bool FastllmCudaDeepSeekV41IndexerScore(const fastllm::Data &q, const
         V41IndexerScoreMmaKernel<<<mmaGrid, kIdxMmaThreads>>>(
             (const __nv_bfloat16*)q.cudaData, (const float*)weights.cudaData,
             kQuant ? nullptr : (const __nv_bfloat16*)k.cudaData,
-            seqlen, heads, m, ratio, startPos, (float*)output.cudaData, k8, kMode, kRowBytes);
+            seqlen, heads, m, ratio, startPos, (float*)output.cudaData, k8, kMode, kRowBytes,
+            V41Fp4VecUnpack() ? 1 : 0);
         return V41CheckLaunch("IndexerScoreMma");
     }
 
@@ -2076,7 +2150,7 @@ extern "C" bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, co
             hasCmp ? (const int32_t*)cmpIdx->cudaData : nullptr,
             (const float*)attnSink.cudaData, seqlen, heads, windowSize, cap, topWidth, startPos,
             softmaxScale, (__nv_bfloat16*)output.cudaData, partAcc, partMx, partL,
-            ringMode, ringRowBytes, cmpMode, cmpRowBytes);
+            ringMode, ringRowBytes, cmpMode, cmpRowBytes, V41Fp4VecUnpack() ? 1 : 0);
         if (splits > 1) {
             V41SparseMergeKernel<<<tokens * heads, 128>>>(partAcc, partMx, partL, tokens, heads, splits,
                                                           (__nv_bfloat16*)output.cudaData);

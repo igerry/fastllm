@@ -116,7 +116,7 @@ namespace fastllm {
         struct V41EngramStat {
             uint64_t calls = 0;
             uint64_t tokens = 0;
-            double hash = 0.0, gather = 0.0, wkv = 0.0, apply = 0.0, wait = 0.0;
+            double hash = 0.0, prep = 0.0, gather = 0.0, wkv = 0.0, apply = 0.0, wait = 0.0;
         };
 
         struct V41EngramProfiler {
@@ -147,19 +147,20 @@ namespace fastllm {
                 }
             }
 
-            void Add(int layer, int tokens, double hash, double gather, double wkv, double apply, double wait) {
+            void Add(int layer, int tokens, double hash, double prep, double gather, double wkv, double apply, double wait) {
                 std::lock_guard<std::mutex> guard(mutex);
                 V41EngramStat &s = tokens > 1 ? prefill : decode;
                 s.calls++;
                 s.tokens += (uint64_t)tokens;
                 s.hash += hash;
+                s.prep += prep;
                 s.gather += gather;
                 s.wkv += wkv;
                 s.apply += apply;
                 s.wait += wait;
                 if (level >= 2) {
-                    printf("[Engram] layer %d tokens %d | hash %.3f gather %.3f wkv %.3f apply %.3f wait %.3f ms\n",
-                           layer, tokens, hash, gather, wkv, apply, wait);
+                    printf("[Engram] layer %d tokens %d | hash %.3f prep %.3f gather %.3f wkv %.3f apply %.3f wait %.3f ms\n",
+                           layer, tokens, hash, prep, gather, wkv, apply, wait);
                 }
                 if (reportEvery > 0 && ++sinceReport >= reportEvery) {
                     sinceReport = 0;
@@ -183,11 +184,11 @@ namespace fastllm {
                     return;
                 }
                 double n = (double)s.calls;
-                double sum = s.hash + s.gather + s.wkv + s.apply;
-                printf("[Engram %s] %s %llu 次 / %llu token：每次 hash %.3f + gather %.3f + wkv %.3f + apply %.3f "
-                       "= %.3f ms（等待预取 %.3f，累计 %.1f ms）\n",
+                double sum = s.hash + s.prep + s.gather + s.wkv + s.apply;
+                printf("[Engram %s] %s %llu 次 / %llu token：每次 hash %.3f + prep %.3f + gather %.3f + wkv %.3f "
+                       "+ apply %.3f = %.3f ms（等待预取 %.3f，累计 %.1f ms）\n",
                        tag, name, (unsigned long long)s.calls, (unsigned long long)s.tokens,
-                       s.hash / n, s.gather / n, s.wkv / n, s.apply / n, sum / n, s.wait / n, sum);
+                       s.hash / n, s.prep / n, s.gather / n, s.wkv / n, s.apply / n, sum / n, s.wait / n, sum);
             }
         };
 
@@ -1597,7 +1598,8 @@ namespace fastllm {
         };
     }
 
-    void DeepSeekV41Model::GatherEngramRows(int layer, const std::vector<int64_t> &rows, int tokens, Data &output) {
+    void DeepSeekV41Model::GatherEngramRows(int layer, const std::vector<int64_t> &rows, int tokens,
+                                           Data &output, double *prepMs) {
         int engramLayerIndex = -1;
         for (size_t l = 0; l < engram_layer_ids.size(); l++) {
             if (engram_layer_ids[l] == layer) {
@@ -1610,9 +1612,13 @@ namespace fastllm {
         const int cols = (int)(rows.size() / std::max(1, tokens));
         const int dim = table.dim;
         const int scaleCols = dim / table.scaleBlock;
+        double prepStart = V41Profiler().level > 0 ? V41NowMs() : 0.0;
         output.ToDevice(DataDevice::CPU);
         output = Data(DataType::BFLOAT16, {1, tokens, cols * dim});
         output.Allocate(false);
+        if (prepMs != nullptr) {
+            *prepMs = V41NowMs() - prepStart;
+        }
         uint16_t *dst = (uint16_t*)output.cpuData;
         static const FP8E4M3ToFP32Manager fp8;
 
@@ -1661,7 +1667,10 @@ namespace fastllm {
             }
             return;
         }
-        int threads = std::min(tokens, std::max(1, (int)std::thread::hardware_concurrency() / 2));
+        // std::thread::hardware_concurrency() 在 glibc 上会去读 /sys/devices/system/cpu/online，
+        // 原来每次查表都调一次，单次 decode 就要 0.2 ms——比查表本身贵一个数量级。只算一次。
+        static const int hardwareThreads = std::max(1, (int)std::thread::hardware_concurrency() / 2);
+        int threads = std::min(tokens, hardwareThreads);
         threads = std::min(threads, 32);
         if (threads <= 1 || tokens < 8) {
             worker(0, tokens);
@@ -1688,7 +1697,7 @@ namespace fastllm {
         static const bool prefetchEnabled = V41EnvFlag("FASTLLM_DSV41_ENGRAM_PREFETCH");
         V41EngramProfiler &profiler = V41Profiler();
         const bool profiling = profiler.level > 0;
-        double tHash = 0.0, tGather = 0.0, tWkv = 0.0, tApply = 0.0, tWait = 0.0, mark = 0.0;
+        double tHash = 0.0, tPrep = 0.0, tGather = 0.0, tWkv = 0.0, tApply = 0.0, tWait = 0.0, mark = 0.0;
 
         std::string pre = "layers." + std::to_string(layer) + ".engram";
         int total = 0;
@@ -1764,9 +1773,9 @@ namespace fastllm {
         // ---- 第二段：查表 + FP8→BF16 ----
         mark = profiling ? V41NowMs() : 0.0;
         Data gathered;
-        GatherEngramRows(layer, rows, total, gathered);
+        GatherEngramRows(layer, rows, total, gathered, profiling ? &tPrep : nullptr);
         if (profiling) {
-            tGather = V41NowMs() - mark;
+            tGather = V41NowMs() - mark - tPrep;
         }
 
         // ---- 第三段：wkv 投影与门控写回（GPU，异步）----
@@ -1785,7 +1794,7 @@ namespace fastllm {
                        hasDead ? &mask : nullptr, rms_norm_eps);
         if (profiling) {
             tApply = V41NowMs() - mark;
-            profiler.Add(layer, total, tHash, tGather, tWkv, tApply, tWait);
+            profiler.Add(layer, total, tHash, tPrep, tGather, tWkv, tApply, tWait);
         }
     }
 

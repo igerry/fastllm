@@ -412,7 +412,9 @@ namespace fastllm {
                                  std::vector<int64_t> &rows) const;
 
         // 从 FP8 表中取行，输出 BF16 [tokens, cols * headDim]
-        void GatherEngramRows(int layer, const std::vector<int64_t> &rows, int tokens, Data &output);
+        // prepMs 非空时回填"准备输出 Data"那一段的耗时（计时用，见 FASTLLM_DSV41_ENGRAM_PROFILE）
+        void GatherEngramRows(int layer, const std::vector<int64_t> &rows, int tokens, Data &output,
+                              double *prepMs = nullptr);
 
         // 对一批片段做 Engram：各片段分别算哈希行号，查表 / wkv / 门控按整批执行
         void RunEngram(int layer, int engramLayerIndex, const std::vector<DeepSeekV41Segment> &segments,

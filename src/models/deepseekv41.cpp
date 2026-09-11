@@ -155,6 +155,18 @@ namespace fastllm {
             return normalized == type || normalized.rfind(type + ":", 0) == 0;
         }
 
+        // 模型主体是否真的跑在 CUDA 上。--device cpu 时 FastllmCudaGetDevice() 依然返回 0，
+        // 只看它会把 CPU 路径也当成可捕获，捕出来的是空图，回放等于什么都没算。
+        bool V41DeviceMapUsesCuda(const std::map<std::string, int> &deviceMap) {
+            for (const auto &it : deviceMap) {
+                if (V41DeviceSpecUsesType(it.first, "cuda") ||
+                    V41DeviceSpecUsesType(it.first, "multicuda")) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
         bool V41DeviceMapUsesMultiCuda(const std::map<std::string, int> &deviceMap) {
             for (const auto &it : deviceMap) {
                 if (V41DeviceSpecUsesType(it.first, "multicuda")) {
@@ -2579,6 +2591,7 @@ namespace fastllm {
             inputEmbeds == nullptr && !hasImageTokens &&
             std::getenv("FASTLLM_DSV41_DUMP_DIR") == nullptr &&
             !GetFastllmEnv().cudaSync && !GetFastllmEnv().printProfile &&
+            (this->deviceMap.empty() || V41DeviceMapUsesCuda(this->deviceMap)) &&
             V41DecodeCudaGraphEnabled()) {
             graphState = V41GetCudaGraphState(this->v41CudaGraphSlot);
             graphLock = std::unique_lock<std::mutex>(graphState->mutex, std::try_to_lock);
@@ -2589,7 +2602,7 @@ namespace fastllm {
                 std::string signature = std::to_string(block_cnt) + "|" + std::to_string((int)tp) +
                                         "|" + std::to_string((int)tpAttention) +
                                         "|" + std::to_string((int)tpSharedExpert) +
-                                        "|" + std::to_string((int)fp8KV) +
+                                        "|" + std::to_string((int)this->kvCacheDataType) +
                                         "|" + std::to_string((int)GetCudaSharedExpert()) + "|";
                 for (int device : tpDevices) {
                     signature += std::to_string(device) + ",";
@@ -2856,6 +2869,17 @@ namespace fastllm {
                 }
             }
         };
+        if (graphActive && hiddenStates.dataDevice != DataDevice::CUDA) {
+            // 残差流没在卡上：deviceMap 为空但执行器选了 CPU，捕获只会得到空图
+            if (graphPoolOpen) {
+                FastllmCudaGraphMemoryPoolAbort();
+                graphPoolOpen = false;
+            }
+            graphState->DestroyCapturedGraph();
+            graphState->disabled = true;
+            graphCapture = false;
+            graphReplay = false;
+        }
         if (graphReplay) {
             std::vector<const void*> current;
             graphCollectBoundaryPointers(current);

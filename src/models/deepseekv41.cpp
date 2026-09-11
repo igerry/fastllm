@@ -337,6 +337,26 @@ namespace fastllm {
             return false;
         }
 
+        // 按层切分（流水线 / 模型分片）：device map 里出现了不止一张卡，但不是 multicuda。
+        // 这种布局下每层跑在不同的卡上，一段图只能属于一张卡，当前的"整趟捕获都在同一张卡上
+        // 开始"的做法会把另一张卡的算子漏在图外（那些流根本没在捕获），回放就少算了。
+        int V41DeviceMapCudaDeviceCount(const std::map<std::string, int> &deviceMap) {
+            std::set<int> devices;
+            for (const auto &it : deviceMap) {
+                const std::string &spec = it.first;
+                if (!V41DeviceSpecUsesType(spec, "cuda")) {
+                    continue;
+                }
+                size_t pos = spec.find(':');
+                if (pos == std::string::npos) {
+                    devices.insert(0);
+                } else {
+                    devices.insert(atoi(spec.c_str() + pos + 1));
+                }
+            }
+            return (int)devices.size();
+        }
+
         bool V41DeviceMapUsesMultiCuda(const std::map<std::string, int> &deviceMap) {
             for (const auto &it : deviceMap) {
                 if (V41DeviceSpecUsesType(it.first, "multicuda")) {
@@ -3138,6 +3158,11 @@ namespace fastllm {
             std::getenv("FASTLLM_DSV41_DUMP_DIR") == nullptr &&
             !GetFastllmEnv().cudaSync && !GetFastllmEnv().printProfile &&
             (this->deviceMap.empty() || V41DeviceMapUsesCuda(this->deviceMap)) &&
+            // 按层切分（非 multicuda 的多卡 device map）默认不启用，见 V41DeviceMapCudaDeviceCount；
+            // FASTLLM_DSV41_CUDA_GRAPH_ALLOW_PIPELINE=1 可以强行打开（排查 / 评估用）
+            (V41DeviceMapUsesMultiCuda(this->deviceMap) ||
+             V41DeviceMapCudaDeviceCount(this->deviceMap) <= 1 ||
+             V41EnvFlag("FASTLLM_DSV41_CUDA_GRAPH_ALLOW_PIPELINE")) &&
             V41DecodeCudaGraphEnabled()) {
             graphState = V41GetCudaGraphState(this->v41CudaGraphSlot);
             graphLock = std::unique_lock<std::mutex>(graphState->mutex, std::try_to_lock);

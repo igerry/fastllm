@@ -8334,6 +8334,7 @@ namespace fastllm {
                     (int)gpuExperts.size());
                 assistReduceTargets.assign(gpuWorkerCount, nullptr);
                 assistPartialEvents.assign(gpuWorkerCount, nullptr);
+                const size_t outputBytes = output.GetBytes();
                 gpuExpertSets.resize(gpuWorkerCount);
                 gpuExpertLoads.assign(gpuWorkerCount, 0);
 
@@ -8430,9 +8431,9 @@ namespace fastllm {
                 }
 
                 // 归约落地缓冲与完成事件都提前在主线程准备好（分配走 CUDA
-                // 内存池，跨层复用），worker 线程里只发拷贝、不做分配。
+                // 内存池，跨层复用），worker 线程里只发拷贝、不做分配；
+                // assistResources 的表项也在这里建好，worker 只做查找。
                 if (assistOverlap && gpuWorkerCount > 1) {
-                    const size_t outputBytes = output.GetBytes();
                     for (int i = 1; i < gpuWorkerCount; i++) {
                         const int assistDevice =
                             cudaInputReplicas[i].deviceId;
@@ -8470,6 +8471,10 @@ namespace fastllm {
                 gpuThreads.reserve(gpuWorkerCount);
                 for (int i = 0; i < gpuWorkerCount; i++) {
                     int workerDevice = cudaInputReplicas[i].deviceId;
+                    // 尺寸在主线程算好传进去：worker 里不再读 input / output
+                    // 的 dims，避免与主线程的 CPU 分支并发访问同一个 Data。
+                    const size_t workerInputBytes = input.GetBytes();
+                    const size_t workerOutputBytes = outputBytes;
                     gpuThreads.emplace_back([&, i, workerDevice]() {
                         FastllmCudaSetDevice(workerDevice);
                         // 输入搬运：主线程只分配了副本缓冲，这里在本线程的
@@ -8477,7 +8482,7 @@ namespace fastllm {
                         // 主线程的 CPU 专家完全并行。后续 compute 走同一条
                         // stream，顺序天然保证，不需要任何主机侧同步。
                         if (deferredStagingDevices.count(workerDevice) != 0) {
-                            const size_t inputBytes = input.GetBytes();
+                            const size_t inputBytes = workerInputBytes;
                             void *replicaData =
                                 cudaInputReplicas[i].cudaData;
                             FastllmCudaCurrentThreadStreamWaitEvent(
@@ -8542,7 +8547,7 @@ namespace fastllm {
                         // 专家、以及主线程的 CPU 专家重叠。主线程只需要在
                         // root stream 上等这个事件，然后做一次 AddTo。
                         if (i > 0 && assistReduceTargets[i] != nullptr) {
-                            const size_t outputBytes = output.GetBytes();
+                            const size_t outputBytes = workerOutputBytes;
                             if (FastllmCudaMemcpyPeerAsyncCurrentThread(
                                     gpuId, assistReduceTargets[i],
                                     workerDevice,

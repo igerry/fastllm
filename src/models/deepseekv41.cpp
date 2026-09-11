@@ -2168,16 +2168,8 @@ namespace fastllm {
             (num_attention_heads / tpRanks) % 32 == 0 &&
             num_attention_heads % o_groups == 0 &&
             (num_attention_heads / tpRanks) % (num_attention_heads / o_groups) == 0;
-        if (tp && !tpHeadsAligned) {
-            static bool warned = false;
-            if (!warned) {
-                warned = true;
-                printf("[Fastllm] DeepSeek-V4.1 tensor parallel: %d heads over %d ranks can't be split "
-                       "(need a multiple of 32 per rank, aligned to o_groups=%d); attention stays replicated.\n",
-                       num_attention_heads, tpRanks, o_groups);
-                fflush(stdout);
-            }
-        }
+        // InitParams 已经在 head 数切不开时把 device map 改回单卡（那时 tp 为假），
+        // 这里的 tpHeadsAligned 只是同一条约束的兜底。
         // 排查用开关：关掉注意力 head 切分 / 共享专家切分后，全部算子退化为"两卡各算一份"，
         // 可以把数值问题定位到切分路径还是复制路径。
         const bool tpAttention = tp && tpHeadsAligned &&
@@ -2326,6 +2318,9 @@ namespace fastllm {
         Data x, attnInput, qr, qNorm, q, kv, attnOut, woAOut, attnProj;
         Data ffnInput, ffnOut, expertIndex, expertScore;
         Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp;
+        // TP + cpu/numa MoE 时，从卡上副本拷出来的路由专家输入（复用同一组缓冲，
+        // 避免每层重新分配、也避免栈上 Data 的地址被下游缓存复用）
+        Data cpuMoeInput, cpuMoeIndex, cpuMoeScore;
         std::vector<Data> segQ(numSegments), segKV(numSegments), segAttnOut(numSegments);
         Data catTmp[2];
 
@@ -2706,9 +2701,18 @@ namespace fastllm {
                 }
 #endif
                 if (!routed) {
-                    logits.ToDevice(DataDevice::CPU);
+                    // 图像 token 走 CPU 参考路由。复制布局下 logits 的 root 只有形状信息，
+                    // 直接 ToDevice(CPU) 会读到失效指针，必须从卡上副本拷出来。
+                    Data cpuLogits;
+                    const Data *logitsCpu = &logits;
+                    if (tp && logits.multiDeviceData && logits.IsTensorParallelReplicated()) {
+                        V41ReplicaToCpu(cpuLogits, logits, tpDevices);
+                        logitsCpu = &cpuLogits;
+                    } else {
+                        logits.ToDevice(DataDevice::CPU);
+                    }
                     gateBias.ToDevice(DataDevice::CPU);
-                    const float *raw = (const float*)logits.cpuData;
+                    const float *raw = (const float*)logitsCpu->cpuData;
                     const float *bias = (const float*)gateBias.cpuData;
                     std::vector<int> indices((uint64_t)seqlen * num_experts_per_tok);
                     std::vector<float> scores((uint64_t)seqlen * num_experts_per_tok);
@@ -2744,6 +2748,12 @@ namespace fastllm {
                     Data idxData(DataType::INT32, {seqlen, num_experts_per_tok});
                     idxData.Allocate();
                     memcpy(idxData.cpuData, indices.data(), indices.size() * sizeof(int));
+#ifdef USE_CUDA
+                    // 之前几层可能把它们做成了复制布局，CopyFrom 只会写 root，
+                    // 留下的旧副本会被后面的 multicuda 算子当成有效数据。
+                    V41ResetMultiDevice(expertIndex);
+                    V41ResetMultiDevice(expertScore);
+#endif
                     expertIndex.CopyFrom(idxData);
                     expertScore.CopyFrom(Data(DataType::FLOAT32, {seqlen, num_experts_per_tok}, scores));
                 }
@@ -2777,7 +2787,6 @@ namespace fastllm {
                 Data *moeInputPtr = &ffnInput;
                 Data *moeIndexPtr = &expertIndex;
                 Data *moeScorePtr = &expertScore;
-                Data cpuMoeInput, cpuMoeIndex, cpuMoeScore;
                 if (tp && !routedExpertParallel) {
                     // MoE 落在 cpu / numa 时，输入必须从某张卡的副本拷出来：
                     // 直接交给 CPU 算子会让 Data::ToDevice 从复制布局已经失效的
@@ -2835,13 +2844,32 @@ namespace fastllm {
             }
             Linear(normed, weight["head.weight"], *GetEmptyData(), allLogits, tp);
             ToDataType(allLogits, DataType::FLOAT32);
-            TopK(allLogits, topk, 1);
-            topk.ToDevice(DataDevice::CPU);
-            const int stride = topk.dims[topk.dims.size() - 1];
-            const float *topkData = (const float*)topk.cpuData;
             segments[0].spec->greedy.resize(seqlen);
-            for (int i = 0; i < seqlen; i++) {
-                segments[0].spec->greedy[i] = (int)(topkData[(uint64_t)i * stride] + 1e-3);
+            if (tp && allLogits.multiDeviceData && allLogits.IsTensorParallelReplicated()) {
+                // TopK 没有 multicuda 实现，会退回单卡读复制布局已失效的 root；
+                // 这里直接从副本拷到 CPU 上自己取 argmax。
+                Data cpuLogits;
+                V41ReplicaToCpu(cpuLogits, allLogits, tpDevices);
+                const int vocab = cpuLogits.dims.back();
+                const float *values = (const float*)cpuLogits.cpuData;
+                for (int i = 0; i < seqlen; i++) {
+                    const float *row = values + (uint64_t)i * vocab;
+                    int best = 0;
+                    for (int v = 1; v < vocab; v++) {
+                        if (row[v] > row[best]) {
+                            best = v;
+                        }
+                    }
+                    segments[0].spec->greedy[i] = best;
+                }
+            } else {
+                TopK(allLogits, topk, 1);
+                topk.ToDevice(DataDevice::CPU);
+                const int stride = topk.dims[topk.dims.size() - 1];
+                const float *topkData = (const float*)topk.cpuData;
+                for (int i = 0; i < seqlen; i++) {
+                    segments[0].spec->greedy[i] = (int)(topkData[(uint64_t)i * stride] + 1e-3);
+                }
             }
             for (auto &seg : segments) {
                 seg.state->totalLen += seg.seqlen;

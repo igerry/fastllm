@@ -156,6 +156,10 @@ namespace fastllm {
     private:
         BaseOperator *cudaOp;
         bool CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
+        // V4.1 有若干算子只有 output 没有 input（IndexerScore / CandidateBlocks /
+        // SparseAttention ...），BaseOperator 的默认 Reshape 会解引用不存在的
+        // "input" 项。形状由每卡下发时的 cudaOp->Reshape 决定，这里留空。
+        void Reshape(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
         void Run(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams);
     };
 

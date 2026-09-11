@@ -4656,6 +4656,10 @@ namespace fastllm {
         return true;
     }
 
+    void MultiCudaDeepSeekV41Op::Reshape(const std::string &opType, const DataDict &datas,
+                                         const FloatDict &floatParams, const IntDict &intParams) {
+    }
+
     bool MultiCudaDeepSeekV41Op::CanRun(const std::string &opType, const DataDict &datas,
                                         const FloatDict &floatParams, const IntDict &intParams) {
         std::vector<int> devices;

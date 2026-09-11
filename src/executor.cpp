@@ -377,6 +377,11 @@ namespace fastllm {
                         }
                     }
                 }
+                static const bool traceOps = std::getenv("FASTLLM_TRACE_OPS") != nullptr;
+                if (traceOps) {
+                    fprintf(stderr, "[op] %s on %s\n", opType.c_str(), device->deviceType.c_str());
+                    fflush(stderr);
+                }
                 device->Reshape(opType, datas, floatParams, intParams);
                 device->Run(opType, datas, floatParams, intParams);
 #ifdef USE_CUDA

@@ -464,6 +464,7 @@ namespace fastllm {
              model->model_type != "laguna" &&
              model->model_type != "minimax_m2" &&
              model->model_type != "deepseek_v4" &&
+             model->model_type != "deepseek_v41" &&
              model->model_struct != "qwen3_5") ||
             !IsThreadTensorParallelLoadEnabled() || deviceIds.size() <= 1 ||
             data.isDiskWeight || data.dims.size() != 2 ||
@@ -479,8 +480,11 @@ namespace fastllm {
         Data emptyBias;
         bool explicitDeviceRatios = HasExplicitRatiosForAllDevices(devices, ratios);
         std::lock_guard<std::mutex> guard(multiCudaTpLoadSplitLock);
+        // DeepSeek-V4.1 继承 DeepSeekV4Model，注意力权重的切分单位（o_groups 对齐）
+        // 与 V4 完全一致，直接复用同一套 split unit。
         const DeepSeekV4Model *deepseekV4 =
-            model->model_type == "deepseek_v4" ?
+            (model->model_type == "deepseek_v4" ||
+             model->model_type == "deepseek_v41") ?
                 dynamic_cast<const DeepSeekV4Model*>(model) : nullptr;
         if (deepseekV4 != nullptr) {
             if (weightName.find(".attn.wq_b.weight") !=
@@ -545,7 +549,8 @@ namespace fastllm {
             model->model_struct == "qwen3_5" &&
             weightName.find(".mlp.experts.") != std::string::npos &&
             data.dataType == DataType::INT4_GROUP;
-        if (model->model_type == "deepseek_v4" && routedExpert >= 0 &&
+        if ((model->model_type == "deepseek_v4" ||
+             model->model_type == "deepseek_v41") && routedExpert >= 0 &&
             !deepSeekV4TensorParallelExperts) {
             constexpr int ownerOffset = 0;
             int ownerCount = (int)devices.size();

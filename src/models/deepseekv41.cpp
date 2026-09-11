@@ -1728,11 +1728,14 @@ namespace fastllm {
             }
             job->Reset();
         }
+        std::vector<V41EngramSegSnapshot> snapshots;
+        if (!tookPrefetched || job != nullptr) {
+            snapshots = V41SnapshotSegments(segments, engram_max_ngram_size);
+        }
         if (!tookPrefetched) {
             mark = profiling ? V41NowMs() : 0.0;
             V41BuildEngramInputs(engramMeta, engramLayerIndex, engram_max_ngram_size, engram_n_heads,
-                                 V41SnapshotSegments(segments, engram_max_ngram_size), total,
-                                 rows, maskValues, hasDead);
+                                 snapshots, total, rows, maskValues, hasDead);
             if (profiling) {
                 tHash = V41NowMs() - mark;
             }
@@ -1743,10 +1746,10 @@ namespace fastllm {
         if (job != nullptr && engramLayerIndex + 1 < (int)engram_layer_ids.size() &&
             engramLayerIndex + 1 < (int)engramTables.size()) {
             int nextIndex = engramLayerIndex + 1;
+            job->Reset();   // 可能还挂着上一次前向留下的任务，先 join 再复用
             job->engramLayerIndex = nextIndex;
             job->total = total;
             job->ready = false;
-            auto snapshots = V41SnapshotSegments(segments, engram_max_ngram_size);
             const DeepSeekV41EngramMeta &meta = engramMeta;
             int maxNgram = engram_max_ngram_size, heads = engram_n_heads;
             auto tablePtr = std::static_pointer_cast<V41EngramTable>(engramTables[nextIndex]);

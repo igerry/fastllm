@@ -29,6 +29,7 @@
 #include <map>
 #include <set>
 #include <numeric>
+#include <fstream>
 
 #ifdef __aarch64__
 #include <arm_neon.h>
@@ -173,6 +174,37 @@ namespace fastllm {
             for (int device : ParseDeviceIds(entry.first, "cuda", ratios)) {
                 appendDevice(device);
             }
+        }
+
+        // Extra MoE-assist GPUs.  The list above only ever contains the GPUs
+        // that hold dense layers, so a machine whose model fits on cuda:0
+        // leaves every other GPU idle during prefill even though routed
+        // experts are streamed from host memory and need no tensor-parallel
+        // shard.  FT_MOE_ASSIST_DEVICES=0,1 lets a deployment hand those GPUs
+        // to the expert stream; each one adds its own PCIe link, which is the
+        // actual limit for a chunk that has to pull every expert once.
+        static const std::vector<int> extraDevices = []() {
+            std::vector<int> parsed;
+            const char *env = std::getenv("FT_MOE_ASSIST_DEVICES");
+            if (env == nullptr) {
+                return parsed;
+            }
+            std::string spec(env);
+            std::string token;
+            for (size_t i = 0; i <= spec.size(); i++) {
+                if (i == spec.size() || spec[i] == ',' || spec[i] == ' ') {
+                    if (!token.empty()) {
+                        parsed.push_back(atoi(token.c_str()));
+                        token.clear();
+                    }
+                    continue;
+                }
+                token.push_back(spec[i]);
+            }
+            return parsed;
+        }();
+        for (int device : extraDevices) {
+            appendDevice(device);
         }
 
         std::sort(devices.begin(), devices.end());
@@ -700,6 +732,112 @@ namespace fastllm {
         }
     }
 
+    // Rows per fused AVX2 NVFP4 task.  Above this the decoded weights are
+    // better amortised by dequantising the tile once, which is what the
+    // generic FastllmGemm fallback does.
+    static int NumasNvfp4Avx2MaxRows() {
+        static const int value = []() {
+            const char *env =
+                std::getenv("FASTLLM_NVFP4_BLOCK32_AVX2_MAX_ROWS");
+            return env != nullptr ? std::max(0, atoi(env)) : 32;
+        }();
+        return value;
+    }
+
+    // The compact block-32 NVFP4 layout used to be registered only when
+    // AVX512-BF16 was available, because it was the only fused consumer.
+    // The AVX2 kernel consumes the same layout, so keep it on those CPUs too;
+    // otherwise they would fall back to block-16 and to the dequantise-then-
+    // GEMM path.
+    static bool NumasNvfp4Block32Available() {
+        static const bool value =
+            GetCPUInstructInfo()->hasAVX512BF16 ||
+            (GetCPUInstructInfo()->hasAVX2 &&
+             NumasNvfp4Avx2MaxRows() > 0 &&
+             std::getenv("FASTLLM_DSV4_DISABLE_NUMAS_MOE_NVFP4_AVX2") ==
+                 nullptr);
+        return value;
+    }
+
+    // The DeepSeek-V4 NUMA MoE fast path (direct GEMM queue, cached task
+    // objects, BF16 activations end to end) was gated on AVX512-BF16 only
+    // because its GEMM leaf had no other fused NVFP4 kernel.  With the AVX2
+    // kernel in place the scheduling half is just as profitable there, and it
+    // is what removes the per-layer prepare/dispatch overhead.
+    static bool NumasDeepSeekV4FastPathAvailable() {
+        static const bool value =
+            GetCPUInstructInfo()->hasAVX512BF16 ||
+            (NumasNvfp4Block32Available() &&
+             std::getenv("FASTLLM_DSV4_DISABLE_NUMAS_MOE_AVX2_FAST") ==
+                 nullptr);
+        return value;
+    }
+
+    // Optional routed-expert histogram for capacity planning (how skewed is
+    // the routing, and would pinning the hottest experts in VRAM pay off).
+    // Point FASTLLM_MOE_ROUTE_HISTOGRAM at a file to enable it; the counts are
+    // written there at process exit as "layer expert count" lines.  Disabled
+    // by default, in which case it costs one bool test per decode step.
+    struct NumasMoeRouteHistogram {
+        bool enabled = false;
+        std::string path;
+        std::mutex mutex;
+        std::map<int, std::vector<uint64_t>> counts;
+
+        NumasMoeRouteHistogram() {
+            const char *env = std::getenv("FASTLLM_MOE_ROUTE_HISTOGRAM");
+            if (env != nullptr && env[0] != '\0') {
+                path = env;
+                enabled = true;
+            }
+        }
+
+        ~NumasMoeRouteHistogram() {
+            Dump();
+        }
+
+        void Record(int layer, const int32_t *index, int rows, int topk,
+                    int experts) {
+            std::lock_guard<std::mutex> guard(mutex);
+            auto &row = counts[layer];
+            if ((int)row.size() < experts) {
+                row.resize(experts, 0);
+            }
+            for (int i = 0; i < rows * topk; i++) {
+                const int expert = index[i];
+                if (expert >= 0 && expert < experts) {
+                    row[expert]++;
+                }
+            }
+        }
+
+        void Dump() {
+            std::lock_guard<std::mutex> guard(mutex);
+            if (!enabled || counts.empty()) {
+                return;
+            }
+            std::ofstream out(path);
+            if (!out) {
+                return;
+            }
+            out << "# layer expert count\n";
+            for (const auto &entry : counts) {
+                for (size_t expert = 0; expert < entry.second.size(); expert++) {
+                    if (entry.second[expert] != 0) {
+                        out << entry.first << ' ' << expert << ' '
+                            << entry.second[expert] << '\n';
+                    }
+                }
+            }
+            counts.clear();
+        }
+    };
+
+    static NumasMoeRouteHistogram &GetNumasMoeRouteHistogram() {
+        static NumasMoeRouteHistogram instance;
+        return instance;
+    }
+
     struct DeepSeekV4NumasGroupedGemmExpert {
         int expert;
         int rowOffset;
@@ -723,6 +861,8 @@ namespace fastllm {
         int chunksPerExpert;
         bool useNvfp4FullBlocks;
         bool useNvfp4ScaleLookup;
+        bool useNvfp4Avx2;
+        int nvfp4Avx2MaxRows;
 
         DeepSeekV4NumasGemmQueueContext(
             const std::vector<std::pair<int, float>> *experts,
@@ -752,7 +892,16 @@ namespace fastllm {
             useNvfp4ScaleLookup(
                 std::getenv(
                     "FASTLLM_DSV4_DISABLE_NUMAS_MOE_NVFP4_SCALE_LUT") ==
-                nullptr) {}
+                nullptr),
+            // Machines without AVX512-BF16 (Zen 2/3, older Xeon) fall back to
+            // the AVX2 fused kernel, which still avoids the temporary BF16
+            // tile that dominated the routed-expert decode there.
+            useNvfp4Avx2(
+                !GetCPUInstructInfo()->hasAVX512BF16 &&
+                GetCPUInstructInfo()->hasAVX2 &&
+                std::getenv(
+                    "FASTLLM_DSV4_DISABLE_NUMAS_MOE_NVFP4_AVX2") == nullptr),
+            nvfp4Avx2MaxRows(NumasNvfp4Avx2MaxRows()) {}
 
         DeepSeekV4NumasGemmQueueContext(
             const std::vector<DeepSeekV4NumasGroupedGemmExpert>
@@ -838,6 +987,18 @@ namespace fastllm {
                         rows, context->m, context->k, st, end,
                         context->useNvfp4ScaleLookup,
                         weight->numasNVFP4AllScalesFuseMagic);
+            }
+            if (!fullBlocks && context->useNvfp4Avx2 &&
+                context->inputDataType == DataType::BFLOAT16 &&
+                weight->GetDataType() ==
+                    DataType::NVFP4_BLOCK_32_E8M0 &&
+                rows <= context->nvfp4Avx2MaxRows) {
+                fullBlocks =
+                    FastllmGemmBFloat16NVFP4Block32E8M0_AVX2(
+                        input, inputStride,
+                        weight->numasData[context->nid], weightStride,
+                        output, outputStride,
+                        rows, context->m, context->k, st, end);
             }
             if (!fullBlocks) {
                 FastllmGemm(
@@ -1876,7 +2037,7 @@ namespace fastllm {
                                     "RegisterNumas can't find nvfp4 scale data.");
                     if (scaleBytes != nullptr) {
                         const bool useBlock32 = data->blockM == 32 &&
-                            GetCPUInstructInfo()->hasAVX512BF16;
+                            NumasNvfp4Block32Available();
                         data->dataType = useBlock32 ?
                             DataType::NVFP4_BLOCK_32_E8M0 :
                             DataType::NVFP4_BLOCK_16_E8M0;
@@ -3220,7 +3381,7 @@ namespace fastllm {
                     return DataType::NVFP4_BLOCK_16;
                 }
                 const bool useBlock32 = weight.blockM == 32 &&
-                    GetCPUInstructInfo()->hasAVX512BF16;
+                    NumasNvfp4Block32Available();
                 return useBlock32 ?
                     DataType::NVFP4_BLOCK_32_E8M0 :
                     DataType::NVFP4_BLOCK_16_E8M0;
@@ -5482,7 +5643,7 @@ namespace fastllm {
             canFuseGroup32;
         const bool useDeepSeekV4LargeFast =
             deepSeekV4Mode &&
-            GetCPUInstructInfo()->hasAVX512BF16 &&
+            NumasDeepSeekV4FastPathAvailable() &&
             std::getenv(
                 "FASTLLM_DSV4_DISABLE_NUMAS_MOE_LARGE_FAST") == nullptr;
         const bool useDeepSeekV4GroupedDecodeFast =
@@ -6684,6 +6845,13 @@ namespace fastllm {
 // auto st = std::chrono::system_clock::now();
             int32_t *indexData = (int32_t*)index.cpuData;
             float *scoreData = (float*)score.cpuData;
+            {
+                auto &histogram = GetNumasMoeRouteHistogram();
+                if (histogram.enabled) {
+                    histogram.Record(layer, indexData, input.dims[0], topk,
+                                     weightsBatch / 2 - 1);
+                }
+            }
 
             {
                 auto *pool = GetAlivePool();
@@ -6817,7 +6985,7 @@ namespace fastllm {
 
                     bool useDeepSeekV4MoeFast =
                         deepSeekV4Mode &&
-                        GetCPUInstructInfo()->hasAVX512BF16 &&
+                        NumasDeepSeekV4FastPathAvailable() &&
                         std::getenv(
                             "FASTLLM_DSV4_DISABLE_NUMAS_MOE_FAST") == nullptr;
                     bool reuseMoeTaskStorage =

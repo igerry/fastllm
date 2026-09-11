@@ -2217,6 +2217,15 @@ namespace fastllm {
             return at;
         }
 
+        // 排查用：每 N 次回放强制判定一次"地址搬家"，验证失效 -> 重捕获这条路径
+        int V41DecodeCudaGraphInvalidateEvery() {
+            static const int n = []() -> int {
+                const char *env = std::getenv("FASTLLM_DSV41_CUDA_GRAPH_INVALIDATE_EVERY");
+                return env != nullptr && env[0] != '\0' ? atoi(env) : 0;
+            }();
+            return n;
+        }
+
         bool V41DecodeCudaGraphVerbose() {
             static const bool v = V41EnvFlag("FASTLLM_DSV41_CUDA_GRAPH_DEBUG");
             return v;
@@ -2253,6 +2262,7 @@ namespace fastllm {
             // 都说明图里烤死的地址已经失效，销毁重捕获；反复失效就彻底关掉。
             std::vector<const void*> boundaryPointers;
             int recaptureCount = 0;
+            long long replayCount = 0;
             std::unique_ptr<DeepSeekV41DecodeWorkspace> workspace;
 
             DeepSeekV41CudaGraphState() : workspace(new DeepSeekV41DecodeWorkspace()) {}
@@ -2892,11 +2902,14 @@ namespace fastllm {
         if (graphReplay) {
             std::vector<const void*> current;
             graphCollectBoundaryPointers(current);
-            if (current != graphState->boundaryPointers) {
+            const int invalidateEvery = V41DecodeCudaGraphInvalidateEvery();
+            const bool forceInvalidate = invalidateEvery > 0 &&
+                                         ++graphState->replayCount % invalidateEvery == 0;
+            if (forceInvalidate || current != graphState->boundaryPointers) {
                 graphState->DestroyCapturedGraph();
                 graphState->recaptureCount++;
                 graphReplay = false;
-                if (graphState->recaptureCount > 3) {
+                if (graphState->recaptureCount > 3 && !forceInvalidate) {
                     graphState->disabled = true;
                 }
                 if (V41DecodeCudaGraphVerbose()) {

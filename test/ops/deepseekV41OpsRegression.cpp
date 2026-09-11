@@ -27,6 +27,12 @@
 
 using namespace fastllm;
 
+#ifdef USE_CUDA
+// 融合 kernel 直接调用（模型里也是这样用的：拒绝时退回 HcApplyPre + RMSNorm 两步）
+extern "C" bool FastllmCudaDeepSeekV41HcPreNorm(const fastllm::Data &x, const fastllm::Data &pre,
+                                     fastllm::Data &normWeight, float eps, fastllm::Data &output);
+#endif
+
 static Executor &Exec() {
     return *((Executor*)GetExecutor());
 }
@@ -512,6 +518,64 @@ static void CheckRotaryQuantEquiv() {
     std::cout << "  [cuda] RotaryQuant：新 kernel 与 legacy kernel 逐 bit 相同（6 组配置）\n";
 }
 
+// ---------------- 6. HcApplyPre + RMSNorm 融合与两步分开做逐 bit 一致 ----------------
+//
+// 融合 kernel 必须复现两件事：HcApplyPre 折叠后写 BF16 的舍入，以及 RMSNorm 的归约树
+// （平方和的累加顺序、warp shuffle-down、rsqrtf(val / channels + eps)、写出的 lo * s * w）。
+// 归约树与 THREAD_PER_BLOCK 绑定，所以这里覆盖 RMSNorm 会选到的三档线程数
+// （channels < 512 -> 64、< 4096 -> 512、否则 1024），以及真实模型的 5120。
+#ifdef USE_CUDA
+static void CheckHcPreNormFused() {
+    struct Case { int seqlen, hcMult, channels; };
+    const std::vector<Case> cases = {
+        {3, 4, 5120},   // 真实模型：hidden_size 5120、hc_mult 4
+        {2, 4, 4096},
+        {5, 4, 2048},
+        {4, 2, 256},
+        {2, 4, 1024},
+    };
+    std::mt19937 rng(31337);
+    std::normal_distribution<float> dist(0.0f, 0.8f);
+    for (const Case &c : cases) {
+        const size_t n = (size_t)c.seqlen * c.hcMult * c.channels;
+        std::vector<float> xv(n);
+        for (size_t i = 0; i < n; i++) {
+            xv[i] = dist(rng);
+        }
+        Data pre(DataType::FLOAT32, {1, c.seqlen, c.hcMult});
+        pre.Allocate();
+        for (int i = 0; i < c.seqlen * c.hcMult; i++) {
+            ((float*)pre.cpuData)[i] = dist(rng);
+        }
+        Data w(DataType::FLOAT32, {c.channels});
+        w.Allocate();
+        for (int i = 0; i < c.channels; i++) {
+            ((float*)w.cpuData)[i] = 0.5f + 0.001f * (i % 97);
+        }
+        const float eps = 1e-6f;
+
+        // 两步：HcApplyPre + RMSNorm
+        Data xA = MakeBf16({1, c.seqlen, c.hcMult, c.channels}, xv), preA, wA, mid, refOut;
+        preA.CopyFrom(pre); wA.CopyFrom(w);
+        ToDev(xA, true); ToDev(preA, true); ToDev(wA, true);
+        Exec().RunOnDevice("cuda", "DeepSeekV41HcApplyPre",
+                           {{"input", &xA}, {"pre", &preA}, {"output", &mid}}, {}, {});
+        Exec().RunOnDevice("cuda", "RMSNorm", {{"input", &mid}, {"weight", &wA}, {"output", &refOut}},
+                           {{"eps", eps}}, {});
+
+        // 融合
+        Data xB = MakeBf16({1, c.seqlen, c.hcMult, c.channels}, xv), preB, wB, gotOut;
+        preB.CopyFrom(pre); wB.CopyFrom(w);
+        ToDev(xB, true); ToDev(preB, true); ToDev(wB, true);
+        Require(FastllmCudaDeepSeekV41HcPreNorm(xB, preB, wB, eps, gotOut),
+                "HcPreNorm：融合 kernel 拒绝了 channels " + std::to_string(c.channels));
+        Require(BitEqual(ReadFloats(refOut), ReadFloats(gotOut)),
+                "HcPreNorm：融合与两步分开做不一致（channels " + std::to_string(c.channels) + ")");
+    }
+    std::cout << "  [cuda] HcApplyPre + RMSNorm：融合与两步分开做逐 bit 相同（5 组配置）\n";
+}
+#endif
+
 int main() {
     try {
         gHasCuda = Exec().HasDevice("cuda");
@@ -547,6 +611,10 @@ int main() {
             CheckIndexerTopK();
             std::cout << "== RotaryQuant（新 kernel vs legacy）==\n";
             CheckRotaryQuantEquiv();
+#ifdef USE_CUDA
+            std::cout << "== HcApplyPre + RMSNorm 融合 ==\n";
+            CheckHcPreNormFused();
+#endif
         } else {
             std::cout << "(未编译 / 未检测到 CUDA，跳过 GPU 部分)\n";
         }

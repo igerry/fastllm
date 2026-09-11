@@ -112,36 +112,42 @@ ftllm server /path/to/DeepSeek-V4.1-Flash \
 - 内存需求：Engram 表约 200 GB + 路由专家（FP4）约 270 GB + 加载临时空间；
 - 首次启动会生成 `engram_meta.json`（约 1 分钟）并读入两张 Engram 表。
 
-### 实测（DeepSeek-V4.1-Flash 真实权重，2026-09-11）
+### 实测（DeepSeek-V4.1-Flash 真实权重，2026-09-12）
 
-主机：EPYC 7C13（128 线程）+ 943 GB 内存 + 2 x RTX 3090 Ti（SM86，24 GB），权重在共享盘上（478 GB，48 个分片）。
-启动参数即上面的推荐配置（`--device cuda --moe_device numa --dtype float16 --chunked_prefill_size 4096 -t 64`）。
+主机：EPYC 7C13（Zen 3，无 AVX512，128 线程）+ 943 GB 内存 + 2 x RTX 3090 Ti（SM86，24 GB），
+权重在共享盘上（478 GB，48 个分片）。线程数 `-t 31`，`--chunked_prefill_size 4096`。
 
 | 指标 | 实测 |
 | --- | --- |
-| 加载耗时 | 约 7 分钟（含两张 Engram 表各 101.4 GB 读入内存） |
-| 显存 | 15.9 GB，单卡即可（稠密 FP8 反量化为 float16 后） |
-| 内存 | 约 521 GB 常驻 |
+| 加载耗时 | 7–20 分钟（取决于两张各 101.4 GB 的 Engram 表是否还在页缓存） |
+| 内存 | 约 520 GB 常驻 |
 | 图像 | 448x336 的图 210 个 prompt token，端到端 6 秒 |
 
-prefill 与 decode（同一台机器、同一组提示词，BF16 mma kernel 上线前后对照）：
+单卡与按层分片双卡的对照（两者的 31k 与 123k"大海捞针"均命中）：
 
-| 上下文 | prefill 旧 | prefill 新 | decode 旧 | decode 新 |
+| 配置 | 每卡显存 | decode | 8k 首 token | 32k 首 token |
 | --- | --- | --- | --- | --- |
-| 14 | 1.9 s | 2.2 s | 194 ms/token | 164 ms/token |
-| 974 | 5.7 s | 4.8 s | 302 ms/token | 153 ms/token |
-| 8014 | 35.9 s | 16.9 s | 423 ms/token | 234 ms/token |
-| 32014 | 207.3 s | 66.4 s | 319 ms/token | 132 ms/token |
+| 单卡 | 15.0 GB | 78 ms/token | 13.1 s | 50.1 s |
+| 按层分片（`--device "{'cuda:0':1,'cuda:1':1}"`） | 7.2 / 8.1 GB | 78–80 ms/token | 11.3 s | 44.0 s |
+
+**decode 在 14 到 32014 token 之间完全持平**，说明 BF16 mma kernel 之后注意力与 indexer 已经不再是
+长上下文的瓶颈。按层分片的 prefill 反而快 12–14%，推测是每卡显存宽裕、分配器压力小。
+
+优化历程（短上下文 decode / 32k prefill）：
+
+| 阶段 | decode | 32k prefill |
+| --- | --- | --- |
+| 初始实现 | 194 ms/token | 207 s |
+| BF16 mma 的注意力与 indexer | 164 ms/token | 66 s |
+| AVX2 融合 FP4 专家 kernel | 78 ms/token | 50 s |
+| 按层分片双卡 | 78–80 ms/token | 44 s |
 
 单步 decode 的算子分解（`FASTLLM_PRINT_PROFILE=1 FASTLLM_CUDA_SYNC=1`，短上下文）显示 `MergeMOE`
-（CPU 上的 FP4 路由专家）占绝对多数：新 kernel 上线前为 137 ms / 190 ms。因此短上下文的 decode
-主要由 CPU 专家决定，长上下文与 prefill 才由注意力与 indexer 决定。
+（CPU 上的 FP4 路由专家）占绝对多数：AVX2 kernel 上线前为 137 ms / 190 ms，之后约 43 ms / 78 ms。
+所以短上下文的 decode 仍由 CPU 专家决定，多卡并行只能切 GPU 的那部分。
 
-CPU 专家的当前瓶颈：融合的 FP4 GEMM 只有 AVX512-BF16 实现，在没有 AVX512 的机器（如 Zen 3 的 EPYC 7C13）
-上回退为"先把 FP4 解量化到临时 BF16 缓冲，再做普通 BF16 GEMM"，读写放大数倍。见文末的未完成项。
-
-行为验证（贪心解码）：中英文常识、算术、代码生成、逻辑推理均正确；34k token 上下文的"大海捞针"命中
-（该长度会激活候选块两级 top-k）；工具调用能正确产出 `tool_calls`；图像输入能正确描述图中的形状与颜色。
+行为验证（贪心解码）：中英文常识、算术、代码生成、逻辑推理均正确；31k 与 123k 上下文的"大海捞针"命中
+（这两个长度都会激活候选块两级 top-k）；工具调用能正确产出 `tool_calls`；图像输入能正确描述图中的形状与颜色。
 
 ## 张量并行
 

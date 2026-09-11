@@ -632,11 +632,12 @@ namespace {
 
     // ---------------- RotaryQuant ----------------
 
-    // 一个 block 处理一行，blockDim = dim（<= 1024）
+    // 旧实现：一个 block 处理一行，blockDim = dim（<= 1024）。
+    // 保留作为 FASTLLM_DSV41_LEGACY_ROTARY=1 的对比基准。
     template <typename T>
-    __global__ void V41RotaryQuantKernel(T *x, int rowsPerToken, int dim, V41RopeTable rope,
-                                         int ropeDim, int startPos, int posStep, int inverse,
-                                         int quantMode, int quantDim, int quantBlock) {
+    __global__ void V41RotaryQuantLegacyKernel(T *x, int rowsPerToken, int dim, V41RopeTable rope,
+                                               int ropeDim, int startPos, int posStep, int inverse,
+                                               int quantMode, int quantDim, int quantBlock) {
         extern __shared__ float row[];
         const int r = blockIdx.x;
         const int token = r / rowsPerToken;
@@ -673,6 +674,81 @@ namespace {
             }
             (void)group;
             float scale = V41QuantScaleDev(a, quantMode);
+            v = V41QuantValueDev(v, scale, quantMode);
+        }
+        V41Store<T>(base, d, v);
+    }
+
+    // quantMode == 0（q / 注意力输出的逆旋转）：只有末尾 ropeDim 个元素会变，
+    // 旧 kernel 却把整行 load 到共享内存再原样写回（dim = 512、ropeDim = 128 时白读写 75%）。
+    // 这里一个 block 处理多行的若干个旋转对，只碰真正需要旋转的元素。
+    template <typename T>
+    __global__ void V41RotaryOnlyKernel(T *x, int rowsPerToken, int dim, V41RopeTable rope,
+                                        int ropeDim, int startPos, int posStep, int inverse,
+                                        uint64_t totalPairs) {
+        const uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= totalPairs) {
+            return;
+        }
+        const int pairs = ropeDim >> 1;
+        const int r = (int)(idx / (uint64_t)pairs);
+        const int d = (int)(idx - (uint64_t)r * pairs);
+        const int token = r / rowsPerToken;
+        T *base = x + (uint64_t)r * dim + (dim - ropeDim) + 2 * d;
+        const float pos = (float)(startPos + (long long)token * posStep);
+        const float ang = pos * rope.invFreq[d];
+        float c = cosf(ang), s = sinf(ang);
+        if (inverse) {
+            s = -s;
+        }
+        const float a = V41Load<T>(base, 0), b = V41Load<T>(base, 1);
+        V41Store<T>(base, 0, a * c - b * s);
+        V41Store<T>(base, 1, a * s + b * c);
+    }
+
+    // quantMode > 0：一个线程一个元素，旋转对通过相邻 lane 的 __shfl_xor 交换，
+    // 因此不再需要共享内存与两次 __syncthreads，一个 block 可以处理 rowsPerBlock 行
+    // （dim = 128 时旧实现只有 128 个线程一个 block）。
+    // 块内 amax 的语义不变：仍是 warp 内连续 quantBlock（16 / 32）个 lane 的归约。
+    template <typename T>
+    __global__ void V41RotaryQuantKernel(T *x, int rowsPerToken, int dim, V41RopeTable rope,
+                                         int ropeDim, int startPos, int posStep, int inverse,
+                                         int quantMode, int quantDim, int quantBlock,
+                                         int rowsPerBlock, int rows) {
+        const int sub = threadIdx.x / dim;
+        const int d = (int)threadIdx.x - sub * dim;
+        const int r = blockIdx.x * rowsPerBlock + sub;
+        if (r >= rows) {
+            return;     // dim 是 32 的倍数，整个 warp 一起返回
+        }
+        const int token = r / rowsPerToken;
+        T *base = x + (uint64_t)r * dim;
+        float v = V41Load<T>(base, d);
+        // 旋转对 (off + 2p, off + 2p + 1) 是相邻的两个 lane；off 是偶数，所以配对与
+        // lane 的奇偶一致。shuffle 放在分支外，保证整个 warp 都参与。
+        const float other = __shfl_xor_sync(0xffffffff, v, 1);
+        const int off = dim - ropeDim;
+        if (d >= off) {
+            const int k = d - off;
+            const float pos = (float)(startPos + (long long)token * posStep);
+            const float ang = pos * rope.invFreq[k >> 1];
+            float c = cosf(ang), s = sinf(ang);
+            if (inverse) {
+                s = -s;
+            }
+            v = (k & 1) ? (other * s + v * c) : (v * c - other * s);
+        }
+        if (d < quantDim) {
+            float a = fabsf(v);
+            if (quantBlock == 16) {
+                a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, 8));
+                a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, 4));
+                a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, 2));
+                a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, 1));
+            } else {
+                a = V41WarpMax(a);
+            }
+            const float scale = V41QuantScaleDev(a, quantMode);
             v = V41QuantValueDev(v, scale, quantMode);
         }
         V41Store<T>(base, d, v);
@@ -1609,6 +1685,11 @@ namespace {
         return !V41EnvOn("FASTLLM_DSV41_LEGACY_FP4_UNPACK");
     }
 
+    // FASTLLM_DSV41_LEGACY_ROTARY=1 退回「一行一个 block + 共享内存」的旧旋转/量化 kernel
+    bool V41LegacyRotary() {
+        return V41EnvOn("FASTLLM_DSV41_LEGACY_ROTARY");
+    }
+
     // ---------------- QuantizeKV ----------------
 
     constexpr int kKvQuantThreads = 128;
@@ -1867,23 +1948,60 @@ extern "C" bool FastllmCudaDeepSeekV41RotaryQuant(fastllm::Data &x, int ropeDim,
     if (quantDim <= 0) {
         quantDim = dim;
     }
-    if (dim > 1024 || dim % 32 != 0 || ropeDim <= 0 || ropeDim > 128 || ropeDim > dim ||
+    if (dim > 1024 || dim % 32 != 0 || ropeDim <= 0 || ropeDim > 128 || ropeDim > dim || (ropeDim & 1) != 0 ||
         (quantMode > 0 && ((quantBlock != 16 && quantBlock != 32) || quantDim % 32 != 0))) {
         return false;
     }
     int rowsPerToken = x.dims.size() == 4 ? x.dims[2] : 1;
     int rows = (int)(x.Count(0) / dim);
+    if (rows <= 0) {
+        return true;
+    }
     V41RopeTable rope = V41BuildRope(ropeDim, ropeBase, originalSeqLen, ropeFactor, betaFast, betaSlow);
-    size_t shared = (size_t)dim * sizeof(float);
+    if (V41LegacyRotary()) {
+        size_t shared = (size_t)dim * sizeof(float);
+        if (x.dataType == DataType::BFLOAT16) {
+            V41RotaryQuantLegacyKernel<__nv_bfloat16><<<rows, dim, shared>>>((__nv_bfloat16*)x.cudaData, rowsPerToken,
+                dim, rope, ropeDim, startPos, posStep, inverse ? 1 : 0, quantMode, quantDim, quantBlock);
+        } else if (x.dataType == DataType::FLOAT16) {
+            V41RotaryQuantLegacyKernel<half><<<rows, dim, shared>>>((half*)x.cudaData, rowsPerToken, dim, rope,
+                ropeDim, startPos, posStep, inverse ? 1 : 0, quantMode, quantDim, quantBlock);
+        } else {
+            V41RotaryQuantLegacyKernel<float><<<rows, dim, shared>>>((float*)x.cudaData, rowsPerToken, dim, rope,
+                ropeDim, startPos, posStep, inverse ? 1 : 0, quantMode, quantDim, quantBlock);
+        }
+        return V41CheckLaunch("RotaryQuant");
+    }
+    if (quantMode <= 0) {
+        // 只旋转，不量化：按「行 x 旋转对」展开，一个 block 256 个对
+        const uint64_t totalPairs = (uint64_t)rows * (uint64_t)(ropeDim >> 1);
+        const int threads = 256;
+        const uint64_t blocks = (totalPairs + threads - 1) / threads;
+        if (x.dataType == DataType::BFLOAT16) {
+            V41RotaryOnlyKernel<__nv_bfloat16><<<(unsigned)blocks, threads>>>((__nv_bfloat16*)x.cudaData,
+                rowsPerToken, dim, rope, ropeDim, startPos, posStep, inverse ? 1 : 0, totalPairs);
+        } else if (x.dataType == DataType::FLOAT16) {
+            V41RotaryOnlyKernel<half><<<(unsigned)blocks, threads>>>((half*)x.cudaData,
+                rowsPerToken, dim, rope, ropeDim, startPos, posStep, inverse ? 1 : 0, totalPairs);
+        } else {
+            V41RotaryOnlyKernel<float><<<(unsigned)blocks, threads>>>((float*)x.cudaData,
+                rowsPerToken, dim, rope, ropeDim, startPos, posStep, inverse ? 1 : 0, totalPairs);
+        }
+        return V41CheckLaunch("RotaryQuant");
+    }
+    // 量化：一个 block 处理 rowsPerBlock 行，目标 blockDim 512
+    const int rowsPerBlock = std::max(1, 512 / dim);
+    const int threads = rowsPerBlock * dim;
+    const int blocks = (rows + rowsPerBlock - 1) / rowsPerBlock;
     if (x.dataType == DataType::BFLOAT16) {
-        V41RotaryQuantKernel<__nv_bfloat16><<<rows, dim, shared>>>((__nv_bfloat16*)x.cudaData, rowsPerToken, dim, rope,
-            ropeDim, startPos, posStep, inverse ? 1 : 0, quantMode, quantDim, quantBlock);
+        V41RotaryQuantKernel<__nv_bfloat16><<<blocks, threads>>>((__nv_bfloat16*)x.cudaData, rowsPerToken, dim, rope,
+            ropeDim, startPos, posStep, inverse ? 1 : 0, quantMode, quantDim, quantBlock, rowsPerBlock, rows);
     } else if (x.dataType == DataType::FLOAT16) {
-        V41RotaryQuantKernel<half><<<rows, dim, shared>>>((half*)x.cudaData, rowsPerToken, dim, rope,
-            ropeDim, startPos, posStep, inverse ? 1 : 0, quantMode, quantDim, quantBlock);
+        V41RotaryQuantKernel<half><<<blocks, threads>>>((half*)x.cudaData, rowsPerToken, dim, rope,
+            ropeDim, startPos, posStep, inverse ? 1 : 0, quantMode, quantDim, quantBlock, rowsPerBlock, rows);
     } else {
-        V41RotaryQuantKernel<float><<<rows, dim, shared>>>((float*)x.cudaData, rowsPerToken, dim, rope,
-            ropeDim, startPos, posStep, inverse ? 1 : 0, quantMode, quantDim, quantBlock);
+        V41RotaryQuantKernel<float><<<blocks, threads>>>((float*)x.cudaData, rowsPerToken, dim, rope,
+            ropeDim, startPos, posStep, inverse ? 1 : 0, quantMode, quantDim, quantBlock, rowsPerBlock, rows);
     }
     return V41CheckLaunch("RotaryQuant");
 }

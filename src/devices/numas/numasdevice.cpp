@@ -8475,7 +8475,9 @@ namespace fastllm {
                     // 的 dims，避免与主线程的 CPU 分支并发访问同一个 Data。
                     const size_t workerInputBytes = input.GetBytes();
                     const size_t workerOutputBytes = outputBytes;
-                    gpuThreads.emplace_back([&, i, workerDevice]() {
+                    gpuThreads.emplace_back(
+                        [&, i, workerDevice,
+                         workerInputBytes, workerOutputBytes]() {
                         FastllmCudaSetDevice(workerDevice);
                         // 输入搬运：主线程只分配了副本缓冲，这里在本线程的
                         // per-thread stream 上排队，与 root 卡的专家计算和

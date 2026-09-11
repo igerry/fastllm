@@ -298,6 +298,12 @@ namespace fastllm {
                                                                              // OnResponseContextCreated 接管
         DeepSeekV41HistoryCacheManager v41HistoryCache;
 
+        // -------- 单 token decode 的 CUDA Graph --------
+        // 捕获的两段（见 ForwardSegments 里的说明）只读写权重与解码工作区，不碰任何
+        // 请求私有的 KV 缓存，因此整个模型共用一份图；状态自带互斥量，抢不到锁的并发
+        // 前向直接退回逐算子执行。
+        std::shared_ptr<void> v41CudaGraphSlot;
+
         std::shared_ptr<DeepSeekV41RequestState> GetOrCreateState(
                 std::vector<std::pair<Data, Data> > &pastKeyValues, bool reset);
         std::shared_ptr<DeepSeekV41RequestState> GetStateByFirstKey(const Data *firstKey);

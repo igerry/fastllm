@@ -2208,6 +2208,15 @@ namespace fastllm {
             return mask;
         }
 
+        // 排查用：让第 N 段的捕获强制失败，验证"就地退回逐算子"这条回退路径
+        int V41DecodeCudaGraphFailAt() {
+            static const int at = []() -> int {
+                const char *env = std::getenv("FASTLLM_DSV41_CUDA_GRAPH_FAIL_AT");
+                return env != nullptr && env[0] != '\0' ? atoi(env) : -1;
+            }();
+            return at;
+        }
+
         bool V41DecodeCudaGraphVerbose() {
             static const bool v = V41EnvFlag("FASTLLM_DSV41_CUDA_GRAPH_DEBUG");
             return v;
@@ -2922,7 +2931,8 @@ namespace fastllm {
                 return;
             }
             if (graphCapture) {
-                if (V41CaptureGraphSegment(*graphState, body)) {
+                if (index != V41DecodeCudaGraphFailAt() &&
+                    V41CaptureGraphSegment(*graphState, body)) {
                     record(graphState->segments.back());
                     return;
                 }

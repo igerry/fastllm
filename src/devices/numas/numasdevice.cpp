@@ -8555,6 +8555,11 @@ namespace fastllm {
                                     outputBytes)) {
                                 FastllmCudaEventRecordCurrentThread(
                                     assistPartialEvents[i]);
+                                // 线程退出时 per-thread 默认流上还挂着这次
+                                // 拷贝，语义上不可依赖，这里显式排空。传输
+                                // 本身仍与主线程的 CPU 专家、root 卡的剩余
+                                // 专家并行，只是不再跨越线程生命周期。
+                                FastllmCudaSyncCurrentThreadStream();
                             } else {
                                 // 没有 peer 通路：pinned host 中转，全部在本
                                 // 线程内完成。事件置空，主线程直接读缓冲。

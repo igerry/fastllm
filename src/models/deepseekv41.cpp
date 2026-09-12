@@ -897,7 +897,23 @@ namespace fastllm {
                 return;
             }
             Data cpu;
+#ifdef USE_CUDA
+            // 复制布局下 root 只有形状信息，CopyFrom 会导出一份垃圾——多卡排查时
+            // 浮点张量会假发散（相关系数接近 0），非常容易误导。从副本取数。
+            if (data.multiDeviceData && data.IsTensorParallelReplicated()) {
+                std::vector<int> replicaDevices;
+                for (const auto &it : data.multiDeviceDatas) {
+                    if (it.second != nullptr) {
+                        replicaDevices.push_back(it.first);
+                    }
+                }
+                V41ReplicaToCpu(cpu, data, replicaDevices);
+            } else {
+                cpu.CopyFrom(data);
+            }
+#else
             cpu.CopyFrom(data);
+#endif
             cpu.ToDevice(DataDevice::CPU);
             Data f32;
             if (cpu.dataType == DataType::FLOAT32) {
@@ -1912,9 +1928,21 @@ namespace fastllm {
         }
 
         // ---- 第三段：wkv 投影与门控写回（GPU，异步）----
+        // 张量并行：gathered / mask 是 CPU 查表产物，而 hiddenStates 是每卡一份的复制布局。
+        // 必须先把它们广播成复制布局，wkv 投影才会逐卡各算一份、kv 也才是复制的；
+        // 否则第二张卡上的 EngramApply 拿不到有效的 kv（读到未初始化显存 -> NaN，
+        // 从 engram 层开始一路传播）。这与 CPU/NUMA MoE 输入、图像 token CPU 路由
+        // 是同一类问题（CPU 产出的数据要喂给复制布局张量）。
         mark = profiling ? V41NowMs() : 0.0;
+        const std::vector<int> tpDevices = V41TpDevices(this->deviceMap);
+        const bool tp = !tpDevices.empty();
         Data kv;
-        Linear(gathered, weight[pre + ".wkv.weight"], Data(), kv);
+#ifdef USE_CUDA
+        if (tp) {
+            PrepareMultiCudaReplicatedData(gathered, tpDevices, true);
+        }
+#endif
+        Linear(gathered, weight[pre + ".wkv.weight"], Data(), kv, tp);
         if (profiling) {
             tWkv = V41NowMs() - mark;
             mark = V41NowMs();
@@ -1922,6 +1950,11 @@ namespace fastllm {
         Data mask;
         if (hasDead) {
             mask.CopyFrom(Data(DataType::FLOAT32, {1, total}, maskValues));
+#ifdef USE_CUDA
+            if (tp) {
+                PrepareMultiCudaReplicatedData(mask, tpDevices, true);
+            }
+#endif
         }
         V41EngramApply(hiddenStates, kv, weight[pre + ".q_weight"], weight[pre + ".k_weight"],
                        hasDead ? &mask : nullptr, rms_norm_eps);

@@ -1435,7 +1435,10 @@ namespace fastllm {
                     result[name].push_back({name, DataType::FLOAT32});
                     continue;
                 }
-                if (V41EndsWith(name, ".markov_head.embed.weight")) {
+                // markov head 的两张表都保持 checkpoint 的 BF16：一来不做多余的重量化，
+                // 二来融合的 markov kernel 要求 embed 与 head 的 dtype 一致（各 66 MB）
+                if (V41EndsWith(name, ".markov_head.embed.weight") ||
+                    V41EndsWith(name, ".markov_head.head.weight")) {
                     result[name].push_back({name, DataType::BFLOAT16});
                     continue;
                 }

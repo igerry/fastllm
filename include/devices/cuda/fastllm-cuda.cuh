@@ -834,6 +834,10 @@ bool FastllmCudaDeepSeekV41CandidateBlocks(const fastllm::Data &score, int block
                                            int ratio, int startPos, fastllm::Data &output);
 bool FastllmCudaDeepSeekV41IndexerTopK(const fastllm::Data &score, const fastllm::Data *candidates,
                                        int topK, int ratio, int startPos, int blockSize, fastllm::Data &output);
+// DSpark 草稿侧的 markov head 整条链（src/devices/cuda/models/deepseekv41-dspark-kernels.cu）
+bool FastllmCudaDeepSeekV41MarkovChain(const fastllm::Data &logits, const fastllm::Data &embedWeight,
+                                       const fastllm::Data &headWeight, int anchorToken, int block,
+                                       std::vector<int> &outTokens, fastllm::Data &outEmbeds);
 bool FastllmCudaDeepSeekV41SparseAttention(const fastllm::Data &q, const fastllm::Data &chunkKV,
                                            const fastllm::Data *ringKV, const fastllm::Data *compressedKV,
                                            const fastllm::Data *cmpIdx, fastllm::Data &attnSink,

@@ -201,6 +201,7 @@ namespace fastllm {
             double draftTotal = 0.0, draftMain = 0.0, draftLayers = 0.0;
             double draftHead = 0.0, draftMarkov = 0.0, draftConf = 0.0;
             double draftMarkovBias = 0.0, draftMarkovArgmax = 0.0;
+            uint64_t draftMarkovFused = 0;
             uint64_t draftCalls = 0;        // 真正生成了候选的次数
             double mainOnly = 0.0;          // 只更新草稿滑窗、不生成候选（prefill 分块）
             uint64_t mainOnlyCalls = 0;
@@ -212,7 +213,11 @@ namespace fastllm {
             // markov 内部再拆：bias 是 embed + [vocab, rank] 投影，argmax 含 TopK 与同步回主机。
             // 后者每个位置一次，block_size 个位置就是 block_size 次设备同步。
             double markovBias = 0.0, markovArgmax = 0.0;
-            void Reset() { layers = head = markov = conf = markovBias = markovArgmax = 0.0; }
+            bool markovFused = false;      // 走了融合 kernel（此时不再拆投影 / argmax）
+            void Reset() {
+                layers = head = markov = conf = markovBias = markovArgmax = 0.0;
+                markovFused = false;
+            }
         };
 
         DsDraftTiming &DsDraftTimingSlot() {
@@ -328,6 +333,7 @@ namespace fastllm {
                 stat.draftMarkov += parts.markov;
                 stat.draftMarkovBias += parts.markovBias;
                 stat.draftMarkovArgmax += parts.markovArgmax;
+                stat.draftMarkovFused += parts.markovFused ? 1 : 0;
                 stat.draftConf += parts.conf;
             }
 
@@ -446,10 +452,16 @@ namespace fastllm {
                        tag, s.draftTotal / draft, s.draftMain / draft, s.draftLayers / draft,
                        s.draftHead / draft, s.draftMarkov / draft, s.draftConf / draft,
                        (unsigned long long)s.draftCalls);
-                printf("[DSpark %s] 其中 markov %.3f ms = 投影 %.3f + argmax/同步 %.3f（每次草稿 %d 个位置，"
-                       "逐位置串行）\n",
-                       tag, s.draftMarkov / draft, s.draftMarkovBias / draft,
-                       s.draftMarkovArgmax / draft, blockSize);
+                if (s.draftCalls > 0 && s.draftMarkovFused == s.draftCalls) {
+                    printf("[DSpark %s] 其中 markov %.3f ms（融合 kernel，%d 个位置的链留在设备上，"
+                           "主机只取回一次）\n", tag, s.draftMarkov / draft, blockSize);
+                } else {
+                    printf("[DSpark %s] 其中 markov %.3f ms = 投影 %.3f + argmax/同步 %.3f"
+                           "（%d 个位置逐位置串行，融合 kernel 用上 %llu / %llu 次）\n",
+                           tag, s.draftMarkov / draft, s.draftMarkovBias / draft,
+                           s.draftMarkovArgmax / draft, blockSize,
+                           (unsigned long long)s.draftMarkovFused, (unsigned long long)s.draftCalls);
+                }
                 if (s.mainOnlyCalls > 0) {
                     printf("[DSpark %s] 只更新草稿滑窗（prefill 分块等）%llu 次，每次 %.3f ms\n",
                            tag, (unsigned long long)s.mainOnlyCalls,
@@ -1395,39 +1407,52 @@ namespace fastllm {
         DsDraftTimingSlot().head = DsElapsed(headStart);
 
         // ---- markov head：逐位置加 bigram 偏置后贪心采样 ----
+        //
+        // 这条链天然串行（每一步要用上一步的 token 去查嵌入），用通用算子拼出来的话
+        // 每步都得把 token 取回主机，于是每步一次完整的设备同步。实测迷你模型上 5 步
+        // 就要 2.6 ms，比整个目标模型的一次前向还贵，而 DSpark 在真实模型上的总收益
+        // 也才几毫秒。所以 CUDA 上走一个把整条链留在设备上的融合 kernel，
+        // 主机只在最后取回一次；其它设备（或 dtype / 布局不满足前提时）退回下面的通用实现。
         const double markovStart = DsTick();
         Data &markovEmbedWeight = weight[last + ".markov_head.embed.weight"];
         Data &markovHeadWeight = weight[last + ".markov_head.head.weight"];
-        std::vector<Data> markovEmbeds(block);
-        int previous = anchorToken;
-        tokens.reserve(block);
-        for (int i = 0; i < block; i++) {
-            const double biasStart = DsTick();
-            Data ids(DataType::FLOAT32, {1, 1}, {(float)previous});
-            Data embedOut, bias, stepLogits;
-            EmbeddingDirect(ids, markovEmbedWeight, embedOut);
-            markovEmbeds[i].CopyFrom(embedOut);
-            Linear(embedOut, markovHeadWeight, Data(), bias);
-            ToDataType(bias, DataType::FLOAT32);
-            Split(logits, 1, i, i + 1, stepLogits);
-            AddTo(stepLogits, bias);
-            DsDraftTimingSlot().markovBias += DsElapsed(biasStart);
-            const double argmaxStart = DsTick();
-            std::vector<int> best = DsArgmaxRows(stepLogits);
-            DsDraftTimingSlot().markovArgmax += DsElapsed(argmaxStart);
-            AssertInFastLLM(best.size() == 1, "DeepSeekV41 DSpark: draft sampling failed.");
-            previous = best[0];
-            tokens.push_back(previous);
+        const int markovRank = markovEmbedWeight.dims.size() == 2 ? markovEmbedWeight.dims[1]
+                                                                  : v41DsparkMarkovRank;
+        Data markovAll;                 // [1, block, rank]，confidence head 的输入
+        bool fusedMarkov = false;
+#ifdef USE_CUDA
+        if (!DsEnvFlag("FASTLLM_DSPARK_DISABLE_FUSED_MARKOV") && logits.dataDevice == DataDevice::CUDA) {
+            markovEmbedWeight.ToDevice(DataDevice::CUDA);
+            markovHeadWeight.ToDevice(DataDevice::CUDA);
+            fusedMarkov = FastllmCudaDeepSeekV41MarkovChain(logits, markovEmbedWeight, markovHeadWeight,
+                                                            anchorToken, block, tokens, markovAll);
+            DsDraftTimingSlot().markovFused = fusedMarkov;
         }
-
-        DsDraftTimingSlot().markov = DsElapsed(markovStart);
-
-        // ---- confidence head：sigmoid(proj(cat(hidden, markov_embed))) ----
-        const double confStart = DsTick();
-        confidence.assign(block, 1.0f);
-        auto confIt = weight.weight.find(last + ".confidence_head.proj.weight");
-        if (confIt != weight.weight.end() && v41DsparkConfidenceThreshold > 0.0f) {
-            Data markovAll, tmp;
+#endif
+        if (!fusedMarkov) {
+            std::vector<Data> markovEmbeds(block);
+            int previous = anchorToken;
+            tokens.clear();
+            tokens.reserve(block);
+            for (int i = 0; i < block; i++) {
+                const double biasStart = DsTick();
+                Data ids(DataType::FLOAT32, {1, 1}, {(float)previous});
+                Data embedOut, bias, stepLogits;
+                EmbeddingDirect(ids, markovEmbedWeight, embedOut);
+                markovEmbeds[i].CopyFrom(embedOut);
+                Linear(embedOut, markovHeadWeight, Data(), bias);
+                ToDataType(bias, DataType::FLOAT32);
+                Split(logits, 1, i, i + 1, stepLogits);
+                AddTo(stepLogits, bias);
+                DsDraftTimingSlot().markovBias += DsElapsed(biasStart);
+                const double argmaxStart = DsTick();
+                std::vector<int> best = DsArgmaxRows(stepLogits);
+                DsDraftTimingSlot().markovArgmax += DsElapsed(argmaxStart);
+                AssertInFastLLM(best.size() == 1, "DeepSeekV41 DSpark: draft sampling failed.");
+                previous = best[0];
+                tokens.push_back(previous);
+            }
+            Data tmp;
             for (int i = 0; i < block; i++) {
                 if (i == 0) {
                     markovAll.CopyFrom(markovEmbeds[0]);
@@ -1436,7 +1461,17 @@ namespace fastllm {
                     markovAll.CopyFrom(tmp);
                 }
             }
-            markovAll.Reshape({1, block, v41DsparkMarkovRank});
+            markovAll.Reshape({1, block, markovRank});
+        }
+
+        DsDraftTimingSlot().markov = DsElapsed(markovStart);
+
+        // ---- confidence head：sigmoid(proj(cat(hidden, markov_embed))) ----
+        const double confStart = DsTick();
+        confidence.assign(block, 1.0f);
+        auto confIt = weight.weight.find(last + ".confidence_head.proj.weight");
+        if (confIt != weight.weight.end() && v41DsparkConfidenceThreshold > 0.0f &&
+            markovAll.dims.size() == 3) {
             Data hiddenFloat, markovFloat, features, confLogits;
             ToDataType(headHidden, hiddenFloat, DataType::FLOAT32);
             ToDataType(markovAll, markovFloat, DataType::FLOAT32);

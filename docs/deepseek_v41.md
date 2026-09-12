@@ -11,6 +11,7 @@
 - `src/devices/cuda/models/deepseekv41-kernels.cu`：对应的 CUDA kernel（面向 SM86 等无 FP8 tensor core 的设备；
   稀疏注意力与 indexer 打分在 SM80+ 上走 BF16 mma，其余算子为 FP32）
 - `src/models/deepseekv41_dspark.cpp`：DSpark 投机解码（草稿层 `mtp.*`、校验与回滚）
+- `src/devices/cuda/models/deepseekv41-dspark-kernels.cu`：DSpark 草稿侧 markov head 整条链的融合 kernel
 - `tools/fastllm_pytools/deepseek_v41_engram.py`：Engram 哈希元数据生成
 - `tools/fastllm_pytools/encoding_dsv41.py`：官方 V4.1 prompt 编码（vendored）
 - `tools/fastllm_pytools/deepseek_v41_multimodal.py`：图像动态分辨率预处理（移植自官方 `image_processor.py`）与图像占位符展开
@@ -687,9 +688,30 @@ token：第一个立刻返回，其余进入请求的待发队列，调度器之
   token 数成正比，所以校验 N 个候选的前向应当只比单 token 前向贵一点（贵的是这 N 个 token
   选中专家的**并集**，不是 N 倍）。这个差值要靠 `FASTLLM_DSPARK_PROBE_EVERY=8` 拿到同等缓存
   状态下的对照基线；差值接近 N 倍说明专家并集几乎没有重叠，块开大了不划算。
-- **草稿分段**：三层是草稿骨干（128 专家 top-3，跟着 `--moe_device` 走），markov 的
-  `argmax/同步` 是 `block_size` 次串行的 TopK + 设备到主机同步，块越大越贵。
+- **草稿分段**：三层是草稿骨干（128 专家 top-3，跟着 `--moe_device` 走）。
   草稿总耗时接近甚至超过"校验与普通前向之差 × 平均接受长度"时，收益就被草稿吃掉了。
+
+#### markov head 的融合 kernel
+
+markov 链是串行的：每一步都要拿上一步的 token 去查嵌入、算 `[vocab, rank]` 的偏置、再取 argmax。
+用通用算子拼出来的话每一步都得把 token 取回主机（查嵌入与切片都需要主机侧的下标），
+于是每步一次完整的设备同步。迷你模型上实测这 5 步要 2.78 ms，比整个目标模型的一次前向（3.24 ms）
+还贵；其中光 `[1, rank] x [vocab, rank]` 这个 GEMV 就占 0.39 ms／步——按带宽只该 20 us，
+通用 Linear 在"一行输入、又高又窄的权重"这种形状上效率很低。
+
+CUDA 上因此走一个把整条链留在设备上的融合 kernel（token 一直在显存里，主机只在最后取回一次），
+输出与通用实现逐 bit 一致，可以用 `FASTLLM_DSPARK_DISABLE_FUSED_MARKOV=1` 对拍。
+迷你模型（6 层 + 3 草稿层、`--dtype float16`、单卡 3090 Ti）上的效果：
+
+| | 通用算子 | 融合 kernel |
+| --- | --- | --- |
+| markov | 2.779 ms | 0.746 ms |
+| 草稿阶段合计 | 4.276 ms | 2.229 ms |
+| 每个输出 token | 8.066 ms | 5.976 ms |
+| decode 吞吐 | 125 tok/s | 168 tok/s |
+
+其它设备、或者 dtype / 张量布局不满足前提（权重被量化、多卡分片等）时自动退回通用实现。
+为此 `markov_head.embed/head` 两张表都按 checkpoint 原样保持 BF16（各 66 MB，不做重量化）。
 
 注意力等 GPU 上的部分是异步下发的，要拿到真实耗时需要同时设 `FASTLLM_CUDA_SYNC=1`，
 否则那些项只反映 kernel launch 的时间；路由专家在 cpu / numa 上时本来就是同步的，不受影响。
@@ -703,6 +725,7 @@ token：第一个立刻返回，其余进入请求的待发队列，调度器之
 | `FASTLLM_DSPARK_STATS` | `1` 累计统计接受率与分段耗时，`2` 额外逐轮打印一行。默认关闭，见下文"接受率与分段计时" |
 | `FASTLLM_DSPARK_STATS_EVERY` | 每累计 N 轮校验打印一次（默认 64，0 表示只在退出时打印） |
 | `FASTLLM_DSPARK_STATS_WARMUP` | 统计前跳过的轮数（默认 3）。第一次 decode 含 CUDA context / 显存池 / 权重量化缓存的一次性开销，会把均值拉偏 |
+| `FASTLLM_DSPARK_DISABLE_FUSED_MARKOV` | 关掉 markov head 的融合 kernel，退回通用算子（对拍 / 排查用；两条路径输出逐 bit 一致） |
 | `FASTLLM_DSPARK_PROBE_EVERY` | 每 N 轮故意不带候选走一次普通单 token 前向，给"校验 N 个候选"提供同等缓存状态下的对照基线。默认 0（关闭），只在诊断时打开 |
 | `FASTLLM_DSPARK_STATS_FILE` | 每轮校验追加一行 `轮次 候选数 接受数`（测试用） |
 | `FASTLLM_DSPARK_FORCE_DRAFTS` | 用文件里的候选替换模型的候选，构造指定的接受长度（测试用） |

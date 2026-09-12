@@ -264,6 +264,9 @@ namespace fastllm {
             bool On() const { return level > 0; }
 
             void SetBlockSize(int n) {
+                if (level == 0) {
+                    return;
+                }
                 std::lock_guard<std::mutex> guard(mutex);
                 if (blockSize != n) {
                     blockSize = n;
@@ -273,6 +276,9 @@ namespace fastllm {
             }
 
             void AddPendingHit() {
+                if (level == 0) {
+                    return;
+                }
                 std::lock_guard<std::mutex> guard(mutex);
                 if (!WarmedLocked()) {
                     return;
@@ -281,6 +287,9 @@ namespace fastllm {
             }
 
             void AddNoProposal() {
+                if (level == 0) {
+                    return;
+                }
                 std::lock_guard<std::mutex> guard(mutex);
                 if (!WarmedLocked()) {
                     return;
@@ -290,6 +299,9 @@ namespace fastllm {
 
             // 草稿模型产出了 generated 个候选，置信度筛选后送去校验 offered 个
             void AddProposal(int generated, int offered) {
+                if (level == 0) {
+                    return;
+                }
                 std::lock_guard<std::mutex> guard(mutex);
                 if (!WarmedLocked()) {
                     return;
@@ -301,6 +313,9 @@ namespace fastllm {
             }
 
             void AddDraft(double total, double main, const DsDraftTiming &parts) {
+                if (level == 0) {
+                    return;
+                }
                 std::lock_guard<std::mutex> guard(mutex);
                 if (!WarmedLocked()) {
                     return;
@@ -317,6 +332,9 @@ namespace fastllm {
             }
 
             void AddMainOnly(double ms) {
+                if (level == 0) {
+                    return;
+                }
                 std::lock_guard<std::mutex> guard(mutex);
                 if (!WarmedLocked()) {
                     return;
@@ -326,6 +344,9 @@ namespace fastllm {
             }
 
             void AddPlainForward(double ms) {
+                if (level == 0) {
+                    return;
+                }
                 std::lock_guard<std::mutex> guard(mutex);
                 if (warmupLeft > 0) {
                     warmupLeft--;
@@ -337,6 +358,9 @@ namespace fastllm {
             }
 
             void AddVerify(int drafts, int accepted, double forwardMs, double commitMs) {
+                if (level == 0) {
+                    return;
+                }
                 std::lock_guard<std::mutex> guard(mutex);
                 if (warmupLeft > 0) {
                     warmupLeft--;

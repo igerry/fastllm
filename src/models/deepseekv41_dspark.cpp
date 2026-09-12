@@ -41,6 +41,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -165,6 +167,322 @@ namespace fastllm {
 
         float DsSigmoid(float x) {
             return x >= 0.0f ? 1.0f / (1.0f + std::exp(-x)) : std::exp(x) / (1.0f + std::exp(x));
+        }
+
+        // ---------------- 接受率与分段计时 ----------------
+        // FASTLLM_DSPARK_STATS=1 累计统计（退出时与每 N 轮打印一次），=2 额外逐轮打印一行。
+        // FASTLLM_DSPARK_STATS_EVERY=N 控制中途汇总的频率（默认 64，0 表示只在退出时打印）。
+        //
+        // 草稿阶段（三个草稿层 + markov head + confidence head）与校验阶段分开计时。
+        // 草稿层的路由专家跑在 moe_device 上：放 cpu / numa 时是同步的，计时准确；
+        // 注意力等 GPU 上的部分是异步下发的，要拿到真实耗时需要同时设 FASTLLM_CUDA_SYNC=1，
+        // 否则这些项只反映 kernel launch 的时间。
+        //
+        // "校验前向"与"普通单 token 前向"分别累计，两者之差就是多校验 N 个候选的边际代价；
+        // 路由专家在 CPU 上时代价与"选中专家的权重字节数"成正比而不是与 token 数成正比，
+        // 所以这个差值通常远小于 N 倍。
+
+        double DsNowMs() {
+            return std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now().time_since_epoch()).count();
+        }
+
+        struct DsparkStat {
+            uint64_t verifyRounds = 0;      // 带候选的校验前向
+            uint64_t plainRounds = 0;       // 没有候选的单 token 前向（dspark 已开启）
+            uint64_t pendingHits = 0;       // 直接从待发队列出队、完全没有前向的轮
+            uint64_t proposed = 0;          // 实际参与校验的候选数
+            uint64_t accepted = 0;
+            uint64_t generatedByDraft = 0;  // 由草稿模型产出、还没经过置信度筛选的候选数
+            std::vector<uint64_t> acceptHist;   // 接受长度 0..blockSize
+            std::vector<uint64_t> offerHist;    // 置信度截断后送去校验的候选数 0..blockSize
+            uint64_t noProposal = 0;        // 该轮没有可用候选（还没生成 / 锚点不匹配）
+            double verifyForward = 0.0, plainForward = 0.0, commit = 0.0;
+            double draftTotal = 0.0, draftMain = 0.0, draftLayers = 0.0;
+            double draftHead = 0.0, draftMarkov = 0.0, draftConf = 0.0;
+            double draftMarkovBias = 0.0, draftMarkovArgmax = 0.0;
+            uint64_t draftCalls = 0;        // 真正生成了候选的次数
+            double mainOnly = 0.0;          // 只更新草稿滑窗、不生成候选（prefill 分块）
+            uint64_t mainOnlyCalls = 0;
+        };
+
+        // DsparkRunDraft 把自己的分段耗时放这里，由 DsparkAdvance 取走（避免改函数签名）
+        struct DsDraftTiming {
+            double layers = 0.0, head = 0.0, markov = 0.0, conf = 0.0;
+            // markov 内部再拆：bias 是 embed + [vocab, rank] 投影，argmax 含 TopK 与同步回主机。
+            // 后者每个位置一次，block_size 个位置就是 block_size 次设备同步。
+            double markovBias = 0.0, markovArgmax = 0.0;
+            void Reset() { layers = head = markov = conf = markovBias = markovArgmax = 0.0; }
+        };
+
+        DsDraftTiming &DsDraftTimingSlot() {
+            static thread_local DsDraftTiming timing;
+            return timing;
+        }
+
+        struct DsparkProfiler {
+            int level = 0;
+            uint64_t reportEvery = 64;
+            std::mutex mutex;
+            DsparkStat stat;
+            uint64_t sinceReport = 0;
+            int blockSize = 0;
+            // 头几轮包含 CUDA context、显存池、权重量化缓存的一次性开销，
+            // 会把均值拉得没法看（实测第一次 decode 比稳态慢一个数量级），默认跳过。
+            uint64_t warmupLeft = 3;
+            uint64_t warmupSkipped = 0;
+
+            DsparkProfiler() {
+                const char *v = std::getenv("FASTLLM_DSPARK_STATS");
+                if (v != nullptr && v[0] != '\0' && strcmp(v, "0") != 0) {
+                    level = atoi(v);
+                    if (level <= 0) {
+                        level = 1;
+                    }
+                }
+                const char *e = std::getenv("FASTLLM_DSPARK_STATS_EVERY");
+                if (e != nullptr && e[0] != '\0') {
+                    long long n = atoll(e);
+                    reportEvery = n > 0 ? (uint64_t)n : 0;
+                }
+                const char *w = std::getenv("FASTLLM_DSPARK_STATS_WARMUP");
+                if (w != nullptr && w[0] != '\0') {
+                    long long n = atoll(w);
+                    warmupLeft = n > 0 ? (uint64_t)n : 0;
+                }
+            }
+
+            // 调用方已经持有 mutex
+            bool WarmedLocked() const { return warmupLeft == 0; }
+
+            ~DsparkProfiler() {
+                if (level > 0) {
+                    Report("汇总");
+                }
+            }
+
+            bool On() const { return level > 0; }
+
+            void SetBlockSize(int n) {
+                std::lock_guard<std::mutex> guard(mutex);
+                if (blockSize != n) {
+                    blockSize = n;
+                    stat.acceptHist.assign((size_t)n + 1, 0);
+                    stat.offerHist.assign((size_t)n + 1, 0);
+                }
+            }
+
+            void AddPendingHit() {
+                std::lock_guard<std::mutex> guard(mutex);
+                if (!WarmedLocked()) {
+                    return;
+                }
+                stat.pendingHits++;
+            }
+
+            void AddNoProposal() {
+                std::lock_guard<std::mutex> guard(mutex);
+                if (!WarmedLocked()) {
+                    return;
+                }
+                stat.noProposal++;
+            }
+
+            // 草稿模型产出了 generated 个候选，置信度筛选后送去校验 offered 个
+            void AddProposal(int generated, int offered) {
+                std::lock_guard<std::mutex> guard(mutex);
+                if (!WarmedLocked()) {
+                    return;
+                }
+                stat.generatedByDraft += (uint64_t)generated;
+                if (offered >= 0 && offered < (int)stat.offerHist.size()) {
+                    stat.offerHist[offered]++;
+                }
+            }
+
+            void AddDraft(double total, double main, const DsDraftTiming &parts) {
+                std::lock_guard<std::mutex> guard(mutex);
+                if (!WarmedLocked()) {
+                    return;
+                }
+                stat.draftCalls++;
+                stat.draftTotal += total;
+                stat.draftMain += main;
+                stat.draftLayers += parts.layers;
+                stat.draftHead += parts.head;
+                stat.draftMarkov += parts.markov;
+                stat.draftMarkovBias += parts.markovBias;
+                stat.draftMarkovArgmax += parts.markovArgmax;
+                stat.draftConf += parts.conf;
+            }
+
+            void AddMainOnly(double ms) {
+                std::lock_guard<std::mutex> guard(mutex);
+                if (!WarmedLocked()) {
+                    return;
+                }
+                stat.mainOnlyCalls++;
+                stat.mainOnly += ms;
+            }
+
+            void AddPlainForward(double ms) {
+                std::lock_guard<std::mutex> guard(mutex);
+                if (warmupLeft > 0) {
+                    warmupLeft--;
+                    warmupSkipped++;
+                    return;
+                }
+                stat.plainRounds++;
+                stat.plainForward += ms;
+            }
+
+            void AddVerify(int drafts, int accepted, double forwardMs, double commitMs) {
+                std::lock_guard<std::mutex> guard(mutex);
+                if (warmupLeft > 0) {
+                    warmupLeft--;
+                    warmupSkipped++;
+                    return;
+                }
+                stat.verifyRounds++;
+                stat.proposed += (uint64_t)drafts;
+                stat.accepted += (uint64_t)accepted;
+                stat.verifyForward += forwardMs;
+                stat.commit += commitMs;
+                if (accepted >= 0 && accepted < (int)stat.acceptHist.size()) {
+                    stat.acceptHist[accepted]++;
+                }
+                if (level >= 2) {
+                    printf("[DSpark] round %llu：候选 %d 接受 %d，校验前向 %.3f ms，回滚 %.3f ms\n",
+                           (unsigned long long)stat.verifyRounds, drafts, accepted, forwardMs, commitMs);
+                    fflush(stdout);
+                }
+                if (reportEvery > 0 && ++sinceReport >= reportEvery) {
+                    sinceReport = 0;
+                    ReportLocked("进行中");
+                }
+            }
+
+            void Report(const char *tag) {
+                std::lock_guard<std::mutex> guard(mutex);
+                ReportLocked(tag);
+            }
+
+            void ReportLocked(const char *tag) {
+                const DsparkStat &s = stat;
+                if (s.verifyRounds == 0 && s.plainRounds == 0 && s.draftCalls == 0) {
+                    return;
+                }
+                const double verify = (double)std::max<uint64_t>(s.verifyRounds, 1);
+                const double plain = (double)std::max<uint64_t>(s.plainRounds, 1);
+                const double draft = (double)std::max<uint64_t>(s.draftCalls, 1);
+                const uint64_t forwards = s.verifyRounds + s.plainRounds;
+                const uint64_t outputs = forwards + s.pendingHits;
+
+                printf("[DSpark %s] 前向 %llu 次（校验 %llu + 普通 %llu），出队 %llu，共产出 %llu 个 token"
+                       "；每次前向 %.3f 个 token（已跳过 %llu 轮预热）\n",
+                       tag, (unsigned long long)forwards, (unsigned long long)s.verifyRounds,
+                       (unsigned long long)s.plainRounds, (unsigned long long)s.pendingHits,
+                       (unsigned long long)outputs,
+                       forwards > 0 ? (double)outputs / (double)forwards : 0.0,
+                       (unsigned long long)warmupSkipped);
+
+                if (s.verifyRounds > 0) {
+                    printf("[DSpark %s] 候选 %llu 接受 %llu（接受率 %.1f%%），平均每轮接受 %.2f 个"
+                           "；草稿产出 %llu 个候选，置信度筛掉 %.1f%%\n",
+                           tag, (unsigned long long)s.proposed, (unsigned long long)s.accepted,
+                           s.proposed > 0 ? 100.0 * (double)s.accepted / (double)s.proposed : 0.0,
+                           (double)s.accepted / verify,
+                           (unsigned long long)s.generatedByDraft,
+                           s.generatedByDraft > 0 ?
+                               100.0 * (double)(s.generatedByDraft - s.proposed) / (double)s.generatedByDraft : 0.0);
+                    PrintHist(tag, "接受长度", s.acceptHist, s.verifyRounds);
+                }
+                if (!s.offerHist.empty()) {
+                    uint64_t total = 0;
+                    for (uint64_t v : s.offerHist) {
+                        total += v;
+                    }
+                    if (total > 0) {
+                        PrintHist(tag, "送检候选数", s.offerHist, total);
+                    }
+                }
+                if (s.noProposal > 0) {
+                    printf("[DSpark %s] 没有可用候选的轮次 %llu\n", tag, (unsigned long long)s.noProposal);
+                }
+
+                printf("[DSpark %s] 每次前向：校验 %.3f ms（%llu 次）/ 普通 %.3f ms（%llu 次），"
+                       "差 %.3f ms；回滚 %.3f ms\n",
+                       tag, s.verifyForward / verify, (unsigned long long)s.verifyRounds,
+                       s.plainForward / plain, (unsigned long long)s.plainRounds,
+                       s.verifyRounds > 0 && s.plainRounds > 0 ?
+                           s.verifyForward / verify - s.plainForward / plain : 0.0,
+                       s.commit / verify);
+                printf("[DSpark %s] 每次草稿 %.3f ms = main %.3f + 三层 %.3f + head %.3f + markov %.3f"
+                       " + confidence %.3f（%llu 次）\n",
+                       tag, s.draftTotal / draft, s.draftMain / draft, s.draftLayers / draft,
+                       s.draftHead / draft, s.draftMarkov / draft, s.draftConf / draft,
+                       (unsigned long long)s.draftCalls);
+                printf("[DSpark %s] 其中 markov %.3f ms = 投影 %.3f + argmax/同步 %.3f（每次草稿 %d 个位置，"
+                       "逐位置串行）\n",
+                       tag, s.draftMarkov / draft, s.draftMarkovBias / draft,
+                       s.draftMarkovArgmax / draft, blockSize);
+                if (s.mainOnlyCalls > 0) {
+                    printf("[DSpark %s] 只更新草稿滑窗（prefill 分块等）%llu 次，每次 %.3f ms\n",
+                           tag, (unsigned long long)s.mainOnlyCalls,
+                           s.mainOnly / (double)s.mainOnlyCalls);
+                }
+                // 每产出一个 token 的实际开销：目标前向 + 草稿 + 回滚
+                const double totalMs = s.verifyForward + s.plainForward + s.draftTotal + s.mainOnly + s.commit;
+                if (outputs > 0) {
+                    printf("[DSpark %s] 每个输出 token 合计 %.3f ms（目标前向 %.3f + 草稿 %.3f + 回滚 %.3f）\n",
+                           tag, totalMs / (double)outputs,
+                           (s.verifyForward + s.plainForward) / (double)outputs,
+                           (s.draftTotal + s.mainOnly) / (double)outputs,
+                           s.commit / (double)outputs);
+                }
+                fflush(stdout);
+            }
+
+            static void PrintHist(const char *tag, const char *name,
+                                  const std::vector<uint64_t> &hist, uint64_t total) {
+                if (hist.empty() || total == 0) {
+                    return;
+                }
+                std::string line;
+                char buffer[64];
+                for (size_t i = 0; i < hist.size(); i++) {
+                    snprintf(buffer, sizeof(buffer), "%s%d:%llu(%.0f%%)", i == 0 ? "" : " ",
+                             (int)i, (unsigned long long)hist[i], 100.0 * (double)hist[i] / (double)total);
+                    line += buffer;
+                }
+                printf("[DSpark %s] %s分布 %s\n", tag, name, line.c_str());
+            }
+        };
+
+        DsparkProfiler &DsProfiler() {
+            static DsparkProfiler profiler;
+            return profiler;
+        }
+
+        // FASTLLM_DSPARK_PROBE_EVERY=N：每 N 轮故意不带候选走一次普通单 token 前向，
+        // 给"校验 N 个候选"提供一个同等缓存状态下的对照基线。N=0（默认）关闭。
+        // 只在诊断时打开：这些轮次不投机，会按比例损失一点吞吐。
+        bool DsProbeThisRound() {
+            static int every = DsEnvInt("FASTLLM_DSPARK_PROBE_EVERY", 0);
+            if (every <= 0) {
+                return false;
+            }
+            static std::atomic<long long> counter{0};
+            return (counter.fetch_add(1) % every) == 0;
+        }
+
+        // 计时开销可以忽略，但关掉统计时连时钟都不读
+        inline double DsTick() {
+            return DsProfiler().On() ? DsNowMs() : 0.0;
+        }
+
+        inline double DsElapsed(double start) {
+            return DsProfiler().On() ? DsNowMs() - start : 0.0;
         }
 
         // ---- 测试用的调试钩子 ----
@@ -363,6 +681,7 @@ namespace fastllm {
             this->cantQuantLinears.insert(pre + ".attn.wo_a.weight");
             this->cantQuantLinears.insert(pre + ".ffn.gate.weight");
         }
+        DsProfiler().SetBlockSize(v41DsparkTokens);
         printf("[Fastllm] DeepSeek-V4.1 DSpark: %d draft layers, block size %d (verifying %d), "
                "%d experts (top-%d), target layers = [", v41DsparkLayers, v41DsparkBlockSize,
                v41DsparkTokens, v41DsparkExperts, v41DsparkTopk);
@@ -461,6 +780,7 @@ namespace fastllm {
             if (ids.size() == 1 && ids[0] == pending.front().first) {
                 const int ret = pending.front().second;
                 pending.pop_front();
+                DsProfiler().AddPendingHit();
                 return ret;
             }
         }
@@ -476,20 +796,24 @@ namespace fastllm {
                                                  int startPos, Data &verifyIds, std::vector<int> &drafts) {
         drafts.clear();
         if (!state.dspark || state.dspark->disabled || state.dspark->drafts.empty()) {
+            DsProfiler().AddNoProposal();
             return 0;
         }
         DeepSeekV41DsparkState &dspark = *state.dspark;
         if (dspark.anchorPos != startPos || dspark.committed != startPos) {
             dspark.drafts.clear();
+            DsProfiler().AddNoProposal();
             return 0;
         }
         std::vector<int> ids = DsReadIds(inputIds);
         if (ids.size() != 1 || ids[0] != dspark.anchor) {
             dspark.drafts.clear();
+            DsProfiler().AddNoProposal();
             return 0;
         }
         // 置信度：conditional survival 低于阈值处截断本轮校验的候选数
-        int count = std::min((int)dspark.drafts.size(), v41DsparkTokens);
+        const int generated = std::min((int)dspark.drafts.size(), v41DsparkTokens);
+        int count = generated;
         if (v41DsparkConfidenceThreshold > 0.0f && (int)dspark.confidence.size() >= count) {
             for (int i = 0; i < count; i++) {
                 if (dspark.confidence[i] < v41DsparkConfidenceThreshold) {
@@ -498,6 +822,12 @@ namespace fastllm {
                 }
             }
         }
+        if (DsProbeThisRound()) {
+            // 对照轮：丢掉候选走普通前向（下一轮 DsparkAdvance 会重新生成）
+            dspark.drafts.clear();
+            return 0;
+        }
+        DsProfiler().AddProposal(generated, count);
         if (count <= 0) {
             dspark.drafts.clear();
             return 0;
@@ -607,8 +937,14 @@ namespace fastllm {
             }
         }
 
+        const double forwardStart = DsTick();
         std::vector<int> ret = ForwardSegments(segments, *idsPtr, nullptr, nullptr, generationConfigs,
                                                lastTokens, retLogits, samplingPastKeyValues);
+        const double forwardMs = DsElapsed(forwardStart);
+        // 单请求单 token 的普通前向：与校验前向对照，差值就是多校验 N 个候选的边际代价
+        if (drafts == 0 && numSegments == 1 && seqlen == 1 && active[0]) {
+            DsProfiler().AddPlainForward(forwardMs);
+        }
 
         if (drafts > 0) {
             DeepSeekV41RequestState &state = *segments[0].state;
@@ -620,7 +956,10 @@ namespace fastllm {
                 accepted++;
             }
             const int commitCount = accepted + 1;
+            const double commitStart = DsTick();
             DsparkCommitPrefix(state, scratch, startPos, commitCount, drafts + 1);
+            const double commitMs = DsElapsed(commitStart);
+            DsProfiler().AddVerify(drafts, accepted, forwardMs, commitMs);
             ret.assign(1, scratch.greedy[0]);
             for (int j = 1; j <= accepted; j++) {
                 state.dspark->pending.push_back(std::make_pair(scratch.greedy[j - 1], scratch.greedy[j]));
@@ -739,6 +1078,8 @@ namespace fastllm {
             dspark.filled = 0;
         }
 
+        const double advanceStart = DsTick();
+
         // 1) main_x = main_norm(main_proj(cat(mean_hc(h_37), mean_hc(h_38), mean_hc(h_39))))
         Data combined, tmp;
         for (size_t k = 0; k < scratch.mainHidden.size(); k++) {
@@ -775,14 +1116,25 @@ namespace fastllm {
         }
         dspark.committed = committed;
         dspark.filled = std::min(dspark.filled + rows, window_size);
+        const double mainMs = DsElapsed(advanceStart);
 
         // 3) 生成下一轮的候选
         if (anchorToken < 0 || dspark.committed <= 0) {
+            // prefill 分块的中间结果不是真正的下一个 token，这一轮只更新滑窗
+            if (DsProfiler().On()) {
+                DsProfiler().AddMainOnly(mainMs);
+            }
             return;
         }
         std::vector<int> tokens;
         std::vector<float> confidence;
+        DsDraftTimingSlot().Reset();
+        const double draftStart = DsTick();
         DsparkRunDraft(dspark, anchorToken, tokens, confidence);
+        const double draftMs = DsElapsed(draftStart);
+        if (DsProfiler().On()) {
+            DsProfiler().AddDraft(mainMs + draftMs, mainMs, DsDraftTimingSlot());
+        }
         if (tokens.empty()) {
             return;
         }
@@ -865,6 +1217,7 @@ namespace fastllm {
         Data w1, w2, w3, tempInput, tempOutput, moeInputTemp, moeOutputTemp;
         Data confidenceInput;
 
+        const double layersStart = DsTick();
         for (int stage = 0; stage < v41DsparkLayers; stage++) {
             const std::string pre = "mtp." + std::to_string(stage);
             const int layerId = std::max(0, block_cnt - v41DsparkLayers + stage);
@@ -1003,7 +1356,10 @@ namespace fastllm {
             preMix.CopyFrom(ffnPre);
         }
 
+        DsDraftTimingSlot().layers = DsElapsed(layersStart);
+
         // ---- head：mtp.<last>.norm + 共享 lm_head ----
+        const double headStart = DsTick();
         const std::string last = "mtp." + std::to_string(v41DsparkLayers - 1);
         Data headHidden;
         DsHcApplyPre(*curHidden, preMix, headHidden);       // confidence head 的输入（未归一化）
@@ -1012,13 +1368,17 @@ namespace fastllm {
         Linear(normed, weight["head.weight"], *GetEmptyData(), logits);
         ToDataType(logits, DataType::FLOAT32);
 
+        DsDraftTimingSlot().head = DsElapsed(headStart);
+
         // ---- markov head：逐位置加 bigram 偏置后贪心采样 ----
+        const double markovStart = DsTick();
         Data &markovEmbedWeight = weight[last + ".markov_head.embed.weight"];
         Data &markovHeadWeight = weight[last + ".markov_head.head.weight"];
         std::vector<Data> markovEmbeds(block);
         int previous = anchorToken;
         tokens.reserve(block);
         for (int i = 0; i < block; i++) {
+            const double biasStart = DsTick();
             Data ids(DataType::FLOAT32, {1, 1}, {(float)previous});
             Data embedOut, bias, stepLogits;
             EmbeddingDirect(ids, markovEmbedWeight, embedOut);
@@ -1027,13 +1387,19 @@ namespace fastllm {
             ToDataType(bias, DataType::FLOAT32);
             Split(logits, 1, i, i + 1, stepLogits);
             AddTo(stepLogits, bias);
+            DsDraftTimingSlot().markovBias += DsElapsed(biasStart);
+            const double argmaxStart = DsTick();
             std::vector<int> best = DsArgmaxRows(stepLogits);
+            DsDraftTimingSlot().markovArgmax += DsElapsed(argmaxStart);
             AssertInFastLLM(best.size() == 1, "DeepSeekV41 DSpark: draft sampling failed.");
             previous = best[0];
             tokens.push_back(previous);
         }
 
+        DsDraftTimingSlot().markov = DsElapsed(markovStart);
+
         // ---- confidence head：sigmoid(proj(cat(hidden, markov_embed))) ----
+        const double confStart = DsTick();
         confidence.assign(block, 1.0f);
         auto confIt = weight.weight.find(last + ".confidence_head.proj.weight");
         if (confIt != weight.weight.end() && v41DsparkConfidenceThreshold > 0.0f) {
@@ -1060,6 +1426,7 @@ namespace fastllm {
                 confidence[i] = std::isfinite(p) ? p : 1.0f;
             }
         }
+        DsDraftTimingSlot().conf = DsElapsed(confStart);
     }
 
     void DeepSeekV41Model::DsparkReportStats() {

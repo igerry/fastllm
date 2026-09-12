@@ -18,6 +18,8 @@
 - `test/basic/deepseek_v41_reference.py`：与官方 `inference/model.py` 的端到端数值对齐测试
 - `test/basic/deepseek_v41_vision_reference.py`：图文输入的端到端对齐测试（含真实 ViT 权重验证）
 - `test/basic/deepseek_v41_dspark.py`：DSpark 的精确性（开 / 关输出一致）与回滚测试
+- `test/basic/test_deepseek_v41_cpu_fixture.py`：CPU-only 的固定 fixture 对齐回归（只依赖 numpy，可进 CI）
+- `test/ops/deepseekV41OpsRegression.cpp`：11 个 V4.1 专用算子的 CPU / CUDA 一致性测试
 
 ## 相对 DeepSeek-V4 的架构变化
 
@@ -915,6 +917,50 @@ indexer 分数矩阵的分块效果（65536 token prefill，扣掉同卡其它�
 而 logits 仍与 BF16 存储逐 bit 相同。剩下的差距全部在稀疏注意力里
 （341 ms vs 268 ms）：解包本身已经不是 ALU 瓶颈（把 FP32 乘 + 转换换成 BF16 上的
 `__hmul2` 没有任何变化），要再往下压得靠 KV tile 的双缓冲，那要重排整个 mma kernel。
+
+### CPU-only 固定 fixture 回归（无需 torch）
+
+`test/basic/deepseek_v41_reference.py` 需要 torch、transformers 与官方 `inference/` 代码，进不了 CI。
+`test/basic/test_deepseek_v41_cpu_fixture.py` 把「一个微型 V4.1 checkpoint + 官方实现算出的参考 logits」
+固化在 `test/basic/deepseek_v41_fixture.npz`（约 2.2 MB）里，只依赖 numpy 与 fastllm 的 Python 包：
+
+```bash
+PYTHONPATH=build/tools python test/basic/test_deepseek_v41_cpu_fixture.py
+```
+
+退出码 0 表示通过，1 表示失败；fixture 缺失时打印重新生成的命令并以 0 退出（跳过）。
+fixture 里的模型是 5 层、dim 128、词表 128、2 专家，覆盖 V4.1 的全部结构特性：
+`compress_ratios = (0, 2, 2, 1, 1)`（三种压缩层）、`kv_source_layer_ids = (1, 3)`（层 2 / 4 跨层复用压缩 KV）、
+`index_source_layer_ids = (1, 3, 4)` 且 `candidate_source_layer_id = 3`（两级 top-k）、
+`engram_layer_ids = (1, 4)`、`hc_mult = 2`、`window_size = 8`（48 token 的 prefill 让滑窗环形缓冲绕多圈）。
+
+比较方式：逐步（prefill + 4 步 decode）比较 logits 的余弦相似度（>= 0.9975）与
+`max|diff|` 占 logits 值域的比例（<= 4%），并要求贪心 token 与参考一致；
+参考侧是官方实现的 bf16 前向，噪声底约为值域的 2–3%（fastllm 自己的 CPU 与 CUDA 路径之间也有约 1.5%），
+所以容差按值域折算而不是给绝对值。fixture 生成时会在多个提示词种子里挑一个每步 top1/top2 间距都
+远大于该噪声的，避免 argmax 因舍入翻转；万一仍然翻转，测试会按"参考侧两者间距落在容差内"判为并列而不算失败。
+
+重新生成 fixture（需要 torch + 官方 inference 代码 + 一张 GPU）：
+
+```bash
+PYTHONPATH=build/tools python test/basic/deepseek_v41_fixture_gen.py \
+  --reference-dir /path/to/DeepSeek-V4.1-Flash/inference \
+  --work-dir /tmp/v41-micro --out test/basic/deepseek_v41_fixture.npz
+```
+
+生成脚本自带一个 128 词的迷你 tokenizer，不依赖真实 checkpoint 的 tokenizer.json。
+
+### 算子级 CPU / CUDA 一致性
+
+`test/ops/deepseekV41OpsRegression.cpp`（`cmake -DUNIT_TEST=ON`）用同一份输入分别在 CPU 与 CUDA 上跑
+11 个 V4.1 专用算子并比较输出，覆盖随机输入与边界情况：
+
+```bash
+./build/deepseekV41OpsRegression            # 全部算子
+./build/deepseekV41OpsRegression --list     # 列出用例
+./build/deepseekV41OpsRegression IndexerTopK CandidateBlocks   # 只跑指定算子
+ctest -R deepseekV41Ops                     # 无 CUDA 设备时以 77 跳过
+```
 
 ## 调试环境变量
 

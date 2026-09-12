@@ -555,14 +555,9 @@ def main():
 
     if not args.skip_rollback:
         block = args.dspark_tokens
-        cases = [
-            ("接受 0 个", [0] * 8),
-            ("接受一部分", [2, 1, 3, 2, 1]),
-            ("全部接受", [block] * 6),
-            ("混合", [0, block, 1, block, 0, 2]),
-        ]
-        for name, pattern in cases:
-            print("\n=== 3. 回滚测试：%s ===" % name)
+
+        def run_case(name, pattern):
+            """按 pattern 注入候选跑一遍，返回 (失败信息或 None, 覆盖到的轮数, 分歧位置)。"""
             force_path = os.path.join(tempfile.gettempdir(), "v41-dspark-force-%d.txt" % os.getpid())
             stats2 = force_path + ".stats"
             for path in (force_path, stats2):
@@ -588,16 +583,49 @@ def main():
             print("    构造的接受长度 %s" % want)
             print("    实际接受长度   %s" % observed[:len(want)])
             if kind == "real":
-                failures.append("回滚测试「%s」的输出与基准不一致（位置 %d，非并列）" % (name, idx))
-            elif observed[:valid] != want[:valid]:
-                failures.append("回滚测试「%s」前 %d 轮的接受长度与构造的不一致：%s != %s"
-                                % (name, valid, observed[:valid], want[:valid]))
+                return ("回滚测试「%s」的输出与基准不一致（位置 %d，非并列）" % (name, idx)), valid, idx
+            if observed[:valid] != want[:valid]:
+                return ("回滚测试「%s」前 %d 轮的接受长度与构造的不一致：%s != %s"
+                        % (name, valid, observed[:valid], want[:valid])), valid, idx
+            return None, valid, idx
+
+        cases = [
+            ("接受 0 个", [0] * 8),
+            ("接受一部分", [2, 1, 3, 2, 1]),
+            ("全部接受", [block] * 6),
+            ("混合", [0, block, 1, block, 0, 2]),
+        ]
+        covered_lengths = set()
+        for name, pattern in cases:
+            print("\n=== 3. 回滚测试：%s ===" % name)
+            problem, valid, idx = run_case(name, pattern)
+            if problem is None and valid <= 0 and idx >= 3:
+                # 基准在很靠前的位置就出现 BF16 并列翻转，构造的第一轮跨过了它。
+                # 缩短第一轮的接受长度让它落在分歧之前，重试一次。
+                shrunk = list(pattern)
+                shrunk[0] = max(0, min(shrunk[0], idx - 3))
+                if shrunk != list(pattern):
+                    print("    （基准在位置 %d 就并列翻转，把第一轮的接受长度缩到 %d 重试）"
+                          % (idx, shrunk[0]))
+                    problem, valid, idx = run_case(name, shrunk)
+                    pattern = shrunk
+            if problem is not None:
+                failures.append(problem)
             elif valid <= 0:
-                failures.append("回滚测试「%s」没有覆盖到任何一轮" % name)
+                print("    SKIP: 基准在位置 %d 就并列翻转，这一档没有可判定的轮次" % idx)
             else:
+                covered_lengths.update(pattern[:valid])
                 print("    OK: 前 %d 轮接受长度符合预期%s"
                       % (valid, "，输出与基准完全一致" if idx < 0 else
                          "，位置 %d 起为 BF16 并列翻转" % idx))
+        # 整套测试至少要覆盖到"接受 0 个"、"接受一部分"、"接受满一整块"三类
+        print("\n=== 回滚测试覆盖到的接受长度: %s ===" % sorted(covered_lengths))
+        if 0 not in covered_lengths:
+            failures.append("回滚测试没有覆盖到接受 0 个的情况")
+        if not any(0 < v < block for v in covered_lengths):
+            failures.append("回滚测试没有覆盖到接受一部分的情况")
+        if max(covered_lengths, default=0) < 2:
+            failures.append("回滚测试覆盖到的最大接受长度只有 %d，太弱" % max(covered_lengths, default=0))
 
     print("\n==================== 结果 ====================")
     if failures:

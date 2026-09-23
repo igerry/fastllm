@@ -1110,7 +1110,10 @@ namespace fastllm {
         this->model_struct = "deepseek_v41";
         this->canDoBatchForward = true;      // 多请求 decode 共享一次前向（见 ForwardSegments）
         this->canDoConcurrentForward = true;
-        this->defaultChunkedPrefillSize = 4096;
+        // 2 x RTX 3090 Ti（24 GB）+ 真实权重，32k prefill 实测（chunk / ttft / cuda:0 峰值）：
+        //   4096 -> 38.1 s / 18.6 GB    8192 -> 35.7 s / 20.8 GB    12288 -> 31.8 s / 23.3 GB
+        // 12288 最快，但只剩 1.2 GB 余量，并发或更长上下文会 OOM；8192 留 3.7 GB。
+        this->defaultChunkedPrefillSize = 8192;
 
         weight.embeddingNames.clear();
         weight.embeddingNames.insert("embed.weight");

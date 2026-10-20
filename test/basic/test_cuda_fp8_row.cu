@@ -3,6 +3,7 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include "devices/cuda/fastllm-fp8-small-t.cuh"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -27,6 +28,21 @@ template <class T> T *Upload(const std::vector<T> &v) {
     Check(cudaMalloc(&p, v.size() * sizeof(T)));
     Check(cudaMemcpy(p, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice));
     return p;
+}
+// Exhaust all paired E4M3 codes, including subnormals, signed zero and NaNs.
+__global__ void CheckDecodeHalf2(int *errors) {
+    uint16_t codes = blockIdx.x * blockDim.x + threadIdx.x;
+    __nv_fp8x2_e4m3 q;
+    q.__x = codes;
+    __half2 h = static_cast<__half2>(q);
+    uint32_t expected = *reinterpret_cast<uint32_t *>(&h);
+    uint32_t actual = fastllm::fp8small::DecodeHalf2(codes);
+    for (int shift = 0; shift < 32; shift += 16) {
+        uint16_t a = actual >> shift, e = expected >> shift;
+        // NaN payloads/signs may differ; every other code must be bit-exact.
+        if (a != e && !((a & 0x7fff) > 0x7c00 && (e & 0x7fff) > 0x7c00))
+            atomicAdd(errors, 1);
+    }
 }
 template <class T> void Launch(T *x, uint8_t *w, T *y, T *b, float *s, int M, int K, int N, int bm, int bk) {
     if constexpr (__is_same(T, half))
@@ -79,7 +95,7 @@ template <class T> void Run(int K, int N, int M, bool bias, bool block, bool exp
                     "driver graph kernel params");
                 const char *name = nullptr;
                 Req(cuFuncGetName(&name, p.func) == CUDA_SUCCESS, "driver kernel name");
-                seen |= std::strstr(name, "fp8row") != nullptr;
+                seen |= (std::strstr(name, "fp8row") != nullptr || std::strstr(name, "fp8small") != nullptr);
             }
         }
         Req(seen == (bool(mode) && expected), "graph dispatch mismatch");
@@ -141,12 +157,26 @@ int main() {
         int n = 0;
         if (cudaGetDeviceCount(&n) != cudaSuccess || !n)
             return 77;
+        auto errors = Upload(std::vector<int>(1, 0));
+        CheckDecodeHalf2<<<256, 256>>>(errors);
+        int errorCount = 0;
+        Check(cudaMemcpy(&errorCount, errors, sizeof(int), cudaMemcpyDeviceToHost));
+        Check(cudaFree(errors));
+        Req(errorCount == 0, "FP8 pair decode differs from CUDA conversion");
+        int device = 0;
+        Check(cudaGetDevice(&device));
+        Req(!fastllm::fp8small::KernelAvailable<
+                fastllm::fp8small::MmaKernel<half, 8, 16>, 1025>(device),
+            "unsupported block size admitted");
+        Req(!fastllm::fp8small::CanRun<half>(device, 512, 513, 33),
+            "unsupported row count admitted");
+        Check(cudaGetLastError());
 #define RUN(T)                                                                                               \
     Run<T>(5120, 14336, 1, false, false, true);                                                              \
     Run<T>(5120, 248320, 1, false, false, true);                                                             \
     Run<T>(1024, 4099, 1, true, false, true);                                                                \
     Run<T>(768, 4096, 1, false, false, true);                                                               \
-    Run<T>(1024, 4096, 2, true, false, false);                                                               \
+    Run<T>(1024, 4096, 2, true, false, true);                                                               \
     Run<T>(1024, 4096, 1, false, true, false)
         RUN(half);
         RUN(__nv_bfloat16);
@@ -162,6 +192,18 @@ int main() {
         }
         Run<half>(5803, 4099, 2, true, false, false, 17408);
         Run<__nv_bfloat16>(5803, 4099, 2, true, false, false, 17408);
+        for (int M=2; M<=8; ++M) {
+            Run<half>(5120, 16384, M, M%2, false, true);
+            Run<__nv_bfloat16>(5120, 14336, M, M%2, false, true);
+            Run<half>(768, 4099, M, true, false, true);
+        }
+        bool extended = fastllm::fp8small::UseSm75Mma(device);
+        for (int M = 9; M <= 32; ++M)
+            Run<half>(768, 513, M, M % 2, false, extended);
+        Run<half>(5120,14336,9,false,false,extended);
+        Run<half>(768,513,33,false,false,false);
+        Run<half>(5120,3584,4,false,false,true);
+        Run<__nv_bfloat16>(1536,513,8,true,false,true);
         puts("PASS row FP8");
     } catch (const std::exception &e) {
         fprintf(stderr, "FAIL %s\n", e.what());

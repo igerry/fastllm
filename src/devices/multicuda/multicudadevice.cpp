@@ -5,6 +5,7 @@
 #include "devices/cpu/cpudevice.h"
 #include "devices/cuda/cudadevice.h"
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cuda/fastllm-cuda-nvfp4-fused.h"
 #include "devices/multicuda/multicudadevice.h"
 
 #include "fastllm-multicuda.cuh"
@@ -40,9 +41,10 @@ namespace fastllm {
     static thread_local void *currentMultiCudaDedicatedWorker = nullptr;
     static thread_local bool multiCudaPersistentAsyncDispatch = false;
 
-    static bool MultiCudaEnvFlagEnabled(const char *name) {
+    static bool MultiCudaEnvFlagEnabled(const char *name, bool defaultValue = false) {
         const char *v = std::getenv(name);
-        return v != nullptr && v[0] != '\0' && strcmp(v, "0") != 0 &&
+        if (v == nullptr) return defaultValue;
+        return v[0] != '\0' && strcmp(v, "0") != 0 &&
                strcmp(v, "false") != 0 && strcmp(v, "FALSE") != 0 &&
                strcmp(v, "off") != 0 && strcmp(v, "OFF") != 0;
     }
@@ -3670,19 +3672,16 @@ namespace fastllm {
     }
 
     struct MultiCudaDoMergeMLPOp : MultiThreadBaseOp {
-        uint8_t *oriCudaInput, *oriCpuInput; // 移除了 partOutput
         Data *input, *weight0, *bias0, *weight1, *bias1;
-        Data *w1, *w2, *w3;
+        Data *w1, *w3;
         Data *output;
         int deviceId;
 
-        MultiCudaDoMergeMLPOp(uint8_t *oriCudaInput, uint8_t *oriCpuInput, 
-                            Data *input, Data *weight0, Data *bias0, Data *weight1, Data *bias1, 
-                            Data *w1, Data *w2, Data *w3,
-                            Data *output, int deviceId) : 
-                oriCudaInput(oriCudaInput), oriCpuInput(oriCpuInput), // 移除了 partOutput 初始化
-                input(input), weight0(weight0), bias0(bias0), weight1(weight1), bias1(bias1), 
-                w1(w1), w2(w2), w3(w3), 
+        MultiCudaDoMergeMLPOp(Data *input, Data *weight0, Data *bias0, Data *weight1, Data *bias1,
+                            Data *w1, Data *w3,
+                            Data *output, int deviceId) :
+                input(input), weight0(weight0), bias0(bias0), weight1(weight1), bias1(bias1),
+                w1(w1), w3(w3),
                 output(output), deviceId(deviceId) {}
 
         void Run() {
@@ -3690,14 +3689,26 @@ namespace fastllm {
             AssertInFastLLM(input->cudaData != nullptr, "MultiCudaDoMergeMLPOp: local input should be prepared.\n");
 
             DoCudaLinearReshape(*input, *weight0, *w3);
-            if (bias0 == nullptr) {
-                DoCudaLinear(*input, *weight0, *GetEmptyData(), *w3);
-            } else {
-                DoCudaLinear(*input, *weight0, *bias0, *w3);
-            }
-
             DoCudaSwigluReshape(*w3, *w1);
-            DoCudaSwiglu(*w3, *w1);
+            if (weight0->dataType == DataType::NVFP4_BLOCK_16 &&
+                MultiCudaEnvFlagEnabled("FASTLLM_TP_NVFP4_MLP_SWIGLU", true)) {
+                // CanRun requires the final shape and allocation, including
+                // its owning rank. The block performs the complete fallback
+                // itself when the layout, architecture or bias is unsupported.
+                w1->Allocate();
+                const bool fused = CudaNvfp4LinearSwigluBlock(*input, *weight0,
+                    bias0 == nullptr ? *GetEmptyData() : *bias0, *w3, *w1);
+                static thread_local std::set<int> loggedDevices;
+                if (fused && loggedDevices.insert(deviceId).second) {
+                    printf("[TP MLP] NVFP4 Linear+SwiGLU fused on GPU %d, rows=%llu N=%d K=%d\n",
+                        deviceId, (unsigned long long)(input->Count(0) / weight0->dims[1]),
+                        weight0->dims[0], weight0->dims[1]);
+                }
+            } else {
+                DoCudaLinear(*input, *weight0,
+                    bias0 == nullptr ? *GetEmptyData() : *bias0, *w3);
+                DoCudaSwiglu(*w3, *w1);
+            }
 
             DoCudaLinearReshape(*w1, *weight1, *output);
             output->Allocate();
@@ -3708,39 +3719,6 @@ namespace fastllm {
             }
 
             FastllmNcclAllReduce(output->cudaData, output->cudaData, output->Count(0), output->dataType, deviceId);
-        }
-    };
-
-    struct MultiCudaCpuDoMergeMLPOp : MultiThreadBaseOp {
-        uint8_t *oriCpuInput, *partOutput;
-        Data *input, *weight0, *bias0, *weight1, *bias1;
-        Data *w1, *w2, *w3;
-        Data *output;
-        int deviceId;
-
-        MultiCudaCpuDoMergeMLPOp(uint8_t *oriCpuInput, uint8_t *partOutput,
-                            Data *input, Data *weight0, Data *bias0, Data *weight1, Data *bias1, 
-                            Data *w1, Data *w2, Data *w3,
-                            Data *output, int deviceId) : 
-                oriCpuInput(oriCpuInput), partOutput(partOutput),
-                input(input), weight0(weight0), bias0(bias0), weight1(weight1), bias1(bias1), 
-                w1(w1), w2(w2), w3(w3), 
-                output(output), deviceId(deviceId) {}
-
-        void Run() {
-            input->Allocate();
-            memcpy(input->cpuData, oriCpuInput, input->GetBytes());
-
-            DoCpuLinearReshape(*input, *weight0, *w3);
-            DoCpuLinear(*input, *weight0, bias0 == nullptr ? Data() : *bias0, *w3);
-
-            DoCpuSwigluReshape(*w3, *w1);
-            DoCpuSwiglu(*w3, *w1);
-
-            DoCpuLinearReshape(*w1, *weight1, *output);
-            DoCpuLinear(*w1, *weight1, bias1 == nullptr ? Data() : *bias1, *output);
-
-            FastllmCudaCopyFromHostToDevice(partOutput, output->cpuData, output->GetBytes());
         }
     };
 
@@ -3787,11 +3765,9 @@ namespace fastllm {
         Data &bias1 = *(datas.find("bias1")->second);
 
         Data &w1 = *(datas.find("w1")->second);
-        Data &w2 = *(datas.find("w2")->second);
         Data &w3 = *(datas.find("w3")->second);
 
         output.Allocate();
-// auto st = std::chrono::system_clock::now();
         int mid = weight0.dims[0] / 2;
         int unit = GetMultiCudaSplitUnit(weight0, weight1);
         AssertInFastLLM((!IsGGUFTensor(weight0) && !IsGGUFTensor(weight1)) || mid % unit == 0,
@@ -3816,7 +3792,6 @@ namespace fastllm {
         SplitMultiCudaWeight(weight0, bias0, devices, divisionScheme, 0);
         SplitMultiCudaWeight(weight1, bias1, devices, divisionSchemeO, 1);
         CopyToMultiDevices(w1, devices, false);
-        CopyToMultiDevices(w2, devices, false);
         CopyToMultiDevices(w3, devices, false);
 
         EnsureReplicatedMultiCudaTensor(input, devices, true);
@@ -3836,76 +3811,23 @@ namespace fastllm {
                 if (specialId != "cpu") {
                     opDevices.push_back(device);
                     ops.push_back(new MultiCudaDoMergeMLPOp (
-                        (uint8_t*)input.cudaData, (uint8_t*)input.cudaData, 
                         input.multiDeviceDatas[device], 
                         weight0.multiDeviceDatas[device], bias0.multiDeviceDatas[device], 
                         weight1.multiDeviceDatas[device], bias1.multiDeviceDatas[device], 
-                        w1.multiDeviceDatas[device], w2.multiDeviceDatas[device], w3.multiDeviceDatas[device],
+                        w1.multiDeviceDatas[device], w3.multiDeviceDatas[device],
                         output.multiDeviceDatas[device], device));
                 }
             }
             RunMultiCudaDeviceOpsAndDelete(opDevices, ops);
 
-            SyncReplicatedRootFromReplica(output, devices);
-        }
-/*
-        uint8_t *partOutput = (uint8_t*)FastllmCudaMalloc(output.GetBytes() * devices.size());
-        
-        // Launch cuda op
-        auto *pool = fastllm::GetAlivePool();
-
-        std::vector<fastllm::MultiThreadBaseOp*> ops;
-        for (int i = 0; i < devices.size(); i++) {
-            auto device = devices[i];
-            std::string specialId = "";
-            int mallocType;
-            DeviceGetInfos(device, specialId, mallocType);
-
-            if (specialId != "cpu") {
-                ops.push_back(new MultiCudaDoMergeMLPOp (
-                    (uint8_t*)input.cudaData, (uint8_t*)cpuInput.data(), partOutput + output.GetBytes() * i,
-                    input.multiDeviceDatas[device], 
-                    weight0.multiDeviceDatas[device], bias0.multiDeviceDatas[device], 
-                    weight1.multiDeviceDatas[device], bias1.multiDeviceDatas[device], 
-                    w1.multiDeviceDatas[device], w2.multiDeviceDatas[device], w3.multiDeviceDatas[device],
-                    curOutput.multiDeviceDatas[device], device));
+            // An explicit persistent-workspace caller consumes the root
+            // replica directly and retains all replicas for the next call.
+            // The root allocation is not updated in this mode.
+            auto keep = intParams.find("keepReplicatedOutput");
+            if (keep == intParams.end() || !keep->second) {
+                SyncReplicatedRootFromReplica(output, devices);
             }
         }
-        for (int i = 0; i < ops.size(); i++) {
-            pool->PushOp(i, ops[i]);
-        }
-
-        // run cpu op
-        auto temp = pool->curActivateThreadInterval;
-        pool->curActivateThreadInterval = std::make_pair(ops.size(), pool->threads.size());
-        for (int i = 0; i < devices.size(); i++) {
-            auto device = devices[i];
-            std::string specialId = "";
-            int mallocType;
-            DeviceGetInfos(device, specialId, mallocType);
-
-            if (specialId == "cpu") {
-                MultiCudaCpuDoMergeMLPOp (
-                    (uint8_t*)cpuInput.data(), partOutput + output.GetBytes() * i,
-                    input.multiDeviceDatas[device], 
-                    weight0.multiDeviceDatas[device], bias0.multiDeviceDatas[device], 
-                    weight1.multiDeviceDatas[device], bias1.multiDeviceDatas[device], 
-                    w1.multiDeviceDatas[device], w2.multiDeviceDatas[device], w3.multiDeviceDatas[device],
-                    curOutput.multiDeviceDatas[device], device).Run();
-            }
-        }
-        pool->curActivateThreadInterval = temp;
-
-        // wait cuda op
-        for (int i = 0; i < ops.size(); i++) {
-            pool->Wait(i);
-            delete ops[i];
-        }
-// printf("calc spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
-        FastllmReduce((uint8_t*)output.cudaData, partOutput, output.Count(0), devices.size(), output.dataType);
-        FastllmCudaFree(partOutput);
-// printf("last spend %f s.\n", GetSpan(st, std::chrono::system_clock::now()));
-*/
     }
 
     struct MultiCudaDoLinearOp : MultiThreadBaseOp {
@@ -4315,14 +4237,10 @@ namespace fastllm {
         handle->ownedOps.reserve(devices.size());
         for (int device : devices) {
             handle->ownedOps.emplace_back(new MultiCudaDoMergeMLPOp(
-                (uint8_t*)input.cudaData, (uint8_t*)input.cudaData,
                 input.multiDeviceDatas.at(device),
                 gateupWeight.multiDeviceDatas.at(device), nullptr,
                 downWeight.multiDeviceDatas.at(device), nullptr,
                 swigluOutput.multiDeviceDatas.at(device),
-                // MultiCudaDoMergeMLPOp retains this legacy scratch argument
-                // but does not access it; alias the gateup workspace.
-                gateupOutput.multiDeviceDatas.at(device),
                 gateupOutput.multiDeviceDatas.at(device),
                 output.multiDeviceDatas.at(device), device));
             ops.push_back(handle->ownedOps.back().get());
@@ -4368,17 +4286,33 @@ namespace fastllm {
         int repeatTimes;
         int rootDevice;
         int device;
+        bool repeatFromOutput;
 
         MultiCudaRepeatBroadcastOp(Data *rootInput, Data *localInput,
                                    Data *localOutput, int axis,
-                                   int repeatTimes, int rootDevice, int device) :
+                                   int repeatTimes, int rootDevice, int device, bool repeatFromOutput = false) :
                 rootInput(rootInput), localInput(localInput),
                 localOutput(localOutput), axis(axis),
                 repeatTimes(repeatTimes), rootDevice(rootDevice),
-                device(device) {}
+                device(device), repeatFromOutput(repeatFromOutput) {}
 
         void Run() override {
             FastllmCudaSetDevice(device);
+            if (repeatFromOutput) {
+                // For one outer row, the first output copy is also the
+                // broadcast staging area. Subsequent copies only read this
+                // prefix and write disjoint ranges, avoiding temporary replicas.
+                void *send = device == rootDevice ? rootInput->cudaData : localOutput->cudaData;
+                FastllmNcclBroadcastFrom(send, localOutput->cudaData, rootInput->Count(0),
+                                        rootInput->dataType, rootDevice, device);
+                if (repeatTimes > 1) {
+                    const int bytes = (int)rootInput->GetBytes();
+                    FastllmCudaRepeat(localOutput->cudaData,
+                        (uint8_t *)localOutput->cudaData + bytes, 1, repeatTimes - 1,
+                        bytes, bytes * (repeatTimes - 1), bytes, bytes);
+                }
+                return;
+            }
             void *send = device == rootDevice ? rootInput->cudaData :
                                                 localInput->cudaData;
             FastllmNcclBroadcastFrom(send, localInput->cudaData,
@@ -4426,11 +4360,14 @@ namespace fastllm {
         output.dataDevice = DataDevice::CUDA;
         output.dataDeviceIds = devices;
 
-        // Warmup creates these replicas.  Capture and replay only refresh their
-        // payloads, preserving every pointer recorded in the graph.
-        EnsureReplicatedMultiCudaTensor(input, devices, true);
+        // An unbatched repeat can broadcast straight into the first output
+        // slice. Other layouts retain independent broadcast staging replicas.
+        const bool repeatFromOutput = &input != &output && input.unitSizeDiv == 1 &&
+            input.Count(0) == input.Count(axis) && input.GetBytes() > 0 &&
+            output.GetBytes() <= (uint64_t)std::numeric_limits<int>::max();
+        if (!repeatFromOutput) EnsureReplicatedMultiCudaTensor(input, devices, true);
         EnsureReplicatedMultiCudaTensor(output, devices, false);
-        SyncReplicatedLocalShapeFromRoot(input, devices);
+        if (!repeatFromOutput) SyncReplicatedLocalShapeFromRoot(input, devices);
         SyncReplicatedLocalShapeFromRoot(output, devices);
         if (!FastllmInitNccl(devices)) {
             return false;
@@ -4438,10 +4375,9 @@ namespace fastllm {
 
         int originalDevice = FastllmCudaGetDevice();
         for (int device : devices) {
-            Data *localInput = input.multiDeviceDatas.at(device);
             Data *localOutput = output.multiDeviceDatas.at(device);
             FastllmCudaSetDevice(device);
-            localInput->Allocate(false);
+            if (!repeatFromOutput) input.multiDeviceDatas.at(device)->Allocate(false);
             localOutput->Allocate(false);
         }
         FastllmCudaSetDevice(originalDevice);
@@ -4450,9 +4386,9 @@ namespace fastllm {
         ops.reserve(devices.size());
         for (int device : devices) {
             ops.push_back(new MultiCudaRepeatBroadcastOp(
-                &input, input.multiDeviceDatas.at(device),
+                &input, repeatFromOutput ? nullptr : input.multiDeviceDatas.at(device),
                 output.multiDeviceDatas.at(device), axis, repeatTimes,
-                rootDevice, device));
+                rootDevice, device, repeatFromOutput));
         }
         RunMultiCudaDeviceOpsAndDelete(devices, ops);
         SyncReplicatedRootMetaFromDevice0(output, devices);
@@ -4471,18 +4407,22 @@ namespace fastllm {
         for (int device : devices) {
             if (!reuse) break;
             auto it = output.multiDeviceDatas.find(device);
-            std::vector<int> localDims = dims;
-            localDims[axis] = 0;
-            for (const auto &range : scheme.at(device)) localDims[axis] += range.second - range.first;
+            int localAxis = 0;
+            for (const auto &range : scheme.at(device)) localAxis += range.second - range.first;
             reuse = it != output.multiDeviceDatas.end() && it->second != nullptr &&
-                    it->second->dataType == output.dataType && it->second->dims == localDims &&
+                    it->second->dataType == output.dataType && it->second->dims.size() == dims.size() &&
                     it->second->dataDevice == DataDevice::CUDA && it->second->cudaData != nullptr;
+            if (reuse) for (size_t dim = 0; dim < dims.size(); ++dim)
+                if (it->second->dims[dim] != ((int)dim == axis ? localAxis : dims[dim])) {
+                    reuse = false;
+                    break;
+                }
         }
         if (!reuse) {
             PrepareMultiCudaShardedData(output, devices, dims, axis, scheme);
         } else {
-            output.Resize(dims);
-            output.tpGlobalDims = dims;
+            if (output.dims != dims) output.Resize(dims);
+            if (output.tpGlobalDims != dims) output.tpGlobalDims = dims;
         }
     }
 
@@ -4499,6 +4439,137 @@ namespace fastllm {
             stride *= data.dims[axis];
         }
         return true;
+    }
+
+    bool MultiCudaBroadcastCpuActivation(Data &input, const std::vector<int> &devices) {
+        if (currentMultiCudaDedicatedWorker != nullptr || devices.size() < 2 ||
+            input.dataDevice != DataDevice::CPU || !input.cpuData || input.multiDeviceData ||
+            !IsCompactV41Activation(input) || input.Count(0) == 0 ||
+            input.Count(0) > std::numeric_limits<int>::max()) return false;
+        std::set<int> seen;
+        for (int device : devices) {
+            std::string specialId;
+            int mallocType = 0;
+            DeviceGetInfos(device, specialId, mallocType);
+            if (!specialId.empty() || mallocType == 0 || !seen.insert(device).second) return false;
+        }
+        if (!FastllmInitNccl(devices)) return false;
+        const int previousDevice = FastllmCudaGetDevice();
+        const int root = devices.front();
+        // Keep the original host allocation alive through its synchronous
+        // pageable-memory upload. The normal worker handoff orders the root
+        // stream's copy before NCCL; all consumers retain that same ordering.
+        PrepareMultiCudaReplicatedData(input, devices, false);
+        for (int device : devices) {
+            FastllmCudaSetDevice(device);
+            input.multiDeviceDatas.at(device)->Allocate(false);
+        }
+        FastllmCudaSetDevice(root);
+        FastllmCudaCopyFromHostToDevice(input.multiDeviceDatas.at(root)->cudaData,
+                                       input.cpuData, input.GetBytes());
+        const bool launched = MultiCudaRunDeviceCallbacks(devices, [&](int, int device) {
+            Data &local = *input.multiDeviceDatas.at(device);
+            FastllmNcclBroadcastFrom(local.cudaData, local.cudaData,
+                (int)local.Count(0), local.dataType, root, device);
+        });
+        FastllmCudaSetDevice(previousDevice);
+        AssertInFastLLM(launched, "MultiCuda CPU activation broadcast failed.");
+        return true;
+    }
+
+    static bool MultiCudaV41LocalHeadsValid(const Data &q, const std::vector<int> &devices);
+
+    bool MultiCudaDeepSeekV41SparseAttentionBatch(
+            const std::vector<FastllmCudaV41AttentionRequest> &requests,
+            Data &attnSink, int windowSize, float scale, const std::vector<int> &devices,
+            const std::function<void(int, int)> &before,
+            const std::function<void(int, int)> &after, bool workerOrdered) {
+        if (requests.empty() || devices.size() < 2) return false;
+        for (const auto &r : requests) {
+            if (!r.q || !r.output || !r.q->multiDeviceData || !r.q->IsTensorParallelSharded() ||
+                r.q->tpAxis != 2 || !MultiCudaV41LocalHeadsValid(*r.q, devices)) return false;
+        }
+        const auto &scheme = requests.front().q->tpRanges;
+        for (const auto &r : requests) if (r.q->tpRanges != scheme) return false;
+        auto mutableDevices = devices;
+        if (!attnSink.multiDeviceData && !SplitMultiCudaWeight1D(attnSink, mutableDevices, scheme)) return false;
+        for (const auto &r : requests) {
+            r.output->dataType = DataType::BFLOAT16;
+            PrepareV41ShardedOutput(*r.output, devices, r.q->dims, 2, scheme);
+        }
+        std::vector<int> ok(devices.size(), 0);
+        auto task = [&](int rank, int device) {
+            auto local = [&](const Data *root) -> const Data* {
+                if (!root) return nullptr;
+                auto found = root->multiDeviceDatas.find(device);
+                return found == root->multiDeviceDatas.end() ? nullptr : found->second;
+            };
+            std::vector<FastllmCudaV41AttentionRequest> batch;
+            for (const auto &r : requests) {
+                batch.push_back({local(r.q), local(r.chunkKV), local(r.ringKV), local(r.compressedKV),
+                    local(r.indices), r.output->multiDeviceDatas.at(device), r.startPos});
+                if (!batch.back().q || !batch.back().chunkKV || (r.ringKV && !batch.back().ringKV) ||
+                    (r.compressedKV && !batch.back().compressedKV) || (r.indices && !batch.back().indices)) return;
+            }
+            Data &sink = *attnSink.multiDeviceDatas.at(device);
+            if (before) before(rank, device);
+            if (!FastllmCudaDeepSeekV41SparseAttentionBatch(batch, sink, windowSize, scale)) {
+                if (FastllmCudaGetThreadError()) return;
+                // Preserve existing scalar/MMA support on other SMs and dtypes.
+                for (const auto &r : batch) {
+                    if (!FastllmCudaDeepSeekV41SparseAttention(*r.q, *r.chunkKV, r.ringKV, r.compressedKV,
+                        r.indices, sink, windowSize, r.startPos, scale, *r.output)) return;
+                }
+            }
+            if (after) after(rank, device);
+            ok[rank] = 1;
+        };
+        bool dispatched = workerOrdered && MultiCudaRunDeviceCallbacksEnqueueOnly(devices, task);
+        if (!dispatched) dispatched = MultiCudaRunDeviceCallbacks(devices, task);
+        if (!dispatched) {
+            const int originalDevice = FastllmCudaGetDevice();
+            for (size_t rank = 0; rank < devices.size(); ++rank) {
+                FastllmCudaSetDevice(devices[rank]);
+                task(rank, devices[rank]);
+                FastllmCudaSyncDevice(devices[rank]);
+            }
+            FastllmCudaSetDevice(originalDevice);
+        }
+        AssertInFastLLM(std::all_of(ok.begin(), ok.end(), [](int value) { return value != 0; }),
+                        "DeepSeekV41 batch attention failed on a TP rank.");
+        return true;
+    }
+
+    bool MultiCudaCopyShardedActivation(Data &dst, const Data &src,
+                                        const std::vector<int> &devices, bool copyData) {
+        if (&dst == &src) return true;
+        if (devices.size() < 2 || !src.multiDeviceData || !src.IsTensorParallelSharded()) return false;
+        for (int device : devices) {
+            auto it = src.multiDeviceDatas.find(device);
+            if (it == src.multiDeviceDatas.end() || it->second == nullptr ||
+                it->second->cudaData == nullptr || !IsCompactV41Activation(*it->second)) return false;
+        }
+        dst.dataType = src.dataType;
+        dst.UpdateUnitSize();
+        PrepareV41ShardedOutput(dst, devices, src.dims, src.tpAxis, src.tpRanges);
+        std::vector<int> ok(devices.size(), 0);
+        auto copy = [&](int rank, int device) {
+            FastllmCudaSetDevice(device);
+            Data &output = *dst.multiDeviceDatas.at(device);
+            const Data &input = *src.multiDeviceDatas.at(device);
+            output.Allocate(false);
+            ok[rank] = !copyData || FastllmCudaCopyFromDeviceToDeviceAsyncCurrentThread(
+                output.cudaData, input.cudaData, input.GetBytes());
+        };
+        if (!MultiCudaRunDeviceCallbacks(devices, copy)) {
+            const int originalDevice = FastllmCudaGetDevice();
+            for (size_t rank = 0; rank < devices.size(); ++rank) {
+                copy(rank, devices[rank]);
+                FastllmCudaSyncDevice(devices[rank]);
+            }
+            FastllmCudaSetDevice(originalDevice);
+        }
+        return std::all_of(ok.begin(), ok.end(), [](int value) { return value != 0; });
     }
 
     bool MultiCudaCopyReplicaToCpu(Data &dst, const Data &src,
@@ -4545,10 +4616,12 @@ namespace fastllm {
         FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
         CudaDeepSeekV4HcPostOp cudaPostOp;
         BaseOperator *postOp = (BaseOperator *)&cudaPostOp;
-        DataDict roots = {{"input", &input}, {"residual", &residual},
+        const bool mixed = input.dataType == DataType::FLOAT32 &&
+            shared.dataType == DataType::BFLOAT16 && residual.dataType == DataType::BFLOAT16;
+        DataDict roots = {{"input", mixed ? &shared : &input}, {"residual", &residual},
                           {"post", &post}, {"comb", &comb}, {"output", &output}};
         if (devices.size() <= 1 || currentMultiCudaDedicatedWorker != nullptr ||
-            shared.dataType != input.dataType || shared.Count(0) != input.Count(0) ||
+            (!mixed && shared.dataType != input.dataType) || shared.Count(0) != input.Count(0) ||
             !postOp->CanRun("DeepSeekV41HcPost", roots, {}, {})) return false;
         for (Data *data : {&input, &shared, &residual, &post, &comb}) {
             if (data->multiDeviceData && !data->IsTensorParallelReplicated()) return false;
@@ -4584,6 +4657,13 @@ namespace fastllm {
                 localInput.Allocate(false);
                 FastllmCudaCopyFromHostToDevice(localInput.cudaData, cpuInput, inputBytes);
             }
+            if (mixed) {
+                AssertInFastLLM(FastllmCudaDeepSeekV41MoeHcPost(localInput, localShared,
+                    *residual.multiDeviceDatas.at(device), *post.multiDeviceDatas.at(device),
+                    *comb.multiDeviceDatas.at(device), *output.multiDeviceDatas.at(device)),
+                    "DeepSeekV41 mixed MoE HC post rejected validated tensors.");
+                return;
+            }
             // Keep the two kernels: AddTo must round to the activation dtype
             // before HcPost multiplies it by post and adds the residual mix.
             FastllmCudaAddTo(localInput, localShared, 1.0f);
@@ -4598,12 +4678,13 @@ namespace fastllm {
         return dispatched;
     }
 
-    bool MultiCudaDeepSeekV41SharedSwiglu(Data &input, float limit, Data &output) {
+    static bool RunMultiCudaV41SharedSwiglu(Data &input, float limit, Data &output, bool quantized) {
         std::vector<int> devices;
         std::map<int, int> ratios;
         FastllmGetMulticudaDeviceAndRatio(devices, ratios, true);
         if (!input.multiDeviceData || devices.size() <= 1) {
-            return FastllmCudaDeepSeekV41SharedSwiglu(input, limit, output);
+            return quantized ? FastllmCudaDeepSeekV41SharedSwigluQuantized(input, limit, output) :
+                FastllmCudaDeepSeekV41SharedSwiglu(input, limit, output);
         }
         if (input.dims.empty() || input.dims.back() % 2 != 0) return false;
         std::vector<int> dims = input.dims;
@@ -4640,12 +4721,28 @@ namespace fastllm {
         } else {
             return false;
         }
+        if (quantized) for (int device : devices) {
+            const Data &local = *input.multiDeviceDatas.at(device);
+            // Each local gate/up pair must preserve complete block-32 groups.
+            if (local.dims.empty() || local.dims.back() % 64 != 0) return false;
+        }
         std::vector<int> ok(devices.size(), 0);
         const bool dispatched = MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
-            ok[rank] = FastllmCudaDeepSeekV41SharedSwiglu(
-                *input.multiDeviceDatas.at(device), limit, *output.multiDeviceDatas.at(device));
+            Data &localInput = *input.multiDeviceDatas.at(device);
+            Data &localOutput = *output.multiDeviceDatas.at(device);
+            ok[rank] = quantized ?
+                FastllmCudaDeepSeekV41SharedSwigluQuantized(localInput, limit, localOutput) :
+                FastllmCudaDeepSeekV41SharedSwiglu(localInput, limit, localOutput);
         });
         return dispatched && std::all_of(ok.begin(), ok.end(), [](int value) { return value != 0; });
+    }
+
+    bool MultiCudaDeepSeekV41SharedSwiglu(Data &input, float limit, Data &output) {
+        return RunMultiCudaV41SharedSwiglu(input, limit, output, false);
+    }
+
+    bool MultiCudaDeepSeekV41SharedSwigluQuantized(Data &input, float limit, Data &output) {
+        return RunMultiCudaV41SharedSwiglu(input, limit, output, true);
     }
 
     struct MultiCudaDelegatedCudaOp : MultiThreadBaseOp {
@@ -4875,8 +4972,7 @@ namespace fastllm {
         for (int device : devices) {
             auto it = q.multiDeviceDatas.find(device);
             if (it == q.multiDeviceDatas.end() || it->second == nullptr ||
-                it->second->dims.size() != 4 || it->second->dims[2] <= 0 ||
-                it->second->dims[2] % 32 != 0) {
+                it->second->dims.size() != 4 || it->second->dims[2] <= 0) {
                 return false;
             }
         }
@@ -4960,7 +5056,7 @@ namespace fastllm {
                 return;
             }
             AssertInFastLLM(MultiCudaV41LocalHeadsValid(q, devices),
-                            "DeepSeekV41SparseAttention MultiCuda needs a per-rank head count that is a multiple of 32.\n");
+                            "DeepSeekV41SparseAttention MultiCuda needs a valid nonempty head shard on every rank.\n");
             if (!attnSink.multiDeviceData) {
                 AssertInFastLLM(SplitMultiCudaWeight1D(attnSink, devices, q.tpRanges),
                                 "DeepSeekV41SparseAttention MultiCuda failed to split attn_sink.\n");
@@ -5439,10 +5535,19 @@ namespace fastllm {
 
         DoCudaLinearReshape(input, weight, output);
         int outputAxis = (int)output.dims.size() - 1;
+        // Attention views a row-linear output as [..., heads, headDim].
+        // Flattening that view for the next projection must retain the local
+        // allocations: captured kernels still write to those addresses.
+        auto flattenShardDims = [](std::vector<int> dims, int axis) {
+            if (axis < 0 || axis >= (int)dims.size()) return std::vector<int>();
+            for (int i = axis + 1; i < (int)dims.size(); ++i) dims[axis] *= dims[i];
+            dims.resize(axis + 1);
+            return dims;
+        };
         bool reuseOutput = output.multiDeviceData &&
                            output.IsTensorParallelSharded() &&
-                           output.tpAxis == outputAxis &&
-                           output.tpGlobalDims == output.dims;
+                           flattenShardDims(output.tpGlobalDims, output.tpAxis) == output.dims &&
+                           output.multiDeviceDatas.size() == devices.size();
         if (reuseOutput) {
             for (int device : devices) {
                 std::vector<int> localDims = output.dims;
@@ -5454,7 +5559,8 @@ namespace fastllm {
                 auto it = output.multiDeviceDatas.find(device);
                 if (it == output.multiDeviceDatas.end() || it->second == nullptr ||
                     it->second->dataType != output.dataType ||
-                    it->second->dims != localDims ||
+                    flattenShardDims(it->second->dims, output.tpAxis) != localDims ||
+                    (it->second->dims != localDims && !it->second->expansionDims.empty()) ||
                     it->second->dataDevice != DataDevice::CUDA ||
                     it->second->cudaData == nullptr) {
                     reuseOutput = false;
@@ -5470,6 +5576,11 @@ namespace fastllm {
             // not; keep its address stable for whole-step CUDA graph capture.
             output.tpRanges = divisionScheme;
             output.tpGlobalDims = output.dims;
+            output.tpAxis = outputAxis;
+            for (int device : devices) {
+                auto *local = output.multiDeviceDatas.at(device);
+                local->Reshape(flattenShardDims(local->dims, outputAxis));
+            }
             output.cudaData = nullptr;
         }
 
@@ -5556,6 +5667,74 @@ namespace fastllm {
                                     Data &output) {
         return RunMultiCudaColumnLinear(
             input, weight, bias, output, false, true);
+    }
+
+    bool MultiCudaTryReduceReplicatedFp32Accumulated(Data &data) {
+        if (!data.IsTensorParallelReplicated() || data.multiDeviceDatas.size() < 2 ||
+            data.dataType != DataType::BFLOAT16 ||
+            data.Count(0) > (uint64_t)std::numeric_limits<int>::max()) return false;
+        if (const char *disabled = getenv("FASTLLM_DISABLE_NCCL")) {
+            if (!strcmp(disabled, "1") || !strcasecmp(disabled, "true")) return false;
+        }
+        // FP16 ToDataType uses round-toward-zero, while the custom
+        // collective rounds to nearest. Keep that dtype on its original path.
+        const int count = (int)data.Count(0);
+        std::vector<int> devices;
+        for (const auto &entry : data.multiDeviceDatas) {
+            const Data *local = entry.second;
+            if (!local || !local->cudaData || local->dataDevice != DataDevice::CUDA ||
+                local->dataType != data.dataType || local->Count(0) != data.Count(0) ||
+                reinterpret_cast<uintptr_t>(local->cudaData) % 16 != 0) return false;
+            // Require both policies: the reference FP32 path must also use
+            // the rank-ordered custom sum, preserving its reduction order.
+            if (!FastllmCudaCustomAllReduceCanRun(count, data.dataType, entry.first) ||
+                !FastllmCudaCustomAllReduceCanRun(count, DataType::FLOAT32, entry.first)) return false;
+            devices.push_back(entry.first);
+        }
+        std::vector<char> reduced(devices.size(), 0);
+        const bool dispatched = MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
+                void *ptr = data.multiDeviceDatas.at(device)->cudaData;
+                reduced[rank] = FastllmCudaCustomAllReduce(ptr, ptr, count, data.dataType, device);
+            });
+        AssertInFastLLM(dispatched && !FastllmCudaGetThreadError(),
+                        "Custom FP32-accumulated reduction dispatch failed.\n");
+        const bool complete = std::all_of(reduced.begin(), reduced.end(), [](char ok) { return ok != 0; });
+        const bool untouched = std::none_of(reduced.begin(), reduced.end(), [](char ok) { return ok != 0; });
+        AssertInFastLLM(complete || untouched, "Partial custom FP32-accumulated reduction.\n");
+        if (!complete) return false;
+        SyncReplicatedRootMetaFromDevice0(data, devices);
+        return true;
+    }
+
+    bool MultiCudaReduceReplicated(Data &data) {
+        if (!data.IsTensorParallelReplicated() || data.multiDeviceDatas.empty()) return false;
+        std::vector<int> devices;
+        for (const auto &entry : data.multiDeviceDatas) {
+            const Data *local = entry.second;
+            if (local == nullptr || local->cudaData == nullptr ||
+                local->dataDevice != DataDevice::CUDA || local->dataType != data.dataType ||
+                local->Count(0) != data.Count(0)) return false;
+            devices.push_back(entry.first);
+        }
+        bool useNccl = FastllmInitNccl(devices);
+        if (const char *disabled = getenv("FASTLLM_DISABLE_NCCL")) {
+            if (!strcmp(disabled, "1") || !strcasecmp(disabled, "true")) useNccl = false;
+        }
+        if (useNccl) {
+            if (!MultiCudaRunDeviceCallbacks(devices, [&](int rank, int device) {
+                    Data &local = *data.multiDeviceDatas.at(device);
+                    FastllmNcclAllReduce(local.cudaData, local.cudaData, local.Count(0),
+                                        local.dataType, device);
+                })) return false;
+        } else {
+            // Peer-copy fallback cannot reuse a partial until its producer
+            // finishes. It intentionally stays synchronous without NCCL.
+            for (int device : devices) FastllmCudaSyncDevice(device);
+            ReduceReplicatedOutputOnRoot(data, devices);
+            for (int device : devices) FastllmCudaSyncDevice(device);
+        }
+        SyncReplicatedRootMetaFromDevice0(data, devices);
+        return true;
     }
 
     bool MultiCudaLinearOp::CanRun(const std::string &opType, const DataDict &datas, const FloatDict &floatParams, const IntDict &intParams) {
@@ -6335,6 +6514,7 @@ auto st = std::chrono::system_clock::now();
         int wBatch;
         float sharedScale;
         float swigluLimit;
+        bool deepSeekV41 = false;
         Data *output;
         Data *pairedReduceInput;
         int rootDeviceId;
@@ -6500,7 +6680,7 @@ auto st = std::chrono::system_clock::now();
                     (const float*)((uint8_t*)gpuRoutePacket.cudaData + routeOffset + routeBytes);
                 bool ok = false;
 #ifdef FASTLLM_ENABLE_DSV4_MOE_DEEPGEMM_SM120
-                if (MultiCudaDsv4DeepGemmMoeEnabled() &&
+                if (!deepSeekV41 && MultiCudaDsv4DeepGemmMoeEnabled() &&
                     input->dataType == DataType::BFLOAT16) {
                     ok = FastllmCudaBFloat16MergeMOEDeepGemmSm120ExpertParallel(
                         packetInput, *output,
@@ -6519,9 +6699,10 @@ auto st = std::chrono::system_clock::now();
                         FastllmCudaBFloat16MergeMOEVllmMarlinBatch1ExpertParallel(
                             packetInput, *w1, *output, localExpertTable->localWeights.data(),
                             (int)localExpertTable->localWeights.size(), gpuRouteIndex,
-                            gpuRouteScore, topk, expertOwnerRank, expertOwnerCount);
+                            gpuRouteScore, topk, expertOwnerRank, expertOwnerCount,
+                            deepSeekV41, swigluLimit);
                 }
-                if (!ok) {
+                if (!ok && !deepSeekV41) {
                     ok = input->dataType == DataType::FLOAT16 ?
                         FastllmCudaHalfMergeMOENVFP4Batch1ExpertParallel(
                             packetInput, *w1, *output, localExpertTable->localWeights.data(),
@@ -6552,7 +6733,7 @@ auto st = std::chrono::system_clock::now();
                 (input->dataType == DataType::FLOAT16 ||
                  input->dataType == DataType::BFLOAT16);
             if (expertParallel && input->dims.size() > 0 && input->dims[0] == 1 &&
-                !ran && !useVllmMarlin &&
+                !ran && !useVllmMarlin && !deepSeekV41 &&
                 !(directGpuRouteAvailable && batchOneDecode) &&
                 ((preparedHostIndex != nullptr && preparedHostScore != nullptr) ||
                  (deviceIndex->dims.size() >= 2 && deviceScore->dims.size() >= 2 &&
@@ -6641,7 +6822,7 @@ auto st = std::chrono::system_clock::now();
                     FastllmCudaCopyFromHostToDevice(filteredScore.cudaData, localScore.data(), localScore.size() * sizeof(float));
                     DoCudaMergeMOE(*input, *output, filteredIndex, filteredScore, *w1, *w2, *w3,
                                    localTable.localWeights.data(), nullptr, sharedScale, gateType,
-                                   (int)localTable.localWeights.size());
+                                   (int)localTable.localWeights.size(), swigluLimit, deepSeekV41);
                     ran = true;
                 }
             }
@@ -6655,7 +6836,7 @@ auto st = std::chrono::system_clock::now();
                 int topk = deviceIndex->dims[1];
                 bool deepGemmOk = false;
 #ifdef FASTLLM_ENABLE_DSV4_MOE_DEEPGEMM_SM120
-                if (MultiCudaDsv4DeepGemmMoeEnabled() &&
+                if (!deepSeekV41 && MultiCudaDsv4DeepGemmMoeEnabled() &&
                     input->dataType == DataType::BFLOAT16) {
                     deepGemmOk =
                         FastllmCudaBFloat16MergeMOEDeepGemmSm120ExpertParallel(
@@ -6684,8 +6865,8 @@ auto st = std::chrono::system_clock::now();
                             (int)localExpertTable->localWeights.size(),
                             (const int32_t *)deviceIndex->cudaData,
                             (const float *)deviceScore->cudaData, topk,
-                            expertOwnerRank, expertOwnerCount);
-                } else {
+                            expertOwnerRank, expertOwnerCount, deepSeekV41, swigluLimit);
+                } else if (!deepSeekV41) {
                     ran = input->dataType == DataType::FLOAT16 ?
                         FastllmCudaHalfMergeMOENVFP4Batch1ExpertParallel(
                             *input, *w1, *output,
@@ -6717,7 +6898,7 @@ auto st = std::chrono::system_clock::now();
                 }
                 broadcastInput();
 #ifdef FASTLLM_ENABLE_DSV4_MOE_DEEPGEMM_SM120
-                if (MultiCudaDsv4DeepGemmMoeEnabled() &&
+                if (!deepSeekV41 && MultiCudaDsv4DeepGemmMoeEnabled() &&
                     !expertParallel && directGpuRouteAvailable &&
                     input->dataType == DataType::BFLOAT16) {
                     const int topk = deviceIndex->dims[1];
@@ -6733,7 +6914,7 @@ auto st = std::chrono::system_clock::now();
                 if (!ran) {
                     DoCudaMergeMOE(*input, *output, *deviceIndex, *deviceScore,
                                    *w1, *w2, *w3,
-                                   curWeights.data(), nullptr, sharedScale, gateType, wBatch);
+                                   curWeights.data(), nullptr, sharedScale, gateType, wBatch, swigluLimit, deepSeekV41);
                 }
             }
             if (output->GetBytes() != partOutputBytes) {
@@ -6962,6 +7143,9 @@ auto st = std::chrono::system_clock::now();
         float sharedScale = floatParams.find("sharedScale") != floatParams.end() ? floatParams.find("sharedScale")->second : 1.0f;
         float swigluLimit = floatParams.find("swigluLimit") != floatParams.end() ?
                             floatParams.find("swigluLimit")->second : 0.0f;
+        const bool deepSeekV41 = intParams.count("deepSeekV4Mode") &&
+            intParams.at("deepSeekV4Mode") && intParams.count("activationQuantBlock") &&
+            intParams.at("activationQuantBlock") == 32;
         MoeGateType gateType = intParams.find("gateType") != intParams.end() ?
             (MoeGateType) intParams.find("gateType")->second : MoeGateSwiglu;
         
@@ -7043,6 +7227,13 @@ auto st = std::chrono::system_clock::now();
             }
         }
 
+        // Routed expert outputs are BF16, but their local/EP sum stays FP32
+        // until the model adds the shared expert and rounds once.
+        if (deepSeekV41) {
+            output.dataType = DataType::FLOAT32;
+            output.UpdateUnitSize();
+        }
+
         CopyToMultiDevices(w1, devices, false);
         CopyToMultiDevices(w2, devices, false);
         CopyToMultiDevices(w3, devices, false);
@@ -7065,7 +7256,7 @@ auto st = std::chrono::system_clock::now();
                 break;
             }
         }
-        bool useHybridEpCollectives = useExpertParallel &&
+        bool useHybridEpCollectives = !deepSeekV41 && useExpertParallel &&
                                       !input.multiDeviceData && input.cudaData != nullptr &&
                                       input.dims.size() > 0 && input.dims[0] == 1 &&
                                       index.dims.size() >= 2 && score.dims.size() >= 2 &&
@@ -7202,6 +7393,7 @@ auto st = std::chrono::system_clock::now();
                 auto *op = &localOps.back();
                 op->gateType = gateType;
                 op->swigluLimit = swigluLimit;
+                op->deepSeekV41 = deepSeekV41;
                 ops.push_back(op);
             }
             if (persistentWorkspace != nullptr) {
@@ -7350,6 +7542,7 @@ auto st = std::chrono::system_clock::now();
                 );
                 op->gateType = gateType;
                 op->swigluLimit = swigluLimit;
+                op->deepSeekV41 = deepSeekV41;
                 op->expertOwnerRank = i;
                 op->expertOwnerCount = (int)devices.size();
                 op->pairedReduceInput = pairedReduceInput == nullptr ? nullptr :
@@ -7399,6 +7592,7 @@ auto st = std::chrono::system_clock::now();
                 );
                 op->gateType = gateType;
                 op->swigluLimit = swigluLimit;
+                op->deepSeekV41 = deepSeekV41;
                 op->expertOwnerRank = i;
                 op->expertOwnerCount = (int)devices.size();
                 ops.push_back(op);

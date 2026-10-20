@@ -1,6 +1,6 @@
 # FastLLM
 
-[English](README_EN.md) · [快速开始](#快速开始) · [模型部署指南](#模型部署指南) · [Benchmark](docs/benchmark.md) · [常用参数](#常用参数) · [版本日志](docs/version.md)
+[English](README_EN.md) · [快速开始](#快速开始) · [模型部署指南](#模型部署指南) · [Agent 部署速查](docs/model-deployment-agent.md) · [开发与验证记录](docs/development-validation.md) · [Flash-Next 用户手册](docs/qwen3.8-flash-next/README.md) · [Benchmark](docs/benchmark.md) · [常用参数](#常用参数) · [版本日志](docs/version.md)
 
 FastLLM 是一个面向本地运行和服务部署的高性能大模型推理引擎。核心运行时使用 C++ 实现，不依赖 PyTorch，支持稠密模型与 MoE 模型，并提供 CUDA、ROCm、CPU、NUMA、磁盘混合推理以及多卡张量并行能力。
 
@@ -149,13 +149,17 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 ## 模型部署指南
 
+如果由自动化 agent 部署，建议先把[模型簇与参数速查](docs/model-deployment-agent.md)交给 agent。支持自动规划的混合模型优先使用 `--auto`，再根据日志做必要的参数覆盖；Qwen3.8 27B 等尚未接入的架构使用对应的手动配置。开发记录、测试入口和 Benchmark 记录规则见[开发与验证记录](docs/development-validation.md)。
+
 不同模型在注意力结构、MoE 布局、投机解码和量化格式上差异很大。选择目标模型后，请先阅读对应部署指南，再使用后面的通用配置作为补充。
 
 | 模型 | 部署指南 | 推荐配置入口 | Benchmark |
 | --- | --- | --- | --- |
-| Qwen4-Exp / Qwen3.8-Flash-Next | [Qwen4-Exp 指南](docs/qwen4.md) | PLE、QSA、CUDA/NUMA、`--ngram_device disk` | [Qwen4 Benchmark](docs/benchmarks/qwen4_exp.md) |
+| Agent 快速部署 | [模型簇与参数速查](docs/model-deployment-agent.md) | `--auto`、按日志回退 | — |
+| Qwen4-Exp / Qwen3.8-Flash-Next | [用户手册](docs/qwen3.8-flash-next/README.md) | 双卡串行 / TP2、专家缓存、固定 GPU 专家层、MTP | [本机实测性能](docs/qwen3.8-flash-next/README.md#performance) |
 | Qwen3.5 / Qwen3.6 / Qwen3.8 | [Qwen 当前模型指南](docs/qwen3.md) | 单卡、TP、混合 MoE、MTP、DFlash2 | [Qwen3 Benchmark](docs/benchmarks/qwen3.md) |
 | DeepSeek-V4 / V4-Flash | [DeepSeek-V4 指南](docs/deepseek.md) | CUDA + NUMA、磁盘专家、TP、内置 DSpark | [DeepSeek-V4 Benchmark](docs/benchmarks/deepseek_v4.md) |
+| DeepSeek-V4.1-Flash 1017 | [DeepSeek-V4.1 指南](docs/deepseek_v41.md) | `--auto`、Engram、DSpark、资源限额 | [DeepSeek-V4.1 Benchmark](docs/benchmarks/deepseek_v41.md) |
 | Kimi-K3 | [Kimi-K3 指南](docs/kimi_k3.md) | KDA/MLA、混合专家、磁盘专家、外部 DSpark | [Kimi-K3 Benchmark](docs/benchmarks/kimi_k3.md) |
 | Dots3-Note | [Dots3-Note 指南](docs/dots3_note.md) | DSA、长上下文、CUDA + CPU/NUMA | [Dots3-Note Benchmark](docs/benchmarks/dots3_note.md) |
 | GLM-5 / GLM-5.3-Flash | [GLM-5 指南](docs/glm5.md) | DSA/KDA、分页缓存、NUMA、量化 KV-B CPU | [GLM-5 Benchmark](docs/benchmarks/glm5.md) |
@@ -210,7 +214,7 @@ ftllm server /data/models/Qwen3.8-27B-FP8 \
 
 `--tokens` 是所有会话共享的 KV 池容量，未设置时自动预算。显式目标超过 RoPE 覆盖范围或 warmup 校准容量会启动失败；`/v1/models` 返回实际窗口、模型原声明和用户目标。上述 1M 命令需要足够显存，本机双 24GB 的测试配置无法容纳，完整 1M 输入尚未实测。
 
-当前扩展接入 HF Qwen2、Qwen3、Qwen3.5 布局，以及基于 Qwen3.5 架构的 Qwen3.8；Launcher 高级参数中的「RoPE 扩展」使用相同配置。GGUF、FLM 和自定义 GraphLLM 仅设置长度时保留旧的只缩小行为，暂不支持新的 RoPE 扩展。更多参数、适配范围和验证结果见[上下文扩展说明](docs/context-length-extension-design.md)。
+当前扩展支持 Qwen2、Qwen3、Qwen3.5 布局，以及基于 Qwen3.5 架构的 Qwen3.8；Launcher 高级参数中的「RoPE 扩展」使用相同配置。HF 目录和 GGUF 文件均可显式设置 `--rope_scaling`，仍受模型布局限制。GGUF、FLM 和自定义 GraphLLM 在 CLI 中仅设置长度时保留只缩小的行为；FLM 和自定义 GraphLLM 暂不支持 RoPE 扩展。更多参数、适配范围和验证结果见[上下文扩展说明](docs/context-length-extension.md)。
 
 ### 投机解码
 
@@ -238,7 +242,7 @@ ftllm server /data/models/qwen3.8 \
 
 `--draft` 会根据 draft checkpoint 自动识别 MTP、DFlash2 或 DSpark。独立 MTP 当前用于 Qwen3.5 GGUF，路径可指向包含 `config.json` 和 `mtp.safetensors` 的目录，也可直接指向 `mtp.safetensors`；省略 `--draft_tokens` 时默认使用 5。DFlash2 的 `--draft_tokens` 表示实际 draft token 数，不包含 anchor token。
 
-DFlash2 的完整配置和验证结果见 [Qwen3.8 DFlash2 文档](docs/dflash2_qwen38_27b_tp2_20260819.md)。
+DFlash2 的完整配置和验证结果见 [Qwen3.8 DFlash2 文档](docs/benchmarks/qwen38_27b_dflash2.md)。
 
 ### Qwen4 PLE 磁盘模式
 
@@ -250,7 +254,7 @@ ftllm server /data/models/qwen4-exp \
   --ngram_device disk
 ~~~
 
-磁盘模式会降低常驻内存，但增加随机 I/O，建议使用高速 SSD。更多限制见 [Qwen4-Exp 文档](docs/qwen4_exp.md)。
+磁盘模式会降低常驻内存，但增加随机 I/O，建议使用高速 SSD。更多限制见 [Flash-Next 用户手册](docs/qwen3.8-flash-next/README.md)。
 
 ## 常用参数
 
@@ -281,6 +285,8 @@ CLI 会持续演进，`ftllm <command> --help` 是当前安装版本的最终依
 | 参数 | 默认值 | 说明 |
 | --- | ---: | --- |
 | `--gpu_mem_ratio` | `0.9` | 可用于模型与缓存的 GPU 显存比例 |
+| `--auto_gpu_memory_limit` | 未设置 | `--auto` 时限制每张可见 GPU 的规划显存，例如 `20g`；未设置则读取实际可用显存 |
+| `--auto_host_memory_limit` | 未设置 | `--auto` 时限制自动规划使用的主机内存总量，例如 `128g`；未设置则读取实际可用内存 |
 | `--moe_cuda_cache` / `--moe-cuda-cache` | `0` | GPU 专家权重缓存预算，例如 `3g`（3 GiB）；`0` 关闭。配合 CUDA 主计算与 CPU/NUMA/disk 专家使用，KV Cache、普通权重及工作区另算；见[专家缓存说明](docs/cuda-expert-cache.md) |
 | `--moe_cpu_cache` / `--moe-cpu-cache` | `0` | `--moe_device disk` 的专家内存缓存总预算，例如 `32g`；可与显存专家缓存同时使用，见[磁盘多级缓存](docs/cuda-expert-cache.md#disk-backed-multilevel-cache) |
 | `--kv_cache_limit` | `auto` | KV Cache 最大使用量 |
@@ -311,6 +317,30 @@ CLI 会持续演进，`ftllm <command> --help` 是当前安装版本的最终依
 | `--cache_dir` | 在线模型的本地缓存目录 |
 | `--ori` | 读取部分 GGUF 时指定原模型配置和 tokenizer 目录 |
 | `--mmproj` | Qwen3.5 架构族 GGUF 的配套视觉模块文件；配置要求与示例见 [GGUF 多模态](docs/qwen3.md#gguf-multimodal) |
+
+Qwen4 CUDA 推理将 MTP 草稿专家常驻 GPU：单卡使用该卡，PP 使用最后一个 CUDA 阶段，TP 在各卡常驻对应分片。草稿专家独立于 `--moe_cuda_cache` 的目标模型专家缓存预算，需要额外显存；CPU 推理沿用 MoE 设备配置。
+
+Qwen3.5 系列的 MTP 和 DFlash 草稿支持以下设置。启用相应的草稿算法后，兼容路径默认使用 NVFP4；环境变量可在启动前覆盖默认值：
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `FASTLLM_DRAFT_QUANT` | `nvfp4` | `off` 关闭 NVFP4 转换；`nvfp4_head` 只转换独立草稿输出头；`nvfp4` 转换草稿主干和输出头。目标模型输出头保持原权重，不支持的设备、类型或形状保留原路径 |
+| `FASTLLM_CUDA_NVFP4_SWIGLU_MULTIROW` | `1` | 允许多行 NVFP4 Linear + SwiGLU 融合，`0` 关闭。当前多行内核仅支持 SM75、FP16 输入、M=2～8，并检查形状、布局和临时空间；其他情况回退 |
+| `FASTLLM_TP_NVFP4_MLP_SWIGLU` | `1` | TP MLP 尝试 NVFP4 Linear + SwiGLU 融合，`0` 关闭；由底层能力检查选择内核，不支持时执行原 Linear + SwiGLU |
+| `FASTLLM_TP_NATIVE_GREEDY` | `1` | Qwen3.5 TP 贪心采样支持原生类型 logits；eager 推测验证省去 FP16→FP32 转换，`0` 关闭。随机采样、返回 logits、Graph 和 GPU token handoff 仍保持 FP32 路径 |
+| `FASTLLM_DFLASH_BATCH_PREFIX_SNAPSHOTS` | `1` | DFlash2 CUDA 批量验证按各请求接受长度恢复线性状态，避免拒绝后的主模型重算。max_batch≤4 使用逐位置状态快照；更大配置保存紧凑激活、批量恢复卷积/GDN 状态，实际 batch 缩小时仍沿用该路径，无 16 路上限。自动预留恢复缓冲与草稿滑窗 KV 显存，相应减少主模型 KV 容量。`0` 回退到完整前缀重算；单请求路径不变。不限定 SM；状态算子已在 SM75 验证到 32 路 |
+| `FASTLLM_MTP_BATCH_SAMPLING` | `1` | Qwen3.5 CUDA MTP 将多请求的草稿采样和主模型拒绝采样合批，直接读取各请求独立的草稿缓存，合并结果回读。混合贪心/采样或不兼容验证长度保留原路径；`0` 恢复逐请求采样。保持采样分布，不保证与逐请求路径随机输出逐 token 相同 |
+| `FASTLLM_MTP_FP8_MARLIN` | `1` | Qwen3.5 TP MTP 在初始化时为符合已有 Marlin 条件的 FP8 草稿分片准备计算布局，避免多行草稿首次调用错过布局转换。不改变权重量化格式，保留现有架构/后端选择；`0` 恢复延迟准备。已在 SM75/TP2 验证 |
+| `FASTLLM_CUDA_GDN_SEQUENCE_PREPARE` | `1` | 批量短序列 GDN 在 K/V 维度均为 128、batch≥4 的 eager 路径预计算 Q/K 归一化与门控系数，避免各状态分块重复计算。保留逐 token FP16 状态舍入及前缀快照；小批量、其他 V 维度和 Graph 保留旧路径。`0` 关闭；已在 SM75/TP2 验证 |
+| `FASTLLM_MTP_DRAFT_TOKEN_IDS` | 未设置 | 可选的单卡或多卡 MTP 草稿词表 token ID 文件，仅在启用 NVFP4 转换时使用；未设置或为 `0` 时使用完整词表。多卡按原词表分片筛选并映射回全局 token ID，对齐填充只重复已有候选。筛选词表只用于贪心草稿，随机采样使用完整输出头，目标模型仍使用完整词表验证 |
+| `FASTLLM_DFLASH_DRAFT_TOKEN_IDS` | 未设置 | DFlash2 贪心请求的可选 token ID 文本清单（空白分隔）。单卡支持原编码 GGUF 或 NVFP4 草稿头，多卡支持 NVFP4；每个连续词表分片至少需有 selector top-k 个候选。对齐填充在 top-k 前移除，选择后恢复原 token ID。完整目标头保留，缩表额外占用草稿头显存，覆盖不足可能降低接受率；启用前应验证任务速度与输出一致性。随机采样使用完整词表；非法或不支持的清单回退完整词表。`FASTLLM_DRAFT_QUANT=off` 时不启用 |
+| `FASTLLM_DFLASH_ATTENTION` | 未设置：SM75 开，其余关 | DFlash FP16 融合滑窗 attention 的统一开关：`0` 关闭，`1` 在支持的设备上开启。要求 head_dim=128、query 数 1～16、query 数×GQA 分组数≤64、query 数≤窗口≤4096，且 FlashInfer 可用；不匹配时回退原路径。SM80 及以上的 Q64 路径尚无实机正确性或速度验证；SM70 及以下始终保持原路径 |
+
+DFlash2 的动态卷积、QKV 和 Gateup 准备会根据设备、类型和形状自动选择融合实现，不支持时回退到常规算子；TP selector 投影固定在 rank 0 输出头工作流中提前提交。旧开关 `FASTLLM_CUDA_DFLASH_FUSED_CONV`、`FASTLLM_CUDA_DFLASH_FUSED_QKV_PREPARE`、`FASTLLM_CUDA_DFLASH_FUSED_GATEUP_PREPARE` 和 `FASTLLM_DFLASH_TP_EARLY_SELECTOR` 已移除，设置它们不再影响执行路径。
+
+未覆盖的设置使用表中默认值；内核本身的能力限制仍然有效。单卡和多卡均可使用草稿 NVFP4；多卡在切分后转换符合条件的分片。MTP 限于稠密模型、FP16 计算；DFlash 的量化 Linear 通过 FP16 适配后恢复原激活类型。量化会影响草稿接受率，独立输出头和视图副本也会改变显存占用，不保证所有模型提速；目标模型权重与完整词表验证保持原样。可用 `FASTLLM_DRAFT_QUANT=off` 保留原草稿精度，既有多卡 FP8 草稿输出头开关仍有效。
+
+NVFP4 小矩阵解码默认在 SM75、68 个 SM 的设备（如 RTX 2080 Ti）上启用已验证的调优，覆盖 M=1～8、N×K 为 17408×5120 的融合 SwiGLU，以及 5120×8704、5120×3072 的 Linear。运行时还需满足线程块驻留条件；其他架构、形状和原始 M>8 的 prefill 保持原路径。可用 `FASTLLM_CUDA_NVFP4_SM75_DECODE_TUNE=0` 关闭，`1` 显式开启全部，或用 `linear` / `swiglu` 仅开启对应部分。多行 SwiGLU 的融合入口仍由 `FASTLLM_CUDA_NVFP4_SWIGLU_MULTIROW` 单独控制。
 
 ### API Server
 
@@ -411,7 +441,7 @@ bash install.sh
 | 主题 | 文档 |
 | --- | --- |
 | 发布说明 | [稳定版日志](docs/version.md) · [Nightly 使用](docs/nightly.md) · [Nightly 日志](docs/nightly_changelog.md) |
-| 模型部署 | [Qwen4-Exp](docs/qwen4.md) · [Qwen3.5/3.6/3.8](docs/qwen3.md) · [DeepSeek-V4](docs/deepseek.md) · [Kimi-K3](docs/kimi_k3.md) · [Dots3-Note](docs/dots3_note.md) · [GLM-5](docs/glm5.md) · [Laguna](docs/laguna.md) |
+| 模型部署 | [Qwen3.8-Flash-Next](docs/qwen3.8-flash-next/README.md) · [Qwen3.5/3.6/3.8](docs/qwen3.md) · [DeepSeek-V4](docs/deepseek.md) · [Kimi-K3](docs/kimi_k3.md) · [Dots3-Note](docs/dots3_note.md) · [GLM-5](docs/glm5.md) · [Laguna](docs/laguna.md) |
 | 混合推理 | [GPU、NUMA 与磁盘混合部署](docs/mixforward.md) |
 | 性能与验证 | [按模型查看 Benchmark](docs/benchmark.md) |
 | 量化 | [动态量化配置](docs/dtype_config.md) |
@@ -441,6 +471,7 @@ FastLLM 的实现参考或使用了以下开源项目与文章中的思路或代
 - [PyTorch](https://github.com/pytorch/pytorch)：底层算子实现思路。
 - [Transformers](https://github.com/huggingface/transformers)：模型结构与参考实现。
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) 和 [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp)：GGUF 量化格式与 kernel。
+- [KVMem / kvmem-llama.cpp](https://github.com/kvmem/kvmem-llama.cpp)：分层 KV 缓存与内容检索的设计参考，包括固定 GPU 工作集、主机 KV 备份和 pre-RoPE mean-K 检索。FastLLM 接入说明见 [KVMem 文档](docs/kvmem.md)。
 - [FlashInfer](https://github.com/flashinfer-ai/flashinfer)：Attention、MLA 等算子。
 - [TurboMind / LMDeploy 的 GEMM 内核](https://github.com/InternLM/lmdeploy/tree/main/src/turbomind/kernels/gemm)：仓内 `third_party/turbomind` 的 SM70 s884（`SM70_MMA_884` / HMMA 8x8x4）核心由其源码移植，并在其上接入 AWQ INT4、块缩放 FP8 与 NVFP4 Linear。
 - [1Cat-vLLM 的 SM70 TurboMind 适配](https://github.com/1CatAI/1Cat-vLLM/tree/main/csrc/sm70_turbomind)：AWQ 接入及 FP8/NVFP4 类型、布局和小批量 tactic 的参考来源；FastLLM 侧另行实现了无 Torch 的原始指针桥接、模型权重格式转换、非对齐 padding、回退和调度。

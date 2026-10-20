@@ -514,8 +514,21 @@ namespace fastllm {
 
         auto vec_dot_type = ggml_type_vec_dot_type(weightType);
         auto vec_dot = ggml_type_vec_dot(weightType);
-        if (GetMulMatFunction(weightType, 1) != nullptr) {
-            int part = (n == 1 ? (end - st) : 64);
+        if (auto single = GetMulMatFunction(weightType, 1)) {
+            // Decode needs only the one-row kernel. Avoid allocating a table
+            // and resolving all eight batch sizes for every worker slice.
+            if (n == 1) {
+                const size_t weightRowBytes = ggml_row_size(weightType, m);
+                const size_t inputRowBytes = ggml_row_size(vec_dot_type, m);
+                DataInfo info{outputData + st, (const char *)q8kInputData,
+                    (size_t)k, inputRowBytes, 0, 1, nullptr, 0};
+                single(m, weightData + size_t(st) * weightRowBytes,
+                       weightRowBytes, info, end - st);
+                if (biasData)
+                    for (int j = st; j < end; ++j) outputData[j] += biasData[j];
+                return true;
+            }
+            const int part = 64;
             int oldSt = st, oldEnd = end;
 
             int maxRows = 8;
@@ -554,13 +567,17 @@ namespace fastllm {
                 st = end;
             }
         } else if (vec_dot != nullptr) {
+            // These strides are constant for the whole operation. Resolving
+            // GGUF type metadata for every output row is costly for small dots.
+            const size_t weightRowBytes = ggml_row_size(weightType, m);
+            const size_t inputRowBytes = ggml_row_size(vec_dot_type, m);
             for (int i = 0; i < n; i++) {
+                const uint8_t *inputRow = q8kInputData + size_t(i) * inputRowBytes;
                 for (int j = st; j < end; j++) {
-                    float now = 0.0f;
                     vec_dot (
-                        m, &outputData[i * k + j], 0, 
-                        weightData + j * ggml_row_size(weightType, m), 0, 
-                        q8kInputData + i * ggml_row_size(vec_dot_type, m), 0, 
+                        m, &outputData[i * k + j], 0,
+                        weightData + size_t(j) * weightRowBytes, 0,
+                        inputRow, 0,
                         1
                     );
                     outputData[i * k + j] += (biasData ? biasData[j] : 0.0f);
@@ -2639,20 +2656,23 @@ namespace fastllm {
             if (q8kInputs.size() < n * rowCount) {
                 q8kInputs.resize(n * rowCount);
             }
-            if (n > 1) {
+            // Tiny expert batches cost less to quantize on the caller than to
+            // dispatch a second wave of worker tasks. Keep the matmul parallel.
+            if (n > 1 && (n > 3 || (int64_t)n * m > 16384)) {
                 std::vector<fastllm::MultiThreadFloat32ToQ8KOp*> ops;
-                int per = n / threadNum;
+                const int quantThreads = std::min(n, threadNum);
+                int per = n / quantThreads;
                 int cur = 0;
-                for (int i = 0; i < threadNum; i++) {
-                    int end = cur + per + (cur + per * (threadNum - i) < n);
+                for (int i = 0; i < quantThreads; i++) {
+                    int end = cur + per + (cur + per * (quantThreads - i) < n);
                     ops.push_back(new MultiThreadFloat32ToQ8KOp(
                         inputData + cur * m, (uint8_t*)(q8kInputs.data() + cur * rowCount), (end - cur) * m, tensor->type));
                     cur = end;
                 }
-                for (int i = 0; i < threadNum; i++) {
+                for (int i = 0; i < quantThreads; i++) {
                     pool->PushOp(startTid + i, ops[i]);
                 }
-                for (int i = 0; i < threadNum; i++) {
+                for (int i = 0; i < quantThreads; i++) {
                     pool->Wait(startTid + i);
                     delete ops[i];
                 }

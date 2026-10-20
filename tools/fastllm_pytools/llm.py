@@ -8,7 +8,6 @@ import threading
 import asyncio
 import copy
 import json
-import math
 import importlib.util
 import importlib.metadata as importlib_metadata
 import logging
@@ -368,6 +367,12 @@ fastllm_lib.create_llm_model_fromhf_with_config.restype = ctypes.c_int
 fastllm_lib.create_llm_model_from_gguf.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
 fastllm_lib.create_llm_model_from_gguf.restype = ctypes.c_int
 
+if hasattr(fastllm_lib, "create_llm_model_from_gguf_with_context"):
+    fastllm_lib.create_llm_model_from_gguf_with_context.argtypes = [
+        ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
+        ctypes.c_int, ctypes.c_char_p]
+    fastllm_lib.create_llm_model_from_gguf_with_context.restype = ctypes.c_int
+
 if hasattr(fastllm_lib, "create_llm_model_from_gguf_with_mtp"):
     fastllm_lib.create_llm_model_from_gguf_with_mtp.argtypes = [
         ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
@@ -412,6 +417,12 @@ fastllm_lib.fetch_response_tokens_batch_llm_model.argtypes = [
     ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int
 ]
 fastllm_lib.fetch_response_tokens_batch_llm_model.restype = ctypes.c_int
+
+fastllm_lib.fetch_response_tokens_batch_with_statistics_llm_model.argtypes = [
+    ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+    ctypes.POINTER(ctypes.c_int)
+]
+fastllm_lib.fetch_response_tokens_batch_with_statistics_llm_model.restype = ctypes.c_int
 
 fastllm_lib.fetch_response_logits_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_float)]
 fastllm_lib.fetch_response_logits_llm_model.restype = ctypes.c_int
@@ -458,11 +469,27 @@ fastllm_lib.set_layered_moe_device_map.argtypes = [ctypes.c_int, ctypes.c_void_p
 fastllm_lib.set_moe_device_layers.argtypes = [ctypes.c_int]
 fastllm_lib.set_ngram_device.argtypes = [ctypes.c_char_p]
 fastllm_lib.set_moe_cuda_cache.argtypes = [ctypes.c_uint64]
+if hasattr(fastllm_lib, "set_moe_cache_policy"):
+    fastllm_lib.set_moe_cache_policy.argtypes = [
+        ctypes.c_float, ctypes.c_int, ctypes.c_int, ctypes.c_uint64,
+        ctypes.c_float, ctypes.c_float, ctypes.c_float, ctypes.c_int,
+        ctypes.c_float, ctypes.c_bool]
+    fastllm_lib.set_moe_cache_policy.restype = ctypes.c_bool
+if hasattr(fastllm_lib, "fastllm_moe_cuda_cache_stats"):
+    fastllm_lib.fastllm_moe_cuda_cache_stats.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint64), ctypes.c_bool]
+    fastllm_lib.fastllm_moe_cuda_cache_stats.restype = ctypes.c_bool
 fastllm_lib.set_moe_cpu_cache.argtypes = [ctypes.c_uint64]
 fastllm_lib.get_disk_moe_cache_stats.argtypes = [ctypes.POINTER(ctypes.c_uint64)]
+if hasattr(fastllm_lib, "get_disk_moe_cache_stats_v2"):
+    fastllm_lib.get_disk_moe_cache_stats_v2.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_int]
+    fastllm_lib.get_disk_moe_cache_stats_v2.restype = ctypes.c_int
 
 fastllm_lib.apply_chat_template.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p]
 fastllm_lib.apply_chat_template.restype = ctypes.c_char_p
+
+fastllm_lib.set_kvmem_llm_model.argtypes = (
+    [ctypes.c_int, ctypes.c_bool] + [ctypes.c_int] * 6 + [ctypes.c_uint64, ctypes.c_int])
+fastllm_lib.set_kvmem_llm_model.restype = ctypes.c_char_p
 
 fastllm_lib.set_kv_cache_limit_llm_model.argtypes = [ctypes.c_int, ctypes.c_int64]
 
@@ -478,7 +505,11 @@ fastllm_lib.get_kv_cache_token_limit_llm_model.argtypes = [ctypes.c_int]
 fastllm_lib.get_kv_cache_token_limit_llm_model.restype = ctypes.c_int
 
 fastllm_lib.set_chunked_prefill_size_llm_model.argtypes = [ctypes.c_int, ctypes.c_int]
+fastllm_lib.set_prefill_batching_llm_model.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int]
+fastllm_lib.set_prefill_batching_llm_model.restype = ctypes.c_bool
 
+fastllm_lib.set_model_indexer_dtype.argtypes = [ctypes.c_int, ctypes.c_char_p]
+fastllm_lib.set_model_indexer_dtype.restype = None
 fastllm_lib.set_model_kv_cache_dtype.argtypes = [ctypes.c_int, ctypes.c_char_p]
 
 fastllm_lib.set_verbose_llm_model.argtypes = [ctypes.c_int, ctypes.c_bool]
@@ -620,11 +651,128 @@ def set_cuda_graph(cuda_graph):
 def set_cuda_slab(mb: int):
     fastllm_lib.set_cuda_slab(ctypes.c_int(mb));
 
-def set_moe_cuda_cache(bytes_: int):
+def set_moe_cuda_cache(bytes_: int, device_bytes=None):
+    """Set cache budgets before loading; a scalar call clears device overrides."""
     bytes_ = int(bytes_)
     if bytes_ < 0 or bytes_ > (1 << 64) - 1:
         raise ValueError("MoE CUDA cache size must fit in uint64")
-    fastllm_lib.set_moe_cuda_cache(ctypes.c_uint64(bytes_));
+    budgets = {} if device_bytes is None else {int(d): int(b) for d, b in device_bytes.items()}
+    if any(d < 0 or d > (1 << 31) - 1 or b < 0 or b > bytes_ for d, b in budgets.items()):
+        raise ValueError("Per-device cache budgets must be nonnegative and within the scalar ceiling")
+    setter = getattr(fastllm_lib, "set_moe_cuda_cache_device", None)
+    if budgets and setter is None:
+        raise RuntimeError("Per-device cache planning requires a matching native library")
+    fastllm_lib.set_moe_cuda_cache(ctypes.c_uint64(bytes_))
+    if budgets:
+        setter.argtypes = [ctypes.c_int, ctypes.c_uint64]
+        setter.restype = None
+        for device, budget in budgets.items():
+            setter(device, budget)
+
+def get_cuda_memory_info(device: int):
+    """Return free/total CUDA bytes for a visible ordinal, or fail closed."""
+    query = getattr(fastllm_lib, "get_cuda_memory_info", None)
+    if query is None:
+        raise RuntimeError("Hybrid auto requires a matching native library")
+    query.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint64)]
+    query.restype = ctypes.c_bool
+    values = (ctypes.c_uint64 * 2)()
+    if not query(int(device), values):
+        raise RuntimeError("Cannot measure memory on CUDA device %d" % device)
+    return {"free": int(values[0]), "total": int(values[1])}
+
+def set_moe_cache_policy(*, half_life=128., update_interval=1, max_replacements=96,
+                         max_bytes=0, min_heat=1., margin=1., factor=1.,
+                         min_residence=0, prefill_prior=0., rank_by_bytes=False):
+    """Configure GGUF/NVFP4/FP8 hybrid decode admission before model loading.
+
+    Counts and byte limits apply per device/update, across all layers. max_bytes=0
+    imposes no byte cap; max_replacements=0 disables decode admission.
+    One decode step may verify several speculative tokens. half_life=0 disables
+    decay. prefill_prior weights rescaled prompt heat and
+    does not discard resident payloads. Existing cache policies keep their config.
+    """
+    for name, value, minimum in (("update_interval", update_interval, 1),
+                                  ("max_replacements", max_replacements, 0),
+                                  ("min_residence", min_residence, 0)):
+        if not isinstance(value, int) or not minimum <= value <= (1 << 31) - 1:
+            raise ValueError(f"{name} must be an integer in [{minimum}, 2147483647]")
+    if not isinstance(max_bytes, int) or not 0 <= max_bytes <= (1 << 64) - 1:
+        raise ValueError("max_bytes must fit in uint64")
+    for name, value, minimum in (("half_life", half_life, 0), ("min_heat", min_heat, 0),
+                                  ("margin", margin, 0), ("factor", factor, 1),
+                                  ("prefill_prior", prefill_prior, 0)):
+        if not math.isfinite(value) or value < minimum:
+            raise ValueError(f"{name} must be finite and >= {minimum}")
+    if prefill_prior > 1:
+        raise ValueError("prefill_prior must be in [0, 1]")
+    native = getattr(fastllm_lib, "set_moe_cache_policy", None)
+    if native is None:
+        raise RuntimeError("MoE cache policy configuration requires an updated native library")
+    if not native(half_life, update_interval, max_replacements, max_bytes,
+                  min_heat, margin, factor, min_residence, prefill_prior, rank_by_bytes):
+        raise ValueError("Invalid MoE cache policy configuration")
+
+def get_moe_cuda_cache_stats(device: int = 0, reset: bool = False):
+    """Synchronize a CUDA device and read expert-cache query counters outside inference timing.
+
+    Hits/misses include GPU-assigned queries and prefetch, excluding CPU-only
+    routes. Use get_moe_cuda_cache_route_stats for full hybrid route residency.
+    Reset clears these query counters only; cached weights and LRU residency are retained.
+    Byte and slot counts cover all prepared expert tables on the selected device.
+    """
+    query = getattr(fastllm_lib, "fastllm_moe_cuda_cache_stats", None)
+    if query is None:
+        raise RuntimeError("GPU expert-cache statistics require an updated CUDA build")
+    values = (ctypes.c_uint64 * 5)()
+    if not query(int(device), values, bool(reset)):
+        raise RuntimeError("Could not read GPU expert-cache statistics")
+    result = dict(zip(("hits", "misses", "payload_bytes", "slots", "records"), values))
+    routes = result["hits"] + result["misses"]
+    result["hit_rate"] = result["hits"] / routes if routes else None
+    return result
+
+def get_moe_cuda_cache_route_stats(device: int = 0):
+    """Read cumulative single-GPU hybrid decode/verifier counters between requests.
+
+    Residency is measured across all routed experts before CPU/GPU dispatch,
+    excluding prefetch lookups. Prefill, multi-GPU EP and pure-GPU mode are
+    not counted. Host inference must be idle; this also synchronizes the GPU.
+    Subtract snapshots for per-request counts; cache and scheduler are retained.
+    """
+    query = getattr(fastllm_lib, "fastllm_moe_cuda_cache_route_stats", None)
+    if query is None:
+        raise RuntimeError("Full-route expert-cache statistics require an updated CUDA build")
+    query.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint64)]
+    query.restype = ctypes.c_bool
+    values = (ctypes.c_uint64 * 8)()
+    if not query(int(device), values):
+        raise RuntimeError("Could not read full-route expert-cache statistics")
+    result = dict(zip(("calls", "routes", "resident_routes", "nonresident_routes",
+                       "gpu_routes", "cpu_routes", "resident_gpu_routes", "prefetched_experts"), values))
+    routes = result["routes"]
+    result["hit_rate"] = result["resident_routes"] / routes if routes else None
+    result["gpu_fraction"] = result["gpu_routes"] / routes if routes else None
+    return result
+
+def get_moe_cuda_cache_prefill_stats(device: int = 0):
+    """Read native host-prefill cache transport counts between requests.
+
+    Includes direct resident aliases and on-device restoration of shared NUMA
+    layouts. Grouped GGUF has a separate path and is not included. Reused bytes
+    count host uploads avoided; temporary on-device conversion is not a hit
+    penalty. Synchronizes the device; subtract snapshots without resetting.
+    """
+    query = getattr(fastllm_lib, "fastllm_moe_cuda_cache_prefill_stats", None)
+    if query is None:
+        raise RuntimeError("Prefill cache statistics require an updated CUDA build")
+    query.argtypes = [ctypes.c_int, ctypes.POINTER(ctypes.c_uint64)]
+    query.restype = ctypes.c_bool
+    values = (ctypes.c_uint64 * 8)()
+    if not query(int(device), values):
+        raise RuntimeError("Could not read prefill cache statistics")
+    return dict(zip(("calls", "gpu_experts", "gpu_routes", "resident_experts", "resident_routes",
+                     "reused_bytes", "uploaded_bytes", "admitted_experts"), values))
 
 def set_moe_cpu_cache(bytes_: int):
     bytes_ = int(bytes_)
@@ -634,10 +782,16 @@ def set_moe_cpu_cache(bytes_: int):
 
 def get_disk_moe_cache_stats():
     """Process-wide cumulative route counts and resident expert payload bytes."""
+    names = ("cpu_bytes", "cuda_bytes", "cpu_hits", "cuda_hits", "misses",
+             "disk_bytes", "uploads", "cpu_evictions", "cuda_evictions",
+             "cpu_cuda_overlap_bytes", "cuda_demotions", "cuda_demotion_bytes")
+    if hasattr(fastllm_lib, "get_disk_moe_cache_stats_v2"):
+        values = (ctypes.c_uint64 * len(names))()
+        count = fastllm_lib.get_disk_moe_cache_stats_v2(values, len(names))
+        return dict(zip(names[:count], values))
     values = (ctypes.c_uint64 * 9)()
     fastllm_lib.get_disk_moe_cache_stats(values)
-    return dict(zip(("cpu_bytes", "cuda_bytes", "cpu_hits", "cuda_hits", "misses",
-                     "disk_bytes", "uploads", "cpu_evictions", "cuda_evictions"), values))
+    return dict(zip(names[:9], values))
 
 def disable_cuda_malloc():
     fastllm_lib.disable_cuda_malloc();
@@ -1088,6 +1242,17 @@ def encode_hf_prompt(tokenizer, prompt: str):
     add_special_tokens = not (avoid_duplicate_bos and bos_token and prompt.startswith(bos_token))
     return tokenizer.encode(prompt, add_special_tokens = add_special_tokens)
 
+def _same_template_input(left, right):
+    # Templates can iterate tool properties and arguments in insertion order.
+    # Ordinary dict equality would allow reusing IDs for a different prompt.
+    if isinstance(left, dict) and isinstance(right, dict):
+        return (list(left) == list(right) and
+                all(_same_template_input(left[key], right[key]) for key in left))
+    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+        return (len(left) == len(right) and
+                all(_same_template_input(a, b) for a, b in zip(left, right)))
+    return left == right
+
 def apply_hf_chat_template(tokenizer, conversation, add_generation_prompt = True,
                            tokenize = False, enable_thinking = None, tools = None,
                            thinking_alias = False, thinking_effort = None,
@@ -1174,9 +1339,16 @@ def try_load_hf_tokenizer(path):
             # 2. 完全禁止所有 logging 输出
             logging.disable(logging.CRITICAL)  # 禁用所有日志（包括 ERROR, WARNING, INFO, DEBUG）
             from transformers import AutoTokenizer
-            ret = AutoTokenizer.from_pretrained(
-                path, trust_remote_code = True,
-                **_hf_tokenizer_compat_kwargs(path))
+            compat_kwargs = _hf_tokenizer_compat_kwargs(path)
+            try:
+                ret = AutoTokenizer.from_pretrained(
+                    path, trust_remote_code = True, **compat_kwargs)
+            except TypeError as error:
+                # Newer Qwen2 tokenizers already supply this keyword to their
+                # backend. Retry without our compatibility override.
+                if "fix_mistral_regex" not in compat_kwargs or "multiple values" not in str(error) or "fix_mistral_regex" not in str(error):
+                    raise
+                ret = AutoTokenizer.from_pretrained(path, trust_remote_code = True)
         finally:
             logging.disable(original_level)  # 恢复原来的日志级别
             if original_use_torch is None:
@@ -1212,7 +1384,10 @@ class model:
                   external_mtp_path: str = "",
                   mmproj_path: str = "",
                   max_context_length: int = -1,
-                  rope_scaling = None):
+                  rope_scaling = None,
+                  indexer_dtype: str = "auto"):
+        if indexer_dtype not in ("auto", "fp8", "fp8_e4m3"):
+            raise ValueError("indexer_dtype must be auto, fp8 or fp8_e4m3")
         if (isinstance(max_context_length, bool) or not isinstance(max_context_length, int) or
                 max_context_length != -1 and not 0 < max_context_length <= 2147483647):
             raise ValueError("max_context_length must be a positive 32-bit integer")
@@ -1223,9 +1398,13 @@ class model:
         if not isinstance(rope_scaling, str):
             raise ValueError("rope_scaling must be yarn or a JSON object")
         context_requested = max_context_length > 0 or bool(rope_scaling)
-        if context_requested and (id != -99999 or graph is not None or model_json or not os.path.isdir(path)):
-            raise ValueError("Context options currently require a Hugging Face model directory")
-        if context_requested and not hasattr(fastllm_lib, "create_llm_model_fromhf_with_context"):
+        is_gguf = os.path.isfile(path) and str(path).lower().endswith(".gguf")
+        if context_requested and (id != -99999 or graph is not None or model_json or
+                                  not (os.path.isdir(path) or is_gguf)):
+            raise ValueError("Context options require a Hugging Face model directory or GGUF file")
+        context_loader = ("create_llm_model_from_gguf_with_context" if is_gguf else
+                          "create_llm_model_fromhf_with_context")
+        if context_requested and not hasattr(fastllm_lib, context_loader):
             raise RuntimeError("The native FastLLM library must be rebuilt to support context options")
         self.context_config = None
         if (graph != None):
@@ -1316,7 +1495,16 @@ class model:
                 if external_mtp_path and mmproj_path:
                     raise ValueError(
                         "external MTP and mmproj cannot be used together")
-                if external_mtp_path:
+                if context_requested:
+                    self.model = fastllm_lib.create_llm_model_from_gguf_with_context(
+                        path.encode(), ori_model_path.encode(),
+                        external_mtp_path.encode(), mmproj_path.encode(),
+                        max_context_length, rope_scaling.encode())
+                    if self.model < 0:
+                        raise ValueError(fastllm_lib.get_llm_context_result().decode("utf-8", errors="replace"))
+                    if mmproj_path:
+                        self.mmproj_path = mmproj_path
+                elif external_mtp_path:
                     if not hasattr(fastllm_lib, "create_llm_model_from_gguf_with_mtp"):
                         raise RuntimeError(
                             "the loaded FastLLM library does not support "
@@ -1469,6 +1657,8 @@ class model:
         print(f"[Fastllm] default generation config: {self.default_generation_config}")
         if (kv_cache_dtype != "" and kv_cache_dtype != "auto"):
             self.set_kv_cache_dtype(kv_cache_dtype)
+        if indexer_dtype != "auto":
+            fastllm_lib.set_model_indexer_dtype(self.model, indexer_dtype.encode())
         self._refresh_context_config()
 
     def _refresh_context_config(self):
@@ -1849,6 +2039,19 @@ class model:
     def eval(self):
         return self;
 
+    def get_vocab_size(self):
+        """Return the output vocabulary bound used by unrestricted sampling."""
+        config = getattr(self, "config", {})
+        text_config = config.get("text_config") or config
+        size = text_config.get("vocab_size")
+        if size is None and self.hf_tokenizer is not None:
+            size = max(self.hf_tokenizer.get_vocab().values(), default=-1) + 1
+        if size is None:
+            size = fastllm_lib.get_tokenizer_vocab_size(self.model)
+        if int(size) <= 0:
+            raise ValueError("Cannot determine vocabulary size for unrestricted sampling")
+        return int(size)
+
     def build_tokenizer_decode_token_cache(self):
         if self.tokenizer_decode_token_cache is not None:
             return
@@ -1960,7 +2163,7 @@ class model:
             for i in range(len(conversation)):
                 if ("content" in conversation[i] and isinstance(conversation[i]["content"], str)):
                     conversation[i]["content"] = [{"type": "text", "text": conversation[i]["content"]}]
-        elif model_struct in ("dots3_note", "glm5_next"):
+        elif model_struct in ("dots3_note", "glm5_next", "naive_n05_flash"):
             # These chat templates iterate over argument objects, while the
             # OpenAI wire protocol stores function.arguments as a JSON string.
             # Normalize assistant tool-call history before rendering so a
@@ -2000,6 +2203,8 @@ class model:
                             tool_choice = None, chat_template_kwargs = None) -> int:
         if enable_thinking is None:
             enable_thinking = self.enable_thinking
+        if getattr(self, "kvmem_enabled", False) and (images or videos):
+            raise ValueError("KVMem currently supports text-only requests")
         multimodal_images = list(images or [])
         multimodal_videos = list(videos or [])
         if multimodal_images or multimodal_videos:
@@ -2112,7 +2317,8 @@ class model:
                          enable_thinking, tools, thinking_effort, tool_choice,
                          chat_template_kwargs],
                         ensure_ascii = False,
-                        sort_keys = True,
+                        # Templates can render tool properties/arguments in
+                        # insertion order; distinct orders must not share IDs.
                         separators = (",", ":"))
                 except (TypeError, ValueError):
                     cache_key = None
@@ -2145,7 +2351,7 @@ class model:
                         tokenize = True,
                         enable_thinking = enable_thinking,
                         tools = tools,
-                        thinking_alias = self._is_kimi_k3(),
+                        thinking_alias = True,
                         thinking_effort = thinking_effort,
                         tool_choice = tool_choice,
                         chat_template_kwargs = chat_template_kwargs)
@@ -2688,6 +2894,7 @@ class model:
                 type = "ChatGLM3"
             if (not(history)):
                 history = [];
+            can_reuse_token_count = False
             if (type == "ChatGLM3"):
                 input = tokenizer.build_chat_input(query, history=history)["input_ids"].reshape(-1).tolist()
             else:
@@ -2695,15 +2902,14 @@ class model:
                 direct_template_tokens = None
                 can_reuse_token_count = (
                     conversation is not None and len(conversation) != 0 and
-                    not self.save_history and
                     pending_text_input_token_cache is not None and
-                    pending_text_input_token_cache.get("conversation") == conversation and
+                    _same_template_input(pending_text_input_token_cache.get("conversation"), conversation) and
                     pending_text_input_token_cache.get("add_generation_prompt") == add_generation_prompt and
                     pending_text_input_token_cache.get("enable_thinking") == enable_thinking and
-                    pending_text_input_token_cache.get("tools") == tools and
+                    _same_template_input(pending_text_input_token_cache.get("tools"), tools) and
                     pending_text_input_token_cache.get("thinking_effort") == thinking_effort and
-                    pending_text_input_token_cache.get("tool_choice") == tool_choice and
-                    pending_text_input_token_cache.get("chat_template_kwargs") == chat_template_kwargs)
+                    _same_template_input(pending_text_input_token_cache.get("tool_choice"), tool_choice) and
+                    _same_template_input(pending_text_input_token_cache.get("chat_template_kwargs"), chat_template_kwargs))
                 if can_reuse_token_count:
                     input = pending_text_input_token_cache["input_ids"]
                 elif (conversation != None and len(conversation) != 0):
@@ -2758,7 +2964,13 @@ class model:
                                                         max_length, min_length, do_sample, top_p, top_k, temperature, repeat_penalty,
                                                         False, stop_token_len, stop_token_list)
             if (self.save_history):
-                self.current_tokenizer_cache[handle] = [[prompt], [input]]
+                if can_reuse_token_count:
+                    # Native KV history is independent of this Python text
+                    # cache. Reused IDs have no rendered prompt snapshot; an
+                    # empty snapshot would match unrelated future requests.
+                    self.current_tokenizer_cache.pop(handle, None)
+                else:
+                    self.current_tokenizer_cache[handle] = [[prompt], [input]]
             return handle
         else:
             prompt = ""
@@ -2894,27 +3106,29 @@ class model:
         is_prefill = True
         start_time = time.time()
 
-        def capture_response_statistics():
-            if response_statistics is None:
-                return
-            statistics = self.get_response_statistics(handle)
-            if statistics is not None:
-                response_statistics.update(statistics)
-
         # DSpark commits at most a small speculative block per scheduler turn,
         # but more than one block may be ready when the HTTP consumer is slow.
         # Drain a generous bounded batch through one C call and one scheduler
         # mutex acquisition.
         fetch_batch_capacity = 64
         fetch_batch_buffer = (ctypes.c_int * fetch_batch_capacity)()
+        fetch_statistics = (ctypes.c_int * 3)()
 
         def fetch_ready_tokens():
-            count = fastllm_lib.fetch_response_tokens_batch_llm_model(
+            count = fastllm_lib.fetch_response_tokens_batch_with_statistics_llm_model(
                 self.model, handle, fetch_batch_buffer,
-                fetch_batch_capacity)
+                fetch_batch_capacity, fetch_statistics)
             if count <= 0:
                 return count, []
             return count, [fetch_batch_buffer[i] for i in range(count)]
+
+        def capture_response_statistics():
+            # The terminal fetch releases the handle. Only use the snapshot
+            # returned by that same call; a lookup could read a new request.
+            if response_statistics is not None and fetch_statistics[0] >= 0:
+                response_statistics.update(zip(
+                    ("cached_input_tokens", "missed_input_tokens", "output_tokens"),
+                    fetch_statistics))
 
         if (self._can_apply_hf_chat_template() or
                 self._uses_hf_deepseek_v4_tokenizer()):
@@ -3117,16 +3331,22 @@ class model:
         fastllm_lib.release_memory(self.model)
     
     def set_save_history(self, save: bool):
-        self.save_history = True
+        if getattr(self, "kvmem_enabled", False) and save:
+            raise ValueError("KVMem does not support history caching")
+        self.save_history = bool(save)
         fastllm_lib.set_save_history(self.model, save)
 
     def set_atype(self, atype: str):
+        if getattr(self, "kvmem_enabled", False):
+            raise ValueError("Set compute dtype before configuring KVMem")
         fastllm_lib.set_model_atype(self.model, str(atype).encode())
 
     def set_moe_atype(self, moe_atype: str):
         fastllm_lib.set_model_moe_atype(self.model, str(moe_atype).encode())
 
     def set_kv_cache_dtype(self, kv_cache_dtype: str):
+        if getattr(self, "kvmem_enabled", False):
+            raise ValueError("Set KV dtype before configuring KVMem")
         fastllm_lib.set_model_kv_cache_dtype(self.model, str(kv_cache_dtype).encode())
 
     def warmup(self):
@@ -3140,6 +3360,44 @@ class model:
     
     def set_cuda_shared_expert(self, cuda_shared_expert: bool):
         fastllm_lib.set_cuda_shared_expert(cuda_shared_expert)
+
+    def set_kvmem(self, *, enabled=True, max_tokens=32768, resident_tokens=8192,
+                  sink_tokens=128, recent_tokens=2048, retrieval_tokens=4096,
+                  prefill_tokens=512, host_mib=8192, retrieval_interval=64):
+        """Opt into host-backed KV before warmup (one active request).
+
+        Qwen3/3.5 use sparse retrieval on one GPU, changing attention once the
+        resident budget is exceeded. Qwen3.5 also supports DFlash/MTP.
+        Qwen4/QSA in Hybrid execution mode keeps the original selection and stores
+        exact FP16 KV in pinned host memory, caching at most resident_tokens per layer
+        on its CUDA device. Prefill temporarily stages one full attention layer
+        on each device, reusing that workspace between layers. This also supports
+        PP/TP and CUDA Graph; sink/recent/retrieval policy parameters do not apply
+        to native QSA. Pure GPU and CPU execution modes do not enable Qwen4 KVMem.
+        Qwen4 resident_tokens must be divisible by 4. Prefix reuse and concurrent
+        requests are disabled in KVMem mode; the full max_tokens context remains
+        available. host_mib covers all target and possible draft KV layers.
+        For Qwen3/3.5, token budgets except max_tokens must align to the KV page.
+        retrieval_interval controls their speculative score reuse in committed
+        tokens; it need not be page aligned. Use 1 to refresh every verify round.
+        """
+        values = (max_tokens, resident_tokens, sink_tokens, recent_tokens,
+                  retrieval_tokens, prefill_tokens)
+        if not isinstance(enabled, bool):
+            raise TypeError("enabled must be bool")
+        if any(type(value) is not int or not 0 <= value <= 2147483647 for value in values):
+            raise ValueError("KVMem token budgets must be nonnegative 32-bit integers")
+        if type(host_mib) is not int or not 0 < host_mib < (1 << 44):
+            raise ValueError("host_mib must be a positive integer below 2**44")
+        if type(retrieval_interval) is not int or not 1 <= retrieval_interval <= 2147483647:
+            raise ValueError("retrieval_interval must be a positive 32-bit integer")
+        error = fastllm_lib.set_kvmem_llm_model(
+            self.model, enabled, *values, host_mib << 20, retrieval_interval)
+        if error:
+            raise ValueError(error.decode("utf-8", errors="replace"))
+        self.kvmem_enabled = enabled
+        if enabled:
+            self.save_history = False
 
     def set_kv_cache_limit(self, limit: str):
         limit_bytes = 0
@@ -3159,6 +3417,8 @@ class model:
         fastllm_lib.set_kv_cache_limit_llm_model(self.model, ctypes.c_int64(limit_bytes))
     
     def set_max_batch(self, batch: int):
+        if getattr(self, "kvmem_enabled", False) and batch != 1:
+            raise ValueError("KVMem currently requires max_batch=1")
         fastllm_lib.set_max_batch_llm_model(self.model, batch)
 
     def get_max_batch(self):
@@ -3178,6 +3438,14 @@ class model:
     def set_chunked_prefill_size(self, size: int):
         """设置分块 prefill 的切片大小（首块与后续块使用相同 token 数）。"""
         fastllm_lib.set_chunked_prefill_size_llm_model(self.model, size)
+
+    def set_prefill_batching(self, tokens: int, max_wait_ms: int = 0):
+        """启动前设置 prefill 攒批目标和最长等待；目前仅支持 Naive 普通 TP GPU 推理。"""
+        if not all(isinstance(value, int) and 0 <= value <= 2147483647
+                   for value in (tokens, max_wait_ms)) or (max_wait_ms > 0 and tokens == 0):
+            raise ValueError("prefill batching requires non-negative int32 values and a positive token target when waiting")
+        if not fastllm_lib.set_prefill_batching_llm_model(self.model, tokens, max_wait_ms):
+            raise ValueError("prefill batching must be configured before serving and currently requires ordinary Naive TP GPU inference")
     
     def set_verbose(self, verbose: int):
         fastllm_lib.set_verbose_llm_model(self.model, verbose)

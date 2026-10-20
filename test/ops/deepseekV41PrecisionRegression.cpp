@@ -5,8 +5,11 @@
 #include "utils.h"
 #include "devices/cpu/computeutils.h"
 #include "devices/cpu/deepseekv41-reference-math.h"
+#include "models/deepseekv41.h"
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda.cuh"
+#include "devices/cpu/cpudevice.h"
+#include "devices/cuda/cudadevice.h"
 #endif
 #include <algorithm>
 #include <cmath>
@@ -24,6 +27,33 @@ static void Check(bool ok, const char *message) {
     if (!ok)
         throw std::runtime_error(message);
     checks++;
+}
+static void ExportedActivationMetadata() {
+    class Probe : public DeepSeekV41Model {
+    public:
+        bool Quantized(const std::string &name) const {
+            return quantizedLinearNames.count(name) != 0;
+        }
+    };
+    const std::string query = "layers.0.attn.wq_a.weight";
+    const std::string expert = "layers.0.ffn.experts.0.w1.weight";
+    Probe original;
+    original.GetTensorMap({query, expert});
+    Check(!original.Quantized(query) && !original.Quantized(expert),
+          "unquantized source acquired activation quantization");
+    Probe exported;
+    exported.weight.AddDict("fastllm_activation_quantized_linears",
+                           "[\"" + query + "\",\"" + expert + "\"]");
+    exported.GetTensorMap({query, expert, "layers.0.attn.wq_b.weight"});
+    Check(exported.Quantized(query) && exported.Quantized(expert),
+          "export lost source activation quantization without scale tensors");
+    Check(exported.Quantized("layers.0.ffn.experts.0.gateup.weight"),
+          "export lost fused expert activation quantization");
+    Check(!exported.Quantized("layers.0.attn.wq_b.weight"),
+          "export metadata quantized an unrelated linear");
+    exported.GetTensorMap({"layers.0.attn.wq_b.weight", "layers.0.attn.wq_b.scale"});
+    Check(exported.Quantized("layers.0.attn.wq_b.weight"),
+          "export metadata prevented source scale detection");
 }
 static float Bf(float x) { return RoundFloat32ToBFloat16RNE(x); }
 static std::vector<float> Read(Data &data) {
@@ -62,7 +92,9 @@ static void Quant(std::vector<float> &values, int block) {
 static void Activation(bool cuda) {
     ApplyDeviceMap({{"cpu", 1}}, 0, 1);
     for (DataType dtype : {DataType::FLOAT32, DataType::FLOAT16, DataType::BFLOAT16}) {
-        for (int rows : {1, 5, 33}) {
+        const std::vector<int> rowsToCheck = dtype == DataType::BFLOAT16 ?
+            std::vector<int>{1, 5, 33, 2047, 2048, 2049} : std::vector<int>{1, 5, 33};
+        for (int rows : rowsToCheck) {
             std::vector<float> x(rows * 128);
             for (size_t i = 0; i < x.size(); i++)
                 x[i] = std::ldexp(((int)(i * 13 % 83) - 41) / 16.0f, (int)((i / 32) % 7) - 5);
@@ -287,6 +319,188 @@ static void MixedMoe(bool numa = false) {
                 }
             }
 }
+#ifdef USE_CUDA
+static void NativeFp8ScaleRange() {
+    ApplyDeviceMap({{"cuda", 1}}, 0, 1);
+    constexpr int dim = 256, channels = 32;
+    for (int rows : {1, 2, 3, 4, 5, 6, 7, 8, 11, 31, 32, 33}) {
+        for (int scaleExponent : {-16, -12, -8, 0, 12}) {
+            Data weight(DataType::FP8_E4M3, {channels, dim});
+            weight.blockK = 32;
+            weight.blockM = 32;
+            weight.scales.assign(dim / 32, std::ldexp(1.0f, scaleExponent));
+            weight.Allocate();
+            std::memset(weight.cpuData, 0x21, channels * dim); // E4M3FN 0.140625
+            std::vector<float> x(rows * dim);
+            for (size_t i = 0; i < x.size(); ++i) x[i] = Bf((1.0f + (i % 13) / 8.0f) / 1024.0f);
+            Data input(DataType::FLOAT32, {rows, dim}, x), output;
+            ToDataType(input, DataType::BFLOAT16);
+            Linear(input, weight, *GetEmptyData(), output);
+            auto actual = Read(output);
+            for (int row = 0; row < rows; ++row) {
+                double sum = 0;
+                for (int c = 0; c < dim; ++c) sum += x[row * dim + c] * 0.140625 * std::ldexp(1.0, scaleExponent);
+                for (int c = 0; c < channels; ++c) {
+                    if (actual[row * channels + c] != Bf(sum))
+                        std::cerr << "FP8 scale range rows=" << rows << " exponent=" << scaleExponent
+                                  << " actual=" << actual[row * channels + c] << " expected=" << Bf(sum) << '\n';
+                    Check(actual[row * channels + c] == Bf(sum), "FP8 GEMM lost exponent range in intermediate values");
+                }
+            }
+        }
+    }
+}
+static void NativeLargeExpertRouter() {
+    ApplyDeviceMap({{"cuda", 1}}, 0, 1);
+    constexpr int topk = 6;
+    for (int experts : {256, 384, 768}) for (int rows : {1, 17}) {
+        std::vector<float> raw(rows * experts), bias(experts), expected(rows * topk);
+        std::vector<int32_t> selected(rows * topk);
+        for (int e=0; e<experts; ++e) bias[e] = (e % 7) * 0.0001f;
+        for (int row=0; row<rows; ++row) {
+            std::vector<std::pair<float,int>> ranked;
+            for (int e=0; e<experts; ++e) {
+                float v = float((e * 37 + row * 13) % experts) / 19.0f - 12.0f;
+                raw[row * experts + e] = v;
+                float transformed = std::sqrt(v > 20.0f ? v : std::log1p(std::exp(v)));
+                ranked.emplace_back(transformed+bias[e],e);
+            }
+            std::sort(ranked.begin(),ranked.end(),[](auto a,auto b){return a.first>b.first;});
+            float sum=0;
+            for(int j=0;j<topk;++j) {
+                int e=ranked[j].second;selected[row*topk+j]=e;
+                float v=raw[row*experts+e];
+                expected[row*topk+j]=std::sqrt(v>20.0f?v:std::log1p(std::exp(v)));
+                sum+=expected[row*topk+j];
+            }
+            for(int j=0;j<topk;++j) expected[row*topk+j] *= 2.5f / sum;
+        }
+        Data logits(DataType::FLOAT32,{rows,experts},raw);
+        Data gateBias(DataType::FLOAT32,{experts},bias);
+        Data ids(DataType::INT32,{rows,topk}), scores(DataType::FLOAT32,{rows,topk});
+        for(Data *d:{&logits,&gateBias}) d->ToDevice(DataDevice::CUDA,{0},true);
+        for(Data *d:{&ids,&scores}) {d->ToDevice(DataDevice::CUDA,{0},false);d->Allocate(false);}
+        Check(FastllmCudaDeepSeekV4RouteScoreTransform(logits,2),"CUDA route transform rejected a large expert count");
+        Check(FastllmCudaSelectExpert(logits,&gateBias,ids,scores,topk,true,2.5f),"CUDA top-k rejected routes");
+        Data hostIds;
+        hostIds.CopyFrom(ids);
+        hostIds.ToDevice(DataDevice::CPU);
+        auto actualIds=(const int32_t *)hostIds.cpuData;
+        auto actualScores=Read(scores);
+        for(int i=0;i<rows*topk;++i) {
+            Check(actualIds[i]==selected[i],"CUDA router selected a different expert");
+            Check(std::abs(actualScores[i]-expected[i])<2e-6f,"CUDA router weight normalization mismatch");
+        }
+    }
+}
+
+static void NativeMxfp4Moe() {
+    ApplyDeviceMap({{"cuda", 1}}, 0, 1);
+    constexpr int dim = 256;
+    Data gate = RoutedWeight(2 * dim, dim), down = RoutedWeight(dim, dim);
+    for (Data *w : {&gate, &down}) {
+        w->directMemory = true;
+        w->ToDevice(DataDevice::CUDA, {0}, true);
+    }
+    std::vector<Data *> weights{nullptr, nullptr, &gate, &down};
+    Data scratch, output;
+    for (int rows : {1, 2, 8, 11, 33, 127, 128, 129, 257, 1}) {
+        std::vector<float> x(rows * dim), scores(rows), expected(rows * dim);
+        for (size_t i = 0; i < x.size(); ++i)
+            x[i] = Bf(std::ldexp(float(int(i * 17 % 79) - 39) / 7.0f, int(i / 32 % 4) - 2));
+        for (int r = 0; r < rows; ++r) {
+            x[r * dim] = 128.0f;
+            x[r * dim + 1] = -128.0f;
+            scores[r] = r % 3 == 0 ? 0.34f : (r % 3 == 1 ? 0.0f : 1.75f);
+            std::vector<float> v(x.begin() + r * dim, x.begin() + (r + 1) * dim);
+            const auto e = Expert(v, true, scores[r], 0.125f, 0.125f);
+            std::copy(e.begin(), e.end(), expected.begin() + r * dim);
+        }
+        Data input(DataType::FLOAT32, {rows, dim}, x);
+        ToDataType(input, DataType::BFLOAT16);
+        Data index(DataType::INT32, {rows, 1});
+        index.Allocate();
+        std::memset(index.cpuData, 0, rows * sizeof(int32_t));
+        Data score(DataType::FLOAT32, {rows, 1}, scores);
+        for (Data *d : {&input, &index, &score}) d->ToDevice(DataDevice::CUDA, {0}, true);
+        Check(Read(score) == scores, "native MoE score upload failed");
+        Check(FastllmCudaBFloat16MergeMOEVllmMarlinBatch1ExpertParallel(
+            input, scratch, output, weights.data(), weights.size(),
+            (const int32_t *)index.cudaData, (const float *)score.cudaData,
+            1, 0, 1, true, 10.0f), "V4.1 native MXFP4 MoE rejected input");
+        const auto actual = Read(output);
+        if (actual != expected) {
+            auto si = Read(input), sa = Read(scratch), ss = Read(score);
+            std::cerr << "input=" << si[0] << " activation=" << sa[0] << " score=" << ss[0] << '\n';
+            int shown = 0;
+            for (size_t j = 0; j < actual.size() && shown < 8; ++j) {
+                if (actual[j] != expected[j]) {
+                    std::cerr << "native MoE rows=" << rows << " at=" << j
+                              << " actual=" << actual[j] << " expected=" << expected[j] << '\n';
+                    ++shown;
+                }
+            }
+        }
+        Check(actual == expected,
+              "V4.1 native MXFP4 changed activation quantization, clipping or pre-down router weighting");
+    }
+}
+static void NativeMxfp4Accumulation() {
+    ApplyDeviceMap({{"cuda", 1}}, 0, 1);
+    constexpr int dim = 256, topk = 2;
+    Data g0 = RoutedWeight(2 * dim, dim), d0 = RoutedWeight(dim, dim);
+    Data g1 = RoutedWeight(2 * dim, dim), d1 = RoutedWeight(dim, dim);
+    for (Data *w : {&g0, &d0, &g1, &d1}) {
+        w->directMemory = true;
+        w->ToDevice(DataDevice::CUDA, {0}, true);
+    }
+    std::vector<Data *> weights{nullptr, nullptr, &g0, &d0, &g1, &d1};
+    Data fg0 = RoutedWeight(2 * dim, dim), fd0 = RoutedWeight(dim, dim);
+    Data fg1 = RoutedWeight(2 * dim, dim), fd1 = RoutedWeight(dim, dim);
+    for (Data *w : {&fg0, &fd0, &fg1, &fd1}) w->ToDevice(DataDevice::CUDA, {0}, true);
+    std::vector<Data *> fallbackWeights{nullptr, nullptr, &fg0, &fd0, &fg1, &fd1};
+    Data scratch, native, fallback, w2, w3;
+    for (auto ownership : std::vector<std::pair<int, int>>{{0, 1}, {0, 2}, {1, 2}, {7, 8}})
+    for (int rows : {1, 2, 8, 11, 16, 33, 127, 128, 129, 255, 256, 257}) {
+        const int ownerRank = ownership.first, ownerCount = ownership.second;
+        std::vector<float> x(rows * dim), scores(rows * topk), expected(rows * dim);
+        for (size_t i = 0; i < x.size(); ++i) x[i] = Bf(float(int(i * 17 % 79) - 39) / 7.0f);
+        for (int row = 0; row < rows; ++row) {
+            scores[row * topk] = 0.34f;
+            scores[row * topk + 1] = row % 2 ? 1.75f : -0.17f;
+            std::vector<float> v(x.begin() + row * dim, x.begin() + (row + 1) * dim);
+            auto a = Expert(v, true, scores[row * topk], 0.125f, 0.125f);
+            auto b = Expert(v, true, scores[row * topk + 1], 0.125f, 0.125f);
+            for (int c = 0; c < dim; ++c)
+                expected[row * dim + c] = (ownerCount == 1 || row % 3 != 0 ? a[c] : 0.0f) +
+                                         (ownerCount == 1 || row % 3 != 1 ? b[c] : 0.0f);
+        }
+        Data input(DataType::FLOAT32, {rows, dim}, x);
+        ToDataType(input, DataType::BFLOAT16);
+        Data index(DataType::INT32, {rows, topk});
+        index.Allocate();
+        for (int i = 0; i < rows * topk; ++i) {
+            const int rank = (i / topk) % 3 == i % topk ? (ownerRank + 1) % ownerCount : ownerRank;
+            ((int32_t *)index.cpuData)[i] = (i % topk) * ownerCount + rank;
+        }
+        Data score(DataType::FLOAT32, {rows, topk}, scores);
+        for (Data *d : {&input, &index, &score}) d->ToDevice(DataDevice::CUDA, {0}, true);
+        Check(FastllmCudaBFloat16MergeMOEVllmMarlinBatch1ExpertParallel(
+            input, scratch, native, weights.data(), weights.size(),
+            (const int32_t *)index.cudaData, (const float *)score.cudaData,
+            topk, ownerRank, ownerCount, true, 10.0f), "V4.1 multi-expert native MoE rejected input");
+        Check(native.dataType == DataType::FLOAT32 && Read(native) == expected,
+              "V4.1 native MoE rounded the expert sum before the collective");
+        if (ownerCount == 1) {
+            DoCudaMergeMOE(input, fallback, index, score, scratch, w2, w3,
+                fallbackWeights.data(), nullptr, 0.0f, MoeGateSwiglu, fallbackWeights.size(), 10.0f, true);
+            Check(fallback.dataType == DataType::FLOAT32 && Read(fallback) == expected,
+                  "V4.1 general CUDA MoE changed the original arithmetic boundaries");
+        }
+    }
+}
+
+#endif
 static void NVFP4TokenReuseOrder() {
     if (V41ReferenceMathEnabled()) return;
     for (auto shape : std::vector<std::pair<int,int>>{{32,19},{96,37},{5120,129},{2304,267}})
@@ -686,6 +900,7 @@ static void SharedSwigluBoundary() {
 int main(int argc, char **argv) {
     try {
         SetThreads(30);
+        ExportedActivationMetadata();
         Activation(false);
         RotaryBoundary(false);
         AttentionBoundary(false);
@@ -700,6 +915,10 @@ int main(int argc, char **argv) {
             ParallelReferenceBoundary();
             SharedSwigluBoundary();
             HcDecodeOrder();
+            NativeLargeExpertRouter();
+            NativeMxfp4Moe();
+            NativeMxfp4Accumulation();
+            NativeFp8ScaleRange();
         }
 #endif
         ReferenceFp8BlockBoundary();

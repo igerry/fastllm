@@ -156,7 +156,7 @@ function cacheElements() {
     "agent-runtime-message", "agent-runtime-progress", "agent-runtime-error", "install-agent-runtime",
     "config-path", "profile-editor-modal", "profile-editor-title", "launch-form",
     "close-profile-editor", "save-state", "ori-field", "auto-configure-profile",
-    "clear-profile-config", "automatic-config-status",
+    "clear-profile-config", "automatic-config-status", "automatic-resource-limits",
     "profile-parameters", "profile-editor-description", "configuration-mode-options",
     "configuration-mode-description", "automatic-config-actions",
     "configuration-mode-settings", "automatic-config-dialog", "automatic-mode-options",
@@ -180,7 +180,7 @@ function cacheElements() {
     "confirmation-modal", "confirmation-icon", "confirmation-kicker",
     "confirmation-title", "confirmation-message", "confirmation-cancel",
     "confirmation-confirm",
-    "toast-region", "download-activity", "download-form", "download-preset",
+    "toast-region", "download-activity", "download-catalog", "download-form", "download-preset",
     "download-badge", "download-command", "download-validation", "download-start",
     "download-cancel", "download-use-model", "download-use-last", "download-status-icon",
     "download-status-title", "download-status-message", "download-progress-value",
@@ -511,13 +511,16 @@ function bindEvents() {
     closeAutomaticConfigurationDialog();
   });
   elements.automaticModeOptions.addEventListener("change", () => {
+    elements.automaticEnableSpeculativeDecoding.closest("label").classList.toggle(
+      "hidden", elements.automaticModeOptions.querySelector("input:checked")?.value === "auto"
+    );
     elements.automaticModeDescription.textContent = configurationModeDescription(
-      elements.automaticModeOptions.querySelector("input:checked")?.value || "long_context"
+      elements.automaticModeOptions.querySelector("input:checked")?.value || "auto"
     );
   });
   elements.automaticConfigDialogApply.addEventListener("click", async () => {
     const selection = {
-      config_mode: elements.automaticModeOptions.querySelector("input:checked")?.value || "long_context",
+      config_mode: elements.automaticModeOptions.querySelector("input:checked")?.value || "auto",
       enable_speculative_decoding: elements.automaticEnableSpeculativeDecoding.checked
     };
     if (await configureProfileAutomatically({ selection })) {

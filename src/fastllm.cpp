@@ -5,10 +5,15 @@
 #include "utils.h"
 
 #include "fastllm.h"
+#include "kvmem.h"
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+#include "devices/cuda/fastllm-fp8-auxiliary.h"
+#endif
 #ifdef USE_CUDA
 #include "devices/cuda/fastllm-cuda-native-prefill.h"
 #endif
 #include "contextconfig.h"
+#include "moe_cache_config.h"
 #include "devices/disk/diskdevice.h"
 
 #include "executor.h"
@@ -55,6 +60,9 @@ namespace py = pybind11;
 #include "gguf.h"
 
 namespace fastllm {
+#ifdef USE_NUMAS
+    void ReleaseNumasMoeWeightArena(Data *weight);
+#endif
     extern BF16ToFP32Manager bf16tofp32;
 
     namespace {
@@ -113,7 +121,10 @@ namespace fastllm {
 #ifdef USE_CUDA
         static void *CudaMallocForData(const Data &data, uint64_t bytes) {
             if (data.isModelWeight && !data.directMemory) {
-                return FastllmCudaMallocModelWeight(bytes, data.name);
+                // TP NVFP4 sources are retired after each layer is repacked.
+                bool transientExpert = data.dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED &&
+                    (data.tpLinearType == TP_LINEAR_ROW || data.tpLinearType == TP_LINEAR_COLUMN);
+                return FastllmCudaMallocModelWeightGrouped(bytes, data.name, transientExpert);
             }
             return data.directMemory ? FastllmCudaDirectMalloc(bytes) : FastllmCudaMalloc(bytes);
         }
@@ -292,9 +303,12 @@ namespace fastllm {
     static bool kvCacheInCPU = false;
     static bool historyCacheInCPU = false;
     static bool cudaEmbedding = false;
+    static bool cudaEmbeddingConfigured = false;
     static bool cudaSharedExpert = false;
     static int cudaSlabMB = 0;
     static std::atomic<uint64_t> moeCudaCacheBytes{0};
+    static std::mutex moeCudaCacheDeviceMutex;
+    static std::map<int, uint64_t> moeCudaCacheDeviceBytes;
     static std::atomic<uint64_t> moeCpuCacheBytes{0};
     static bool enableAMX = false;
     static int maxTokens = -1;
@@ -376,11 +390,6 @@ namespace fastllm {
         if (useFusedGdnPrefillEnv != nullptr && std::strcmp(useFusedGdnPrefillEnv, "0") == 0) {
             this->useFusedGdnPrefill = false;
         }
-
-        const char *debugTokenIdEnv = std::getenv("FASTLLM_DEBUG_TOKEN_ID");
-        if (debugTokenIdEnv != nullptr) {
-            this->debugTokenId = debugTokenIdEnv;
-        }
     }
 
     const FastllmEnv &GetFastllmEnv() {
@@ -421,10 +430,13 @@ namespace fastllm {
 
     void SetCudaEmbedding(bool v) {
         cudaEmbedding = v;
+        cudaEmbeddingConfigured = true;
     }
 
     bool GetCudaEmbedding() {
-        return cudaEmbedding || GetFastllmEnv().cudaGraph;
+        // Graph mode supplies a default, but must not override an explicit
+        // opt-out (for example --low_gpu_mem on a CPU-offloaded MoE model).
+        return cudaEmbeddingConfigured ? cudaEmbedding : GetFastllmEnv().cudaGraph;
     }
 
     bool GetCudaEmbeddingRequested() {
@@ -443,12 +455,43 @@ namespace fastllm {
     }
 
     void SetMoeCudaCacheBytes(uint64_t bytes) {
-        moeCudaCacheBytes = bytes;
+        {
+            std::lock_guard<std::mutex> lock(moeCudaCacheDeviceMutex);
+            moeCudaCacheDeviceBytes.clear();
+            moeCudaCacheBytes = bytes;
+        }
         TrimDiskMoeCache();
     }
 
     uint64_t GetMoeCudaCacheBytes() {
         return moeCudaCacheBytes;
+    }
+
+    void SetMoeCudaCacheDeviceBytes(int device, uint64_t bytes) {
+        std::lock_guard<std::mutex> lock(moeCudaCacheDeviceMutex);
+        moeCudaCacheDeviceBytes[device] = bytes;
+    }
+
+    uint64_t GetMoeCudaCacheDeviceBytes(int device) {
+        std::lock_guard<std::mutex> lock(moeCudaCacheDeviceMutex);
+        auto it = moeCudaCacheDeviceBytes.find(device);
+        return it == moeCudaCacheDeviceBytes.end() ? moeCudaCacheBytes.load() : it->second;
+    }
+
+    namespace {
+        std::mutex moeCacheConfigMutex;
+        MoeCacheConfig moeCacheConfig;
+    }
+
+    void SetMoeCacheConfig(const MoeCacheConfig &config) {
+        config.Validate();
+        std::lock_guard<std::mutex> lock(moeCacheConfigMutex);
+        moeCacheConfig = config;
+    }
+
+    MoeCacheConfig GetMoeCacheConfig() {
+        std::lock_guard<std::mutex> lock(moeCacheConfigMutex);
+        return moeCacheConfig;
     }
 
     void SetMoeCpuCacheBytes(uint64_t bytes) {
@@ -1107,10 +1150,27 @@ namespace fastllm {
         CopyFrom(ori);
     }
 
+    bool ReleaseKvMemCache(Data &cache) {
+        if (!cache.kvMemConfig) {
+            return false;
+        }
+        cache.pageIndex.clear();
+        cache.pagedKVCacheData = nullptr;
+        cache.lastPageLen = 0;
+        cache.isPagedKVCache = false;
+        cache.kvMemCache.reset();
+        cache.kvMemConfig.reset();
+        return true;
+    }
+
     void Data::FakeFrom(const Data &ori, size_t offset) {
+        if (ori.kvMemConfig || kvMemConfig) {
+            throw std::runtime_error("KVMem cache views require an explicit backend implementation");
+        }
         AssertInFastLLM(!ori.cudaNativeNvfp4Layout, "Native NVFP4 weight views require restoring the source layout first.");
         this->cudaNativeNvfp4Layout = false;
         this->dataType = ori.dataType;
+        this->kvCacheFp8Indexer = ori.kvCacheFp8Indexer;
         this->UpdateUnitSize();
         this->isFake = true;
         this->dataDevice = ori.dataDevice;
@@ -1128,12 +1188,44 @@ namespace fastllm {
     }
 
     void Data::CopyFrom(const Data &ori) {
+        if (this == &ori) return;
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        if (!this->isFake && this->extraCudaData.size() >= 7)
+            FastllmCudaReleaseBFloat16FP8Auxiliary(*this);
+#endif
+
+        if (ori.kvMemConfig || kvMemConfig) {
+            throw std::runtime_error("KVMem cache snapshots require an explicit backend implementation");
+        }
 #ifdef USE_CUDA
         if (this->cudaNativeNvfp4Layout) FastllmCudaRestoreNativeNvfp4(*this);
-#endif
+        // A clone belongs to the source device. The executor may currently
+        // point at another pipeline stage while saving an MTP checkpoint.
+        const int callerDevice = FastllmCudaGetDevice();
+        struct RestoreCopyDevice {
+            int device;
+            ~RestoreCopyDevice() { FastllmCudaSetDevice(device); }
+        } restoreDevice{callerDevice};
+        if (ori.dataDevice == DataDevice::CUDA) {
+            int sourceDevice = ori.dataDeviceIds.empty() ? callerDevice : ori.dataDeviceIds[0];
+            if (ori.cudaData != nullptr && !FastllmCudaGraphIsCapturingFast()) {
+                const int actualDevice = GetPointerDeviceId(ori.cudaData);
+                if (actualDevice >= 0) sourceDevice = actualDevice;
+            }
+            FastllmCudaSetDevice(sourceDevice);
+            this->ToDevice(DataDevice::CUDA, {sourceDevice}, false);
+            this->dataDeviceIds = {sourceDevice};
+        } else {
+            this->ToDevice(ori.dataDevice);
+            this->dataDeviceIds = ori.dataDeviceIds;
+        }
+#else
         this->ToDevice(ori.dataDevice);
+        this->dataDeviceIds = ori.dataDeviceIds;
+#endif
         this->name = ori.name;
         this->isKVCache = ori.isKVCache;
+        this->kvCacheFp8Indexer = ori.kvCacheFp8Indexer;
         this->isLinearAttention = ori.isLinearAttention;
         this->isLinearAttentionTransposed = ori.isLinearAttentionTransposed;
         this->cacheUid = ori.cacheUid;
@@ -2227,6 +2319,16 @@ namespace fastllm {
     void Data::FreeSpace() {
         if (isFake)
             return;
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        if (!this->isFake && this->extraCudaData.size() >= 7)
+            FastllmCudaReleaseBFloat16FP8Auxiliary(*this);
+#endif
+
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        if (this->dataType == DataType::DATA_GGUF_FORMAT) {
+            FastllmCudaReleaseMoeGGUFResident(this);
+        }
+#endif
         if (this->cudaNativeNvfp4Layout) { this->cudaNativeNvfp4Layout = false; this->IsRepacked = false; }
         this->expansionSize = 0;
         this->expansionBytes = 0;
@@ -2399,6 +2501,11 @@ namespace fastllm {
             ReleaseDiskMoeCache(this);
         }
 #ifdef USE_CUDA
+#ifndef USE_ROCM
+        if (this->dataType == DataType::DATA_GGUF_FORMAT) {
+            FastllmCudaReleaseMoeGGUFResident(this);
+        }
+#endif
         // Hash-route tables keep per-device CUDA replicas while the owning
         // Data is alive. Retire them before either this object or its CPU
         // allocation can be reused by a subsequently loaded model.
@@ -2417,15 +2524,20 @@ namespace fastllm {
 #ifdef FASTLLM_ENABLE_DSV4_MOE_DEEPGEMM_SM120
             FastllmCudaReleaseMergeMOEDeepGemmSm120Cache(this);
 #endif
-        } else if (this->dataType == DataType::INT4_GROUP &&
-                   this->isModelWeight) {
+        } else if ((this->dataType == DataType::INT4_GROUP && this->isModelWeight) ||
+                   this->dataType == DataType::NVFP4_BLOCK_16_E4M3 ||
+                   this->dataType == DataType::NVFP4_BLOCK_16_E4M3_PACKED) {
             FastllmCudaReleaseMergeMOEVllmMarlinCache(this);
         }
 #endif
         if (isFake) {
             return;
         }
-        if (this->isPagedKVCache && !this->pageIndex.empty()) {
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        if (!this->isFake && this->extraCudaData.size() >= 7)
+            FastllmCudaReleaseBFloat16FP8Auxiliary(*this);
+#endif
+        if (!this->kvMemCache && this->isPagedKVCache && !this->pageIndex.empty()) {
             this->pagedKVCacheData->ReleasePageIndices(this->pageIndex);
         }
         if (this->multiDeviceData) {
@@ -2450,6 +2562,9 @@ namespace fastllm {
                 }
             }
         }
+#endif
+#ifdef USE_NUMAS
+        ReleaseNumasMoeWeightArena(this);
 #endif
     }
 
@@ -2792,6 +2907,16 @@ namespace fastllm {
         if (alreadyOnTarget) {
             return;
         }
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        if (!this->isFake && this->extraCudaData.size() >= 7)
+            FastllmCudaReleaseBFloat16FP8Auxiliary(*this);
+#endif
+
+#if defined(USE_CUDA) && !defined(USE_ROCM)
+        if (this->dataType == DataType::DATA_GGUF_FORMAT) {
+            FastllmCudaReleaseMoeGGUFResident(this);
+        }
+#endif
 
         if (this->expansionBytes != 0) {
 #ifdef USE_CUDA
@@ -2880,6 +3005,13 @@ namespace fastllm {
                 }
             } else if (this->dataDevice == DataDevice::CUDA) {
                 if (device == DataDevice::CPU) {
+                    const int callerDevice = FastllmCudaGetDevice();
+                    int sourceDevice = this->dataDeviceIds.empty() ? callerDevice : this->dataDeviceIds[0];
+                    if (this->cudaData != nullptr && !FastllmCudaGraphIsCapturingFast()) {
+                        const int actualDevice = GetPointerDeviceId(this->cudaData);
+                        if (actualDevice >= 0) sourceDevice = actualDevice;
+                    }
+                    FastllmCudaSetDevice(sourceDevice);
                     if (this->cudaNativeNvfp4Layout) FastllmCudaRestoreNativeNvfp4(*this);
                     if (this->cpuData == nullptr) {
                         this->cpuData = new uint8_t[expansionBytes];
@@ -2893,6 +3025,7 @@ namespace fastllm {
                         this->cudaData = nullptr;
                         this->cudaDataBorrowed = false;
                     }
+                    FastllmCudaSetDevice(callerDevice);
                 } else if (device == DataDevice::CUDA) {
                     int sourceDevice = this->dataDeviceIds.size() == 0 ? 0 : this->dataDeviceIds[0];
                     if (this->cudaData != nullptr) {
@@ -5842,8 +5975,8 @@ namespace fastllm {
         std::string normalized = device;
         std::transform(normalized.begin(), normalized.end(), normalized.begin(),
                        [](unsigned char c) { return (char)std::tolower(c); });
-        AssertInFastLLM(normalized == "cpu" || normalized == "disk",
-                        "ngram device should be cpu or disk.\n");
+        AssertInFastLLM(normalized == "cpu" || normalized == "disk" || normalized == "cuda",
+                        "ngram device should be cpu, disk or cuda.\n");
         defaultNgramDevice = normalized;
     }
 
@@ -5852,217 +5985,159 @@ namespace fastllm {
     }
 
     void PagedCacheManager::SetMaxPages(int maxPages) {
-        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        std::lock_guard<std::mutex> guard(pageIndexLocker);
+        if (trieRoot) EvictTrieSubtree(trieRoot);
         this->maxPages = maxPages;
-        this->freePages.clear();
-        this->triePages.clear();
-        this->freePagesSet.clear();
-        this->triePagesSet.clear();
-        this->freePages.reserve(maxPages);
-        this->freePagesSet.reserve(maxPages);
-        for (int i = 0; i < maxPages; i++) {
-            this->freePages.push_back(i);
-            this->freePagesSet.insert(i);
+        freePages.clear(); triePages.clear();
+        freePagesSet.clear(); triePagesSet.clear();
+        evictableLeaves.clear(); pageToTrieNode.clear();
+        freePages.reserve(maxPages);
+        freePagesSet.reserve(maxPages);
+        for (int i = 0; i < maxPages; ++i) {
+            freePages.push_back(i);
+            freePagesSet.insert(i);
         }
-        this->pageTimestamp.assign(maxPages, 0);
-        this->pageRefCount.assign(maxPages, 0);
-        this->currentTimestamp = 0;
-        this->pageToTrieNode.clear();
-        if (this->trieRoot) {
-            // 简单起见，不递归删除旧树节点（在生命周期内 SetMaxPages 通常只调用一次）
-        }
-        this->trieRoot = new CacheTrieNode();
+        pageTimestamp.assign(maxPages, 0);
+        pageRefCount.assign(maxPages, 0);
+        // Keep generations monotonic across pool resets as well as page reuse.
+        trieRoot = new CacheTrieNode();
     }
 
-    // 从 Trie 中移除一个叶子节点，断开父子关系并清理映射
-    static void RemoveTrieLeaf(CacheTrieNode *node, int pageIndex,
-                               std::unordered_map<int, CacheTrieNode*> &pageToTrieNode) {
-        if (node->parent) {
-            node->parent->children.erase(node->edgeHash);
-        }
-        pageToTrieNode.erase(pageIndex);
-        delete node;
+    void PagedCacheManager::UpdateEvictableLeaf(CacheTrieNode *node) {
+        if (!node || node->pageId < 0) return;
+        if (node->evictable) evictableLeaves.erase({node->lastAccess, node->pageId});
+        node->evictable = node->children.empty() && pageRefCount[node->pageId] == 0;
+        if (node->evictable)
+            evictableLeaves.insert({node->lastAccess, node->pageId});
     }
 
-    // 递归删除 Trie 子树中所有节点，将其关联的页面迁移回 freePages
+    void PagedCacheManager::RemoveTriePage(int pageIndex) {
+        if (!triePagesSet.erase(pageIndex)) return;
+        auto it = pageToTrieNode.find(pageIndex);
+        int index = it == pageToTrieNode.end() ? -1 : it->second->unusedIndex;
+        if (index < 0 || index >= (int)triePages.size() || triePages[index] != pageIndex) {
+            auto pos = std::find(triePages.begin(), triePages.end(), pageIndex);
+            if (pos == triePages.end()) return;
+            index = (int)(pos - triePages.begin());
+        }
+        int moved = triePages.back();
+        triePages[index] = moved;
+        triePages.pop_back();
+        auto movedIt = pageToTrieNode.find(moved);
+        if (movedIt != pageToTrieNode.end()) movedIt->second->unusedIndex = index;
+        if (it != pageToTrieNode.end()) it->second->unusedIndex = -1;
+    }
+
+    // The caller owns pageIndexLocker (or is destroying an idle pool).
     void PagedCacheManager::EvictTrieSubtree(CacheTrieNode *node) {
-        // 先递归处理所有子节点
-        for (auto &kv : node->children) {
-            EvictTrieSubtree(kv.second);
-        }
-        int pid = node->pageId;
+        for (auto &child : node->children) EvictTrieSubtree(child.second);
+        const int pid = node->pageId;
         if (pid >= 0) {
-            this->pageToTrieNode.erase(pid);
-            // 如果页面空闲（在 triePagesSet 中），迁移到 freePages
-            if (this->triePagesSet.erase(pid)) {
-                this->freePagesSet.insert(pid);
-                this->freePages.push_back(pid);
-            }
+            if (node->evictable) evictableLeaves.erase({node->lastAccess, pid});
+            RemoveTriePage(pid);
+            pageToTrieNode.erase(pid);
+            pageTimestamp[pid] = ++currentTimestamp;
+            if (pageRefCount[pid] == 0 && freePagesSet.insert(pid).second)
+                freePages.push_back(pid);
         }
         delete node;
+    }
+
+    void PagedCacheManager::PrepareFreePages(int count) {
+        while ((int)freePages.size() < count) {
+            if (triePages.empty())
+                ErrorInFastLLM("PagedCacheManager: no unused page available.\n");
+            CacheTrieNode *node = nullptr;
+            if (!evictableLeaves.empty()) {
+                node = pageToTrieNode.at(evictableLeaves.begin()->second);
+            } else {
+                // Defensive fallback for callers retaining only a suffix of a
+                // chain. Detach its metadata without freeing referenced pages.
+                for (int pid : triePages) {
+                    auto it = pageToTrieNode.find(pid);
+                    if (it == pageToTrieNode.end()) {
+                        RemoveTriePage(pid);
+                        if (freePagesSet.insert(pid).second) freePages.push_back(pid);
+                        break;
+                    }
+                    if (!node || it->second->lastAccess < node->lastAccess)
+                        node = it->second;
+                }
+                if ((int)freePages.size() >= count) break;
+                if (!node) continue;
+            }
+            CacheTrieNode *parent = node->parent;
+            if (parent) parent->children.erase(node->edgeHash);
+            EvictTrieSubtree(node);
+            UpdateEvictableLeaf(parent);
+        }
     }
 
     int PagedCacheManager::GetUnusedPageIndex(bool pick) {
-        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
-
-        // 尝试将 triePages 中已不在 Trie 中的 stale 条目迁移到 freePages
-        while (this->freePages.empty() && !this->triePages.empty()) {
-            int candidate = this->triePages.back();
-            auto it = this->pageToTrieNode.find(candidate);
-            if (it == this->pageToTrieNode.end()) {
-                // 页面已不在 Trie 中，迁移到 freePages
-                this->triePages.pop_back();
-                this->triePagesSet.erase(candidate);
-                this->freePages.push_back(candidate);
-                this->freePagesSet.insert(candidate);
-            } else {
-                break;
-            }
-        }
-
-        if (this->freePages.empty() && this->triePages.empty()) {
-            ErrorInFastLLM("PagedCacheManager::GetUnusedPageIndex: no page can be use.\n");
-        }
-
-        int pageIndex;
-        if (!this->freePages.empty()) {
-            pageIndex = this->freePages.back();
-            if (pick) {
-                this->freePages.pop_back();
-                this->freePagesSet.erase(pageIndex);
-                this->pageRefCount[pageIndex] = 1;
-            }
-        } else {
-            if (!pick) {
-                pageIndex = this->triePages.back();
-                return pageIndex;
-            }
-
-            // pick 模式：从 triePages 中淘汰，优先选叶子节点
-            pageIndex = -1;
-            for (int i = (int)this->triePages.size() - 1; i >= 0; i--) {
-                int candidate = this->triePages[i];
-                auto it = this->pageToTrieNode.find(candidate);
-                if (it == this->pageToTrieNode.end()) {
-                    // stale 条目：页面已不在 Trie 中，直接用
-                    pageIndex = candidate;
-                    this->triePages[i] = this->triePages.back();
-                    this->triePages.pop_back();
-                    this->triePagesSet.erase(pageIndex);
-                    break;
-                }
-                if (it->second->children.empty()) {
-                    pageIndex = candidate;
-                    this->triePages[i] = this->triePages.back();
-                    this->triePages.pop_back();
-                    this->triePagesSet.erase(pageIndex);
-                    RemoveTrieLeaf(it->second, pageIndex, this->pageToTrieNode);
-                    break;
-                }
-            }
-
-            if (pageIndex == -1) {
-                // 没有叶子可淘汰，选一个非叶子，递归清理其整个子树
-                pageIndex = this->triePages.back();
-                this->triePages.pop_back();
-                this->triePagesSet.erase(pageIndex);
-                auto it = this->pageToTrieNode.find(pageIndex);
-                if (it != this->pageToTrieNode.end()) {
-                    CacheTrieNode *node = it->second;
-                    for (auto &childKv : node->children) {
-                        EvictTrieSubtree(childKv.second);
-                    }
-                    node->children.clear();
-                    if (node->parent) {
-                        node->parent->children.erase(node->edgeHash);
-                    }
-                    this->pageToTrieNode.erase(it);
-                    delete node;
-                }
-                // EvictTrieSubtree 可能将子树页面从 triePages 迁移到 freePages，
-                // 过滤 triePages 中已不在 triePagesSet 的脏条目
-                int w = 0;
-                for (int i = 0; i < (int)this->triePages.size(); i++) {
-                    if (this->triePagesSet.count(this->triePages[i])) {
-                        this->triePages[w++] = this->triePages[i];
-                    }
-                }
-                this->triePages.resize(w);
-            }
-
-            this->pageRefCount[pageIndex] = 1;
+        std::lock_guard<std::mutex> guard(pageIndexLocker);
+        PrepareFreePages(1);
+        int pageIndex = freePages.back();
+        if (pick) {
+            freePages.pop_back();
+            freePagesSet.erase(pageIndex);
+            pageRefCount[pageIndex] = 1;
+            pageTimestamp[pageIndex] = ++currentTimestamp;
         }
         return pageIndex;
     }
 
-    void PagedCacheManager::ReleasePageIndex(int pageIndex) {
-        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
-        this->pageRefCount[pageIndex]--;
-        if (this->pageRefCount[pageIndex] <= 0) {
-            this->pageRefCount[pageIndex] = 0;
-            if (this->pageToTrieNode.find(pageIndex) != this->pageToTrieNode.end()) {
-                if (this->triePagesSet.find(pageIndex) == this->triePagesSet.end()) {
-                    this->triePages.push_back(pageIndex);
-                    this->triePagesSet.insert(pageIndex);
-                }
-            } else {
-                if (this->freePagesSet.find(pageIndex) == this->freePagesSet.end()) {
-                    this->freePages.push_back(pageIndex);
-                    this->freePagesSet.insert(pageIndex);
-                }
+    void PagedCacheManager::PreviewUnusedPageIndices(int count, std::vector<int> &pages) {
+        std::lock_guard<std::mutex> guard(pageIndexLocker);
+        PrepareFreePages(count);
+        pages.clear();
+        for (int i = 0; i < count; ++i) pages.push_back(freePages[freePages.size() - 1 - i]);
+    }
+
+    bool PagedCacheManager::IsCachedPage(int pageIndex, long long generation) {
+        std::lock_guard<std::mutex> guard(pageIndexLocker);
+        auto it = pageToTrieNode.find(pageIndex);
+        return it != pageToTrieNode.end() && pageTimestamp[pageIndex] == generation &&
+               it->second->timestamp == generation;
+    }
+
+    void PagedCacheManager::ReleasePageIndexLocked(int pageIndex) {
+        if (--pageRefCount[pageIndex] > 0) return;
+        pageRefCount[pageIndex] = 0;
+        auto it = pageToTrieNode.find(pageIndex);
+        if (it != pageToTrieNode.end()) {
+            if (triePagesSet.insert(pageIndex).second) {
+                it->second->unusedIndex = (int)triePages.size();
+                triePages.push_back(pageIndex);
             }
+            UpdateEvictableLeaf(it->second);
+        } else if (freePagesSet.insert(pageIndex).second) {
+            freePages.push_back(pageIndex);
         }
+    }
+
+    void PagedCacheManager::ReleasePageIndex(int pageIndex) {
+        std::lock_guard<std::mutex> guard(pageIndexLocker);
+        ReleasePageIndexLocked(pageIndex);
     }
 
     void PagedCacheManager::ReleasePageIndices(const std::vector<int> &pageIndices) {
-        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
-        for (int pageIndex : pageIndices) {
-            this->pageRefCount[pageIndex]--;
-            if (this->pageRefCount[pageIndex] <= 0) {
-                this->pageRefCount[pageIndex] = 0;
-                if (this->pageToTrieNode.find(pageIndex) != this->pageToTrieNode.end()) {
-                    if (this->triePagesSet.find(pageIndex) == this->triePagesSet.end()) {
-                        this->triePages.push_back(pageIndex);
-                        this->triePagesSet.insert(pageIndex);
-                    }
-                } else {
-                    if (this->freePagesSet.find(pageIndex) == this->freePagesSet.end()) {
-                        this->freePages.push_back(pageIndex);
-                        this->freePagesSet.insert(pageIndex);
-                    }
-                }
-            }
-        }
+        std::lock_guard<std::mutex> guard(pageIndexLocker);
+        for (int pageIndex : pageIndices) ReleasePageIndexLocked(pageIndex);
     }
 
     void PagedCacheManager::Pick(std::vector<int> &pageIds) {
-        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
-        bool needRebuildFree = false, needRebuildTrie = false;
-        for (int pageIndex : pageIds) {
-            this->pageRefCount[pageIndex]++;
-            if (this->freePagesSet.erase(pageIndex)) {
-                needRebuildFree = true;
-            } else if (this->triePagesSet.erase(pageIndex)) {
-                needRebuildTrie = true;
-            }
+        std::lock_guard<std::mutex> guard(pageIndexLocker);
+        bool rebuildFree = false;
+        for (int pid : pageIds) {
+            ++pageRefCount[pid];
+            if (freePagesSet.erase(pid)) rebuildFree = true;
+            RemoveTriePage(pid);
+            auto it = pageToTrieNode.find(pid);
+            if (it != pageToTrieNode.end()) UpdateEvictableLeaf(it->second);
         }
-        if (needRebuildFree) {
-            int w = 0;
-            for (int i = 0; i < (int)this->freePages.size(); i++) {
-                if (this->freePagesSet.count(this->freePages[i])) {
-                    this->freePages[w++] = this->freePages[i];
-                }
-            }
-            this->freePages.resize(w);
-        }
-        if (needRebuildTrie) {
-            int w = 0;
-            for (int i = 0; i < (int)this->triePages.size(); i++) {
-                if (this->triePagesSet.count(this->triePages[i])) {
-                    this->triePages[w++] = this->triePages[i];
-                }
-            }
-            this->triePages.resize(w);
+        if (rebuildFree) {
+            freePages.erase(std::remove_if(freePages.begin(), freePages.end(),
+                [&](int pid) { return !freePagesSet.count(pid); }), freePages.end());
         }
     }
 
@@ -6076,98 +6151,78 @@ namespace fastllm {
     }
 
     void PagedCacheManager::Record(const std::vector<int> &tokens, const std::vector<int> &pages) {
-        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
-        this->currentTimestamp++;
-        long long ts = this->currentTimestamp;
-
-        int numPages = (int)tokens.size() / this->pageLen;
-        if ((int)pages.size() < numPages) {
-            numPages = (int)pages.size();
-        }
-
-        CacheTrieNode *cur = this->trieRoot;
-        for (int i = 0; i < numPages; i++) {
-            uint64_t h = HashTokenPage(tokens.data() + i * this->pageLen, this->pageLen);
+        std::lock_guard<std::mutex> guard(pageIndexLocker);
+        const long long access = ++currentTimestamp;
+        const int count = std::min((int)tokens.size() / pageLen, (int)pages.size());
+        CacheTrieNode *cur = trieRoot;
+        for (int i = 0; i < count; ++i) {
+            uint64_t hash = HashTokenPage(tokens.data() + i * pageLen, pageLen);
             int pid = pages[i];
-
-            auto it = cur->children.find(h);
+            auto it = cur->children.find(hash);
+            auto previous = pageToTrieNode.find(pid);
+            if (previous != pageToTrieNode.end() &&
+                (it == cur->children.end() || previous->second != it->second)) {
+                // Publishing different contents in a physical page must also
+                // invalidate its old prefix and every dependent suffix.
+                CacheTrieNode *old = previous->second;
+                for (auto ancestor = cur; ancestor; ancestor = ancestor->parent)
+                    AssertInFastLLM(ancestor != old, "Repeated page in cache prefix.\n");
+                CacheTrieNode *parent = old->parent;
+                parent->children.erase(old->edgeHash);
+                EvictTrieSubtree(old);
+                UpdateEvictableLeaf(parent);
+            }
             CacheTrieNode *child;
             if (it == cur->children.end()) {
                 child = new CacheTrieNode();
-                child->parent = cur;
-                child->edgeHash = h;
-                cur->children[h] = child;
+                child->parent = cur; child->edgeHash = hash;
+                cur->children[hash] = child;
+                UpdateEvictableLeaf(cur);
             } else {
                 child = it->second;
-                if (child->pageId != -1 && child->pageId != pid) {
-                    int oldPid = child->pageId;
-                    this->pageToTrieNode.erase(oldPid);
-                    // 旧页面如果空闲，从 triePages 迁移到 freePages
-                    if (this->triePagesSet.erase(oldPid)) {
-                        for (int j = (int)this->triePages.size() - 1; j >= 0; j--) {
-                            if (this->triePages[j] == oldPid) {
-                                this->triePages[j] = this->triePages.back();
-                                this->triePages.pop_back();
-                                break;
-                            }
-                        }
-                        this->freePages.push_back(oldPid);
-                        this->freePagesSet.insert(oldPid);
-                    }
+                if (child->evictable) evictableLeaves.erase({child->lastAccess, child->pageId});
+                child->evictable = false;
+                if (child->pageId >= 0 && child->pageId != pid) {
+                    int old = child->pageId;
+                    RemoveTriePage(old);
+                    pageToTrieNode.erase(old);
+                    if (pageRefCount[old] == 0 && freePagesSet.insert(old).second)
+                        freePages.push_back(old);
                 }
             }
-
-            // 新页面加入 Trie：如果它在 freePages 中（空闲且不在 Trie 中），迁移到 triePages
-            if (this->pageToTrieNode.find(pid) == this->pageToTrieNode.end()) {
-                if (this->freePagesSet.erase(pid)) {
-                    for (int j = (int)this->freePages.size() - 1; j >= 0; j--) {
-                        if (this->freePages[j] == pid) {
-                            this->freePages[j] = this->freePages.back();
-                            this->freePages.pop_back();
-                            break;
-                        }
-                    }
-                    if (this->pageRefCount[pid] <= 0) {
-                        this->triePages.push_back(pid);
-                        this->triePagesSet.insert(pid);
-                    }
-                }
-            }
-
+            if (freePagesSet.erase(pid))
+                freePages.erase(std::find(freePages.begin(), freePages.end(), pid));
+            // A generation identifies the physical contents, not how often an
+            // unchanged page is published or matched by concurrent requests.
+            if (!pageTimestamp[pid]) pageTimestamp[pid] = ++currentTimestamp;
             child->pageId = pid;
-            child->timestamp = ts;
-            this->pageTimestamp[pid] = ts;
-            this->pageToTrieNode[pid] = child;
-
+            child->timestamp = pageTimestamp[pid];
+            child->lastAccess = access;
+            pageToTrieNode[pid] = child;
+            if (pageRefCount[pid] == 0 && triePagesSet.insert(pid).second) {
+                child->unusedIndex = (int)triePages.size();
+                triePages.push_back(pid);
+            }
+            UpdateEvictableLeaf(child);
             cur = child;
         }
     }
 
     void PagedCacheManager::Query(const std::vector<int> &tokens, std::vector<int> &cachedPageIds) {
-        std::lock_guard<std::mutex> guard(this->pageIndexLocker);
+        std::lock_guard<std::mutex> guard(pageIndexLocker);
         cachedPageIds.clear();
-
-        int numPages = (int)tokens.size() / this->pageLen;
-        CacheTrieNode *cur = this->trieRoot;
-
-        for (int i = 0; i < numPages; i++) {
-            uint64_t h = HashTokenPage(tokens.data() + i * this->pageLen, this->pageLen);
-
-            auto it = cur->children.find(h);
-            if (it == cur->children.end()) {
-                break;
-            }
-
+        const long long access = ++currentTimestamp;
+        CacheTrieNode *cur = trieRoot;
+        for (int i = 0; i < (int)tokens.size() / pageLen; ++i) {
+            uint64_t hash = HashTokenPage(tokens.data() + i * pageLen, pageLen);
+            auto it = cur->children.find(hash);
+            if (it == cur->children.end()) break;
             CacheTrieNode *child = it->second;
-            if (child->pageId == -1) {
-                break;
-            }
-
-            // 验证时间戳：页面未被覆盖
-            if (this->pageTimestamp[child->pageId] != child->timestamp) {
-                break;
-            }
-
+            if (child->pageId < 0 || pageTimestamp[child->pageId] != child->timestamp) break;
+            if (child->evictable) evictableLeaves.erase({child->lastAccess, child->pageId});
+            child->evictable = false;
+            child->lastAccess = access;
+            UpdateEvictableLeaf(child);
             cachedPageIds.push_back(child->pageId);
             cur = child;
         }

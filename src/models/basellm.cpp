@@ -17,10 +17,26 @@
 
 #ifdef USE_CUDA
 #include "fastllm-cuda.cuh"
+#include "devices/cuda/cudaworkspace.h"
 #endif
 
 namespace fastllm {
     namespace {
+        static void SplitPrefillInput(const Data &input, int start, int count, Data &output) {
+            // Keep host token/position metadata on the host while chunking.
+            // Dispatching Split to GPU0 makes TP workers clone and peer-copy
+            // each chunk, introducing cross-device synchronization before use.
+            if (input.dataDevice == DataDevice::CPU && input.dataType == FLOAT32 &&
+                input.dims.size() == 2 && input.dims[0] == 1 && input.cpuData &&
+                input.strides.size() == 2 && input.strides[1] == 1) {
+                Data view(FLOAT32, {1, count}, DataDevice::CPU,
+                          input.cpuData + (size_t)start * sizeof(float));
+                output.CopyFrom(view);
+            } else {
+                Split(input, 1, start, start + count, output);
+            }
+        }
+
         static bool NeedRepeatPenalty(const GenerationConfig &config) {
             float diff = config.repeat_penalty - 1.0f;
             return diff > 1e-6f || diff < -1e-6f;
@@ -50,6 +66,9 @@ namespace fastllm {
         static void ReleasePagedCachePages(Data &cache, bool clearDims = false) {
             std::set<std::pair<PagedCacheManager*, int> > releasedPages;
             auto releaseUnique = [&](Data &pagedCache) {
+                if (ReleaseKvMemCache(pagedCache)) {
+                    return;
+                }
                 if (!pagedCache.isPagedKVCache || pagedCache.pagedKVCacheData == nullptr ||
                     pagedCache.pageIndex.empty()) {
                     return;
@@ -509,11 +528,15 @@ namespace fastllm {
     }
 
     void ResponseContext::TryRecord(basellm *model) {
-        model->TryRecordResponseContext(this);
+        if (model->kvMemConfig.enabled) return;
+        if (model->DeferHistoryCacheRestore()) this->TryRecordPagedCache(model);
+        else model->TryRecordResponseContext(this);
     }
 
     void basellm::TryRecordResponseContext(ResponseContext *context) {
-        if (context == nullptr) {
+        // These caches are keyed only by token IDs. Media placeholders do not
+        // identify their pixels, embeddings, or multimodal position state.
+        if (context == nullptr || !context->multimodalInput.empty()) {
             return;
         }
         this->TryRecordHistoryCache(context->allTokens);
@@ -596,6 +619,11 @@ namespace fastllm {
     }
 
     void ResponseContext::TryRecordPagedCache(basellm *model) {
+        if (model->kvMemConfig.enabled) return;
+        if (model->DeferHistoryCacheRestore()) model->TryRecordResponseContext(this);
+        if (!this->multimodalInput.empty()) {
+            return;
+        }
         bool hasLinearAttentionCache = false;
         bool hasBoundedAttentionCache = false;
         for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
@@ -682,7 +710,9 @@ namespace fastllm {
             }
             if (cache.pagedKVCacheData != nullptr && !cache.pageIndex.empty() &&
                 cache.pagedKVCacheData->type == PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE) {
-                cache.pagedKVCacheData->Record(this->allTokens, cache.pageIndex);
+                auto pages = cache.pageIndex;
+                if (cache.lastPageLen < cache.pageLen) pages.pop_back();
+                cache.pagedKVCacheData->Record(this->allTokens, pages);
             }
         };
         for (int i = 0; i < (int)this->pastKeyValues.size(); i++) {
@@ -1296,6 +1326,321 @@ namespace fastllm {
         exit(0);
     }
 
+    // Both schedulers restore the same page references and model-specific
+    // companion state. Called while scheduling is locked, between forwards.
+    static PagedCacheManager *RestoreResidentPrefix(basellm *model, ResponseContext *ctx) {
+        if (model->kvMemConfig.enabled || !ctx->multimodalInput.empty() || ctx->cacheLen != 0 ||
+            ctx->intParams.count("paged_prefix_restore_disabled")) return nullptr;
+        PagedCacheManager *probeManager = nullptr;
+        bool queryUnboundedLayersOnly = false;
+        for (int li = 0; li < model->block_cnt && probeManager == nullptr; li++) {
+            if (model->GetKVCacheRetainedTokens(li) >= 0) {
+                continue;
+            }
+            auto refs = model->GetPagedKVCacheManagers(li, true);
+            for (auto &ref : refs) {
+                if (ref.second != nullptr) {
+                    probeManager = ref.second;
+                    queryUnboundedLayersOnly = true;
+                    break;
+                }
+            }
+        }
+        if (probeManager == nullptr) {
+            auto probeRefs = model->GetPagedKVCacheManagers(
+                model->kvCacheId, true);
+            for (auto &ref : probeRefs) {
+                if (ref.second != nullptr) {
+                    probeManager = ref.second;
+                    break;
+                }
+            }
+        }
+        if (probeManager != nullptr) {
+            std::map<PagedCacheManager*, std::vector<int> > queriedPages;
+            auto queryManager = [&](PagedCacheManager *manager) -> std::vector<int>& {
+                auto it = queriedPages.find(manager);
+                if (it == queriedPages.end()) {
+                    std::vector<int> pages;
+                    manager->Query(ctx->currentTokens, pages);
+                    it = queriedPages.insert(std::make_pair(manager, std::move(pages))).first;
+                }
+                return it->second;
+            };
+
+            int minCachedPages = (int)queryManager(probeManager).size();
+            if (minCachedPages > 0) {
+                for (int li = 0; li < model->block_cnt; li++) {
+                    if (queryUnboundedLayersOnly &&
+                        model->GetKVCacheRetainedTokens(li) >= 0) {
+                        continue;
+                    }
+                    for (int keyFlag = 0; keyFlag < 2; keyFlag++) {
+                        bool isKey = keyFlag == 0;
+                        auto refs = model->GetPagedKVCacheManagers(li, isKey);
+                        for (auto &ref : refs) {
+                            PagedCacheManager *manager = ref.second;
+                            if (manager == nullptr || manager->pageLen != probeManager->pageLen) {
+                                continue;
+                            }
+                            minCachedPages = std::min(minCachedPages,
+                                    (int)queryManager(manager).size());
+                        }
+                    }
+                }
+            }
+
+            if (minCachedPages > 0) {
+                int cachedLen = minCachedPages * probeManager->pageLen;
+                if (cachedLen >= (int)ctx->currentTokens.size()) {
+                    minCachedPages--;
+                }
+            }
+            if (minCachedPages > 0) {
+                int cachedLen = minCachedPages * probeManager->pageLen;
+                int extraCachedLen = model->QueryPagedPrefixCacheExtra(ctx, cachedLen);
+                extraCachedLen = std::max(0, std::min(extraCachedLen, cachedLen));
+                minCachedPages = extraCachedLen / probeManager->pageLen;
+            }
+            if (minCachedPages > 0) {
+                int cachedLen = minCachedPages * probeManager->pageLen;
+                auto managerDevice = [](PagedCacheManager *manager) {
+                    if (manager == nullptr) {
+                        return -1;
+                    }
+                    Data *managerData = (Data*)manager;
+                    if (managerData->dataDeviceIds.empty()) {
+                        return -1;
+                    }
+                    return managerData->dataDeviceIds[0];
+                };
+                auto restoreOne = [&](Data &cache,
+                                      PagedCacheManager *manager,
+                                      const std::vector<int> &pages) {
+                    if (manager == nullptr || (int)pages.size() < minCachedPages) {
+                        return;
+                    }
+                    Data *managerData = (Data*)manager;
+                    if (managerData->dims.size() < 4) {
+                        return;
+                    }
+                    // Model-specific extra state may have
+                    // restored a bounded fallback tail before
+                    // this generic full-prefix restore. Drop
+                    // that cache-owned reference before
+                    // replacing its page chain; the snapshot
+                    // keeps its own independent references.
+                    if (cache.isPagedKVCache &&
+                        cache.pagedKVCacheData != nullptr &&
+                        !cache.pageIndex.empty()) {
+                        cache.pagedKVCacheData->ReleasePageIndices(
+                            cache.pageIndex);
+                        cache.pageIndex.clear();
+                        cache.lastPageLen = 0;
+                    }
+                    cache.isKVCache = true;
+                    cache.isPagedKVCache = true;
+                    cache.pagedKVCacheData = manager;
+                    cache.pageLen = manager->pageLen;
+                    cache.pageIndex.assign(pages.begin(), pages.begin() + minCachedPages);
+                    manager->Pick(cache.pageIndex);
+                    cache.lastPageLen = manager->pageLen;
+                    cache.dataType = managerData->dataType;
+                    cache.UpdateUnitSize();
+                    cache.dataDevice = managerData->dataDevice;
+                    cache.dataDeviceIds = managerData->dataDeviceIds;
+                    int numHeads = managerData->dims[2];
+                    int headDim = managerData->dims[3];
+                    cache.Resize({numHeads, minCachedPages * manager->pageLen, headDim});
+                };
+
+                struct PagedCacheRestorePlan {
+                    Data *cache = nullptr;
+                    bool multiDevice = false;
+                    std::vector<std::pair<int, PagedCacheManager*> > refs;
+                };
+                std::vector<PagedCacheRestorePlan> restorePlans;
+                auto buildRestorePlan = [&](Data &cache,
+                                            const std::vector<std::pair<int, PagedCacheManager*> > &refs,
+                                            bool required) -> bool {
+                    std::vector<std::pair<int, PagedCacheManager*> > validRefs;
+                    for (auto ref : refs) {
+                        if (ref.second == nullptr || ref.second->pageLen != probeManager->pageLen) {
+                            continue;
+                        }
+                        Data *managerData = (Data*)ref.second;
+                        if (managerData->dims.size() < 4) {
+                            continue;
+                        }
+                        if ((int)queryManager(ref.second).size() < minCachedPages) {
+                            continue;
+                        }
+                        validRefs.push_back(ref);
+                    }
+                    if (validRefs.empty()) {
+                        return !required;
+                    }
+
+                    bool restoreAsMultiDevice =
+                        cache.multiDeviceData ||
+                        !cache.multiDeviceDatas.empty() ||
+                        refs.size() > 1;
+                    if (!restoreAsMultiDevice) {
+                        restorePlans.push_back(
+                            {&cache, false, std::move(validRefs)});
+                        return true;
+                    }
+
+                    // TP cache restore is collective. Restoring only the
+                    // ranks whose trie entries survived would leave the root
+                    // metadata describing a subset while stale local caches
+                    // and page references remain on the other ranks. Keep the
+                    // model-specific fallback state unless every expected
+                    // device can be restored together.
+                    if (validRefs.size() != refs.size()) {
+                        return !required;
+                    }
+                    std::set<int> restoreDevices;
+                    for (auto &ref : validRefs) {
+                        int device = ref.first >= 0
+                            ? ref.first : managerDevice(ref.second);
+                        if (device < 0 || !restoreDevices.insert(device).second) {
+                            return !required;
+                        }
+                        ref.first = device;
+                    }
+                    std::set<int> currentDevices;
+                    for (auto &it : cache.multiDeviceDatas) {
+                        if (it.second != nullptr) {
+                            currentDevices.insert(it.first);
+                        }
+                    }
+                    if (currentDevices.empty()) {
+                        for (int device : cache.dataDeviceIds) {
+                            if (device >= 0) {
+                                currentDevices.insert(device);
+                            }
+                        }
+                    }
+                    if (!currentDevices.empty() &&
+                        currentDevices != restoreDevices) {
+                        return !required;
+                    }
+
+                    restorePlans.push_back(
+                        {&cache, true, std::move(validRefs)});
+                    return true;
+                };
+
+                bool restorePlanReady = true;
+                for (int li = 0; li < model->block_cnt; li++) {
+                    auto &kvFirst = ctx->pastKeyValues[li].first;
+                    auto &kvSecond = ctx->pastKeyValues[li].second;
+                    bool unbounded = queryUnboundedLayersOnly &&
+                        model->GetKVCacheRetainedTokens(li) < 0;
+                    restorePlanReady =
+                        buildRestorePlan(
+                            kvFirst,
+                            model->GetPagedKVCacheManagers(li, true),
+                            unbounded && !kvFirst.isLinearAttention) &&
+                        restorePlanReady;
+                    restorePlanReady =
+                        buildRestorePlan(
+                            kvSecond,
+                            model->GetPagedKVCacheManagers(li, false),
+                            unbounded && !kvSecond.isLinearAttention) &&
+                        restorePlanReady;
+                }
+
+                auto applyRestorePlan = [&](PagedCacheRestorePlan &plan) -> bool {
+                    if (plan.cache == nullptr || plan.refs.empty()) {
+                        return false;
+                    }
+                    Data &cache = *plan.cache;
+                    if (!plan.multiDevice) {
+                        restoreOne(cache, plan.refs[0].second,
+                                   queryManager(plan.refs[0].second));
+                        return true;
+                    }
+
+                    cache.multiDeviceData = true;
+                    cache.dataDevice = DataDevice::CUDA;
+                    cache.dataDeviceIds.clear();
+                    cache.isKVCache = true;
+                    cache.isPagedKVCache = true;
+                    Data *firstLocal = nullptr;
+                    for (auto &ref : plan.refs) {
+                        int device = ref.first;
+                        cache.dataDeviceIds.push_back(device);
+                        Data *managerData = (Data*)ref.second;
+                        Data *&local = cache.multiDeviceDatas[device];
+                        if (local == nullptr) {
+                            local = new Data(managerData->dataType);
+                            local->SetKVCache();
+                            local->cacheUid = cache.cacheUid;
+                        }
+                        restoreOne(*local, ref.second, queryManager(ref.second));
+                        if (firstLocal == nullptr) {
+                            firstLocal = local;
+                        }
+                    }
+                    if (firstLocal == nullptr) {
+                        return false;
+                    }
+                    cache.dataType = firstLocal->dataType;
+                    cache.UpdateUnitSize();
+                    cache.cudaData = nullptr;
+                    cache.pageLen = firstLocal->pageLen;
+                    cache.pageIndex = firstLocal->pageIndex;
+                    cache.lastPageLen = firstLocal->lastPageLen;
+                    cache.pagedKVCacheData = firstLocal->pagedKVCacheData;
+                    cache.dims = firstLocal->dims;
+                    return true;
+                };
+
+                bool restoredPrefix = false;
+                if (restorePlanReady &&
+                    model->RestorePagedPrefixCacheExtra(ctx, cachedLen)) {
+                    restoredPrefix = true;
+                    for (auto &plan : restorePlans) {
+                        if (!applyRestorePlan(plan)) {
+                            restoredPrefix = false;
+                            break;
+                        }
+                    }
+                }
+
+                if (restoredPrefix) {
+                    ctx->currentTokens.erase(
+                        ctx->currentTokens.begin(),
+                        ctx->currentTokens.begin() + cachedLen);
+                    ctx->cacheLen = cachedLen;
+                } else {
+                    // A prefix hit is useful only when its
+                    // complete model state can be restored.
+                    // Drop any model-specific partial state
+                    // and let this request prefill normally.
+                    for (auto &kv : ctx->pastKeyValues) {
+                        ReleasePagedCachePages(kv.first, true);
+                        ReleasePagedCachePages(kv.second, true);
+                    }
+                    ctx->cacheLen = 0;
+                    ctx->intParams["paged_prefix_restore_disabled"] = 1;
+                }
+            }
+        }
+        return probeManager;
+    }
+
+    static void RestoreDeferredHistory(basellm *model, ResponseContext *ctx) {
+        if (ctx->cacheLen == 0 && ctx->multimodalInput.empty() && model->DeferHistoryCacheRestore() &&
+            !ctx->intParams.count("deferred_history_checked")) {
+            ctx->intParams["deferred_history_checked"] = 1;
+            if (model->TryRestoreHistoryCache(ctx->currentTokens, ctx->cacheLen))
+                model->OnResponseContextCreated(ctx);
+        }
+    }
+
     void basellm::NewMainLoop() {
         RunNewMainLoop(false);
     }
@@ -1423,6 +1768,7 @@ namespace fastllm {
         auto collectDecodePageNeeds =
                 [&](const std::vector<ResponseContext*> &contexts) -> std::map<PagedCacheManager*, int> {
             std::map<PagedCacheManager*, int> needs;
+            if (model->kvMemConfig.enabled) return needs;
             bool representativeCachesKnown = true;
             for (auto *ctx : contexts) {
                 if (ctx == nullptr || model->kvCacheId < 0 ||
@@ -1546,6 +1892,7 @@ namespace fastllm {
 
         auto collectPrefillPageNeeds = [&](ResponseContext *ctx, int appendTokens) -> PageNeedState {
             PageNeedState state;
+            if (model->kvMemConfig.enabled) return state;
             if (ctx == nullptr || appendTokens <= 0) {
                 return state;
             }
@@ -1600,7 +1947,10 @@ namespace fastllm {
         };
 
         auto *pcm = model->GetPagedKVCacheManager(model->kvCacheId, true);
-        if (pcm != nullptr) {
+        if (model->kvMemConfig.enabled) {
+            maxTotalLens = model->kvMemConfig.maxTokens;
+            maxBatch = 1;
+        } else if (pcm != nullptr) {
             totalPages = pcm->maxPages;
             pageLen = pcm->pageLen;
             maxTotalLens = totalPages * pageLen;
@@ -1662,9 +2012,6 @@ namespace fastllm {
                    activePrefillTokenLimit);
         }
         while (true) {
-            if (model->isFree) {
-                break;
-            }
             std::vector <Data*> attentionMasks;
             std::vector <Data*> positionIds;
             std::vector <Data*> ownedAttentionMasks;
@@ -1699,6 +2046,9 @@ namespace fastllm {
             decodePositionIds.reserve(reserveBatch);
 
             std::unique_lock<std::mutex> dictLocker(model->dictLocker);
+            // Pair the shutdown check with the condition variable's lock so
+            // its notification cannot be lost before an idle wait.
+            if (model->isFree) break;
             auto &forwardLocker = model->forwardLocker;
 
             // 单次遍历：处理abort、释放isEnding的KV cache、统计alive、构建orders、检测hasPrefill
@@ -1902,312 +2252,9 @@ namespace fastllm {
                     }
 
                     if (isPrompt) {
-                        if (ctx->cacheLen == 0 &&
-                            ctx->intParams.find("paged_prefix_restore_disabled") ==
-                                ctx->intParams.end()) {
-                            PagedCacheManager *probeManager = nullptr;
-                            bool queryUnboundedLayersOnly = false;
-                            for (int li = 0; li < model->block_cnt && probeManager == nullptr; li++) {
-                                if (model->GetKVCacheRetainedTokens(li) >= 0) {
-                                    continue;
-                                }
-                                auto refs = model->GetPagedKVCacheManagers(li, true);
-                                for (auto &ref : refs) {
-                                    if (ref.second != nullptr) {
-                                        probeManager = ref.second;
-                                        queryUnboundedLayersOnly = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            if (probeManager == nullptr) {
-                                auto probeRefs = model->GetPagedKVCacheManagers(
-                                    model->kvCacheId, true);
-                                for (auto &ref : probeRefs) {
-                                    if (ref.second != nullptr) {
-                                        probeManager = ref.second;
-                                        break;
-                                    }
-                                }
-                            }
-                            if (probeManager != nullptr) {
-                                std::map<PagedCacheManager*, std::vector<int> > queriedPages;
-                                auto queryManager = [&](PagedCacheManager *manager) -> std::vector<int>& {
-                                    auto it = queriedPages.find(manager);
-                                    if (it == queriedPages.end()) {
-                                        std::vector<int> pages;
-                                        manager->Query(ctx->currentTokens, pages);
-                                        it = queriedPages.insert(std::make_pair(manager, std::move(pages))).first;
-                                    }
-                                    return it->second;
-                                };
-
-                                int minCachedPages = (int)queryManager(probeManager).size();
-                                if (minCachedPages > 0) {
-                                    for (int li = 0; li < model->block_cnt; li++) {
-                                        if (queryUnboundedLayersOnly &&
-                                            model->GetKVCacheRetainedTokens(li) >= 0) {
-                                            continue;
-                                        }
-                                        for (int keyFlag = 0; keyFlag < 2; keyFlag++) {
-                                            bool isKey = keyFlag == 0;
-                                            auto refs = model->GetPagedKVCacheManagers(li, isKey);
-                                            for (auto &ref : refs) {
-                                                PagedCacheManager *manager = ref.second;
-                                                if (manager == nullptr || manager->pageLen != probeManager->pageLen) {
-                                                    continue;
-                                                }
-                                                minCachedPages = std::min(minCachedPages,
-                                                        (int)queryManager(manager).size());
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if (minCachedPages > 0) {
-                                    int cachedLen = minCachedPages * probeManager->pageLen;
-                                    if (cachedLen >= (int)ctx->currentTokens.size()) {
-                                        minCachedPages--;
-                                        cachedLen = minCachedPages * probeManager->pageLen;
-                                    }
-                                }
-                                if (minCachedPages > 0) {
-                                    int cachedLen = minCachedPages * probeManager->pageLen;
-                                    int extraCachedLen = model->QueryPagedPrefixCacheExtra(ctx, cachedLen);
-                                    extraCachedLen = std::max(0, std::min(extraCachedLen, cachedLen));
-                                    minCachedPages = extraCachedLen / probeManager->pageLen;
-                                }
-                                if (minCachedPages > 0) {
-                                    int cachedLen = minCachedPages * probeManager->pageLen;
-                                    auto managerDevice = [](PagedCacheManager *manager) {
-                                        if (manager == nullptr) {
-                                            return -1;
-                                        }
-                                        Data *managerData = (Data*)manager;
-                                        if (managerData->dataDeviceIds.empty()) {
-                                            return -1;
-                                        }
-                                        return managerData->dataDeviceIds[0];
-                                    };
-                                    auto restoreOne = [&](Data &cache,
-                                                          PagedCacheManager *manager,
-                                                          const std::vector<int> &pages) {
-                                        if (manager == nullptr || (int)pages.size() < minCachedPages) {
-                                            return;
-                                        }
-                                        Data *managerData = (Data*)manager;
-                                        if (managerData->dims.size() < 4) {
-                                            return;
-                                        }
-                                        // Model-specific extra state may have
-                                        // restored a bounded fallback tail before
-                                        // this generic full-prefix restore. Drop
-                                        // that cache-owned reference before
-                                        // replacing its page chain; the snapshot
-                                        // keeps its own independent references.
-                                        if (cache.isPagedKVCache &&
-                                            cache.pagedKVCacheData != nullptr &&
-                                            !cache.pageIndex.empty()) {
-                                            cache.pagedKVCacheData->ReleasePageIndices(
-                                                cache.pageIndex);
-                                            cache.pageIndex.clear();
-                                            cache.lastPageLen = 0;
-                                        }
-                                        cache.isKVCache = true;
-                                        cache.isPagedKVCache = true;
-                                        cache.pagedKVCacheData = manager;
-                                        cache.pageLen = manager->pageLen;
-                                        cache.pageIndex.assign(pages.begin(), pages.begin() + minCachedPages);
-                                        manager->Pick(cache.pageIndex);
-                                        cache.lastPageLen = manager->pageLen;
-                                        cache.dataType = managerData->dataType;
-                                        cache.UpdateUnitSize();
-                                        cache.dataDevice = managerData->dataDevice;
-                                        cache.dataDeviceIds = managerData->dataDeviceIds;
-                                        int numHeads = managerData->dims[2];
-                                        int headDim = managerData->dims[3];
-                                        cache.Resize({numHeads, minCachedPages * manager->pageLen, headDim});
-                                    };
-
-                                    struct PagedCacheRestorePlan {
-                                        Data *cache = nullptr;
-                                        bool multiDevice = false;
-                                        std::vector<std::pair<int, PagedCacheManager*> > refs;
-                                    };
-                                    std::vector<PagedCacheRestorePlan> restorePlans;
-                                    auto buildRestorePlan = [&](Data &cache,
-                                                                const std::vector<std::pair<int, PagedCacheManager*> > &refs,
-                                                                bool required) -> bool {
-                                        std::vector<std::pair<int, PagedCacheManager*> > validRefs;
-                                        for (auto ref : refs) {
-                                            if (ref.second == nullptr || ref.second->pageLen != probeManager->pageLen) {
-                                                continue;
-                                            }
-                                            Data *managerData = (Data*)ref.second;
-                                            if (managerData->dims.size() < 4) {
-                                                continue;
-                                            }
-                                            if ((int)queryManager(ref.second).size() < minCachedPages) {
-                                                continue;
-                                            }
-                                            validRefs.push_back(ref);
-                                        }
-                                        if (validRefs.empty()) {
-                                            return !required;
-                                        }
-
-                                        bool restoreAsMultiDevice =
-                                            cache.multiDeviceData ||
-                                            !cache.multiDeviceDatas.empty() ||
-                                            refs.size() > 1;
-                                        if (!restoreAsMultiDevice) {
-                                            restorePlans.push_back(
-                                                {&cache, false, std::move(validRefs)});
-                                            return true;
-                                        }
-
-                                        // TP cache restore is collective. Restoring only the
-                                        // ranks whose trie entries survived would leave the root
-                                        // metadata describing a subset while stale local caches
-                                        // and page references remain on the other ranks. Keep the
-                                        // model-specific fallback state unless every expected
-                                        // device can be restored together.
-                                        if (validRefs.size() != refs.size()) {
-                                            return !required;
-                                        }
-                                        std::set<int> restoreDevices;
-                                        for (auto &ref : validRefs) {
-                                            int device = ref.first >= 0
-                                                ? ref.first : managerDevice(ref.second);
-                                            if (device < 0 || !restoreDevices.insert(device).second) {
-                                                return !required;
-                                            }
-                                            ref.first = device;
-                                        }
-                                        std::set<int> currentDevices;
-                                        for (auto &it : cache.multiDeviceDatas) {
-                                            if (it.second != nullptr) {
-                                                currentDevices.insert(it.first);
-                                            }
-                                        }
-                                        if (currentDevices.empty()) {
-                                            for (int device : cache.dataDeviceIds) {
-                                                if (device >= 0) {
-                                                    currentDevices.insert(device);
-                                                }
-                                            }
-                                        }
-                                        if (!currentDevices.empty() &&
-                                            currentDevices != restoreDevices) {
-                                            return !required;
-                                        }
-
-                                        restorePlans.push_back(
-                                            {&cache, true, std::move(validRefs)});
-                                        return true;
-                                    };
-
-                                    bool restorePlanReady = true;
-                                    for (int li = 0; li < model->block_cnt; li++) {
-                                        auto &kvFirst = ctx->pastKeyValues[li].first;
-                                        auto &kvSecond = ctx->pastKeyValues[li].second;
-                                        bool unbounded = queryUnboundedLayersOnly &&
-                                            model->GetKVCacheRetainedTokens(li) < 0;
-                                        restorePlanReady =
-                                            buildRestorePlan(
-                                                kvFirst,
-                                                model->GetPagedKVCacheManagers(li, true),
-                                                unbounded && !kvFirst.isLinearAttention) &&
-                                            restorePlanReady;
-                                        restorePlanReady =
-                                            buildRestorePlan(
-                                                kvSecond,
-                                                model->GetPagedKVCacheManagers(li, false),
-                                                unbounded && !kvSecond.isLinearAttention) &&
-                                            restorePlanReady;
-                                    }
-
-                                    auto applyRestorePlan = [&](PagedCacheRestorePlan &plan) -> bool {
-                                        if (plan.cache == nullptr || plan.refs.empty()) {
-                                            return false;
-                                        }
-                                        Data &cache = *plan.cache;
-                                        if (!plan.multiDevice) {
-                                            restoreOne(cache, plan.refs[0].second,
-                                                       queryManager(plan.refs[0].second));
-                                            return true;
-                                        }
-
-                                        cache.multiDeviceData = true;
-                                        cache.dataDevice = DataDevice::CUDA;
-                                        cache.dataDeviceIds.clear();
-                                        cache.isKVCache = true;
-                                        cache.isPagedKVCache = true;
-                                        Data *firstLocal = nullptr;
-                                        for (auto &ref : plan.refs) {
-                                            int device = ref.first;
-                                            cache.dataDeviceIds.push_back(device);
-                                            Data *managerData = (Data*)ref.second;
-                                            Data *&local = cache.multiDeviceDatas[device];
-                                            if (local == nullptr) {
-                                                local = new Data(managerData->dataType);
-                                                local->SetKVCache();
-                                                local->cacheUid = cache.cacheUid;
-                                            }
-                                            restoreOne(*local, ref.second, queryManager(ref.second));
-                                            if (firstLocal == nullptr) {
-                                                firstLocal = local;
-                                            }
-                                        }
-                                        if (firstLocal == nullptr) {
-                                            return false;
-                                        }
-                                        cache.dataType = firstLocal->dataType;
-                                        cache.UpdateUnitSize();
-                                        cache.cudaData = nullptr;
-                                        cache.pageLen = firstLocal->pageLen;
-                                        cache.pageIndex = firstLocal->pageIndex;
-                                        cache.lastPageLen = firstLocal->lastPageLen;
-                                        cache.pagedKVCacheData = firstLocal->pagedKVCacheData;
-                                        cache.dims = firstLocal->dims;
-                                        return true;
-                                    };
-
-                                    bool restoredPrefix = false;
-                                    if (restorePlanReady &&
-                                        model->RestorePagedPrefixCacheExtra(ctx, cachedLen)) {
-                                        restoredPrefix = true;
-                                        for (auto &plan : restorePlans) {
-                                            if (!applyRestorePlan(plan)) {
-                                                restoredPrefix = false;
-                                                break;
-                                            }
-                                        }
-                                    }
-
-                                    if (restoredPrefix) {
-                                        ctx->currentTokens.erase(
-                                            ctx->currentTokens.begin(),
-                                            ctx->currentTokens.begin() + cachedLen);
-                                        ctx->cacheLen = cachedLen;
-                                    } else {
-                                        // A prefix hit is useful only when its
-                                        // complete model state can be restored.
-                                        // Drop any model-specific partial state
-                                        // and let this request prefill normally.
-                                        for (auto &kv : ctx->pastKeyValues) {
-                                            ReleasePagedCachePages(kv.first, true);
-                                            ReleasePagedCachePages(kv.second, true);
-                                        }
-                                        ctx->cacheLen = 0;
-                                        ctx->intParams["paged_prefix_restore_disabled"] = 1;
-                                    }
-                                    {
-                                        std::lock_guard<std::mutex> guard(probeManager->pageIndexLocker);
-                                        curBusyPages = probeManager->maxPages - probeManager->FreePageCount() + pendingNewPages;
-                                    }
-                                }
-                            }
+                        if (auto *manager = RestoreResidentPrefix(model, ctx)) {
+                            std::lock_guard<std::mutex> guard(manager->pageIndexLocker);
+                            curBusyPages = manager->maxPages - manager->FreePageCount() + pendingNewPages;
                         }
 
                         // currentActivate already includes every pending
@@ -2217,6 +2264,8 @@ namespace fastllm {
                         if (currentActivate >= maxBatch) {
                             continue;
                         }
+
+                        RestoreDeferredHistory(model, ctx);
 
                         int thisLen = (int)ctx->currentTokens.size();
                         int thisPages = (thisLen + pageLen - 1) / pageLen;
@@ -2492,6 +2541,7 @@ namespace fastllm {
 #endif
                 Data inputIds = Data(DataType::FLOAT32, {1, (int) ids.size()}, ids);
                 std::vector<int> ret;
+                int chunkedPrefillToken = -1;
                 std::chrono::system_clock::time_point profileStartTime;
                 if (printProfile) {
                     profileStartTime = std::chrono::system_clock::now();
@@ -2508,7 +2558,17 @@ namespace fastllm {
                         tokensManager,
                         &logits
                     );
-                } else if (seqLens.size() == 1 && seqLens[0] > prefillChunkSize) {
+                } else if (!model->kvMemConfig.enabled &&
+                           singleContext != nullptr && seqLens.size() == 1 &&
+                           seqLens[0] > prefillChunkSize &&
+                           model->TryForwardChunkedPrefill(
+                               inputIds, attentionMasks[0] == nullptr ? Data() : *attentionMasks[0],
+                               positionIds[0] == nullptr ? Data() : *positionIds[0],
+                               singleContext->pastKeyValues, generationConfigs[0],
+                               tokensManager, logits[0], chunkedPrefillToken)) {
+                    ret = {chunkedPrefillToken};
+                } else if (seqLens.size() == 1 && (seqLens[0] > prefillChunkSize ||
+                           (model->kvMemConfig.enabled && seqLens[0] > 1))) {
                     int len = seqLens[0];
                     std::vector <std::pair <Data, Data> > *pastKeyValue1;
                     dictLocker.lock();
@@ -2517,9 +2577,13 @@ namespace fastllm {
                     auto prefillStartTime = std::chrono::system_clock::now();
                     for (int st = 0; st < len; ) {
                         int curLen = std::min(prefillChunkSize, len - st);
+                        // Retrieve with the final prompt query before sampling.
+                        if (model->kvMemConfig.enabled && curLen > 1 && st + curLen == len) {
+                            --curLen;
+                        }
                         auto chunkStartTime = std::chrono::system_clock::now();
                         Data curInput, curPositionIds;
-                        Split(inputIds, 1, st, st + curLen, curInput);
+                        SplitPrefillInput(inputIds, st, curLen, curInput);
                         {
                             curPositionIds.dataType = positionIds[0]->dataType;
                             curPositionIds.Resize({1, curLen});
@@ -2710,6 +2774,9 @@ namespace fastllm {
     int basellm::LaunchResponseTokens(const std::vector<int> &inputTokens,
                                       const fastllm::GenerationConfig &generationConfig,
                                       const std::map <std::string, std::vector <Data*> > &multimodalInput) {
+        if (kvMemConfig.enabled && !multimodalInput.empty()) {
+            throw std::invalid_argument("KVMem currently supports text-only requests");
+        }
         mainLoopLocker.lock();
         if (mainLoop == nullptr) {
             if (mainLoop == nullptr) {
@@ -2805,12 +2872,28 @@ namespace fastllm {
                     auto lastRecordTime = std::chrono::system_clock::now();
                     long long genTokens = 0;
                     const bool printProfile = GetFastllmEnv().printProfile;
+                    // Naive uses the base one-token position convention. Keep
+                    // scalar views alive across steps; prefill and other models
+                    // still go through their virtual input builder.
+                    const bool fastDecodeInput = model->model_struct == "naive_n05_flash";
+                    std::vector<float> decodePositions(fastDecodeInput ? maxBatch : 0);
+                    std::vector<Data> decodePositionIds;
+                    if (fastDecodeInput) decodePositionIds.reserve(maxBatch);
+                    const bool batchPrefill = maxBatch > 1 && model->SupportsPrefillBatching() &&
+                                              model->prefillBatchPolicy.targetTokens > 0;
+                    const int prefillChunk = model->GetChunkedPrefillSize();
+                    const int prefillBatchLimit = model->GetBatchedPrefillTokenLimit();
+                    // 选批时一旦选中 prompt 就会跳过本轮全部 decode（见下面 isPrompt 循环里
+                    // 的第一个 continue），而这一轮可能很长：实测 3 路 8k prompt 并发进来时
+                    // 正在输出的请求被饿死 32 秒，1 路时则完全不受影响。
+                    // 这个闩锁复刻新引擎 RunNewMainLoop 里的 forceDecodeThisIteration：
+                    // 跑过一轮带 prompt 的前向后，强制下一轮只做 decode，然后清位。
+                    // 于是 prefill 与 decode 严格交替，已在输出的请求不会被新请求饿死。
+                    bool needDecodeYield = false;
                     while (true) {
-                        if (model->isFree) {
-                            break;
-                        }
                         std::vector <Data*> attentionMasks;
                         std::vector <Data*> positionIds;
+                        std::vector <Data*> ownedPositionIds;
                         std::vector <std::pair <Data*, Data*> > pastKeyValues;
                         std::vector <float> ids;
                         std::vector <int> seqLens;
@@ -2818,9 +2901,19 @@ namespace fastllm {
                         std::vector <int> handles;
                         std::vector <GenerationConfig> generationConfigs;
                         LastTokensManager tokensManager;
+                        tokensManager.units.reserve(maxBatch);
                         std::vector <std::vector <float>* > logits;
+                        attentionMasks.reserve(maxBatch);
+                        positionIds.reserve(maxBatch);
+                        pastKeyValues.reserve((size_t)maxBatch * model->block_cnt);
+                        ids.reserve(maxBatch);
+                        seqLens.reserve(maxBatch);
+                        handles.reserve(maxBatch);
+                        generationConfigs.reserve(maxBatch);
+                        logits.reserve(maxBatch);
 
                         std::unique_lock<std::mutex> dictLocker(model->dictLocker);
+                        if (model->isFree) break;
                         auto &forwardLocker = model->forwardLocker;
 
                         // 首先把已经abort的请求删除掉
@@ -2838,21 +2931,122 @@ namespace fastllm {
                         int limit = maxTotalLens;
                         int promptLimit = model->promptLimit;
 
-                        int lenSum = 0, currentActivate = 0;
+                        // A TP root may expose only a non-owning cache view.
+                        // Ask the model for its pool instead of interpreting
+                        // that view's used-page capacity as contiguous growth.
+                        auto *pagedManager = model->GetPagedKVCacheManager(model->kvCacheId, true);
+                        const bool preallocatedPagedCache = pagedManager != nullptr &&
+                            pagedManager->type == PagedCacheManager::PAGED_CACHE_MANAGER_TYPE_KV_CACHE &&
+                            pagedManager->pageLen > 0 && pagedManager->maxPages > 0;
+                        const int pageLen = preallocatedPagedCache ? pagedManager->pageLen : 1;
+                        const long long pagedTokenLimit = preallocatedPagedCache
+                            ? std::min(((long long)limit + pageLen - 1) / pageLen,
+                                       (long long)pagedManager->maxPages) * pageLen
+                            : 0;
+                        auto allocatedTokens = [](const Data &root) -> long long {
+                            const Data &cache = root.multiDeviceData && !root.multiDeviceDatas.empty() &&
+                                root.multiDeviceDatas.begin()->second->isPagedKVCache
+                                ? *root.multiDeviceDatas.begin()->second : root;
+                            if (cache.isPagedKVCache) {
+                                return (long long)cache.pageIndex.size() * cache.pageLen;
+                            }
+                            return cache.expansionDims.size() > 1 ? cache.expansionDims[1] : 0;
+                        };
+                        long long lenSum = 0;
+                        int currentActivate = 0;
                         for (auto &it: model->responseContextDict.dicts) {
-                            if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims.size() > 0) {
-                                lenSum += it.second->pastKeyValues[model->kvCacheId].first.expansionDims[1];
+                            if (allocatedTokens(it.second->pastKeyValues[model->kvCacheId].first) > 0) {
+                                const Data &cache = it.second->pastKeyValues[model->kvCacheId].first;
+                                lenSum += allocatedTokens(cache);
                                 currentActivate++;
                             }
                         }
+                        auto reservePagedAppend = [&](const Data &cache, int append) {
+                            const long long length = cache.dims.size() > 1 ? cache.dims[1] : 0;
+                            const long long required = (length + append + pageLen - 1) / pageLen * pageLen;
+                            const long long additional = std::max(0LL, required - allocatedTokens(cache));
+                            if (lenSum + additional > pagedTokenLimit) return false;
+                            lenSum += additional;
+                            return true;
+                        };
                         std::vector <std::pair <int, int> > orders;
                         for (auto &it : model->responseContextDict.dicts) {
                             orders.push_back(std::make_pair(-(int)it.second->currentTokens.size(), it.first));
                         }
-                        sort(orders.begin(), orders.end());
+                        if (batchPrefill) {
+                            // Preserve admission order while gathering. Restoring a
+                            // prefix shortens currentTokens; sorting by that length
+                            // would otherwise keep pinning new requests' KV pages.
+                            std::sort(orders.begin(), orders.end(), [&](const auto &a, const auto &b) {
+                                auto *left = model->responseContextDict.dicts.at(a.second);
+                                auto *right = model->responseContextDict.dicts.at(b.second);
+                                const bool lp = left->curTokens == 0, rp = right->curTokens == 0;
+                                if (lp != rp) return lp;
+                                if (lp && left->queuedAt != right->queuedAt) return left->queuedAt < right->queuedAt;
+                                return a < b;
+                            });
+                        } else sort(orders.begin(), orders.end());
 
+                        std::set<int> plannedPrefills;
+                        bool deferPrefill = false;
+                        int activeDecode = 0;
+                        if (batchPrefill) {
+                            auto oldest = PrefillBatchPolicy::Clock::time_point::max();
+                            for (auto &entry : model->responseContextDict.dicts) {
+                                if (entry.second->isEnding) continue;
+                                // A resident-prefix restore can set preTokens before
+                                // the first forward. It is still a pending prefill.
+                                if (entry.second->curTokens > 0) ++activeDecode;
+                                else oldest = std::min(oldest, entry.second->queuedAt);
+                            }
+                            currentActivate = activeDecode;
+                            const int slots = std::max(0, maxBatch - activeDecode);
+                            long long pendingTokens = 0;
+                            bool singlePrefill = false;
+                            for (auto &order : orders) {
+                                if ((int)plannedPrefills.size() >= slots) break;
+                                auto *ctx = model->responseContextDict.dicts.at(order.second);
+                                if (ctx->isEnding || ctx->curTokens != 0) continue;
+                                if (ctx->cacheLen + ctx->currentTokens.size() > (size_t)maxTotalLens ||
+                                    ctx->cacheLen + ctx->currentTokens.size() > (size_t)model->max_positions) continue;
+                                // Count only cache misses. Restore each candidate once in
+                                // this pass; the selection below reuses the same KV owners.
+                                if (model->DeferHistoryCacheRestore()) {
+                                    const auto &cache = ctx->pastKeyValues[model->kvCacheId].first;
+                                    const long long before = allocatedTokens(cache);
+                                    RestoreResidentPrefix(model, ctx);
+                                    RestoreDeferredHistory(model, ctx);
+                                    lenSum += allocatedTokens(cache) - before;
+                                }
+                                const int count = ctx->currentTokens.size();
+                                const bool single = count > prefillChunk || !ctx->multimodalInput.empty();
+                                if (!plannedPrefills.empty() && (single || pendingTokens + count > prefillBatchLimit)) break;
+                                plannedPrefills.insert(order.second);
+                                pendingTokens += count;
+                                singlePrefill = single;
+                                if (single || pendingTokens >= prefillBatchLimit) break;
+                            }
+                            deferPrefill = !singlePrefill && model->prefillBatchPolicy.ShouldWait(
+                                pendingTokens, plannedPrefills.size(), slots, oldest, PrefillBatchPolicy::Clock::now());
+                            if (deferPrefill && activeDecode == 0) {
+                                model->dictCV.wait_until(dictLocker, model->prefillBatchPolicy.Deadline(oldest));
+                                continue;
+                            }
+                        }
+
+                        // 选批过程中 currentActivate 会因为本轮选中的请求自增，
+                        // 「是否有别的请求正在输出」必须用选批之前的快照。
+                        const int activeBeforeSelection = currentActivate;
+
+                        // 上一轮做过 prompt，本轮让给 decode：跳过 prompt 那一遍，
+                        // seqLens 保持为空，于是下面 isPrompt==0 的一遍正常执行。
+                        const bool forceDecodeThisIteration = needDecodeYield && activeBeforeSelection > 0;
                         for (int isPrompt = 1; isPrompt >= 0; isPrompt--) {
                             int cnt = 0;
+                            if (isPrompt && deferPrefill) continue; // Keep decoding while collecting prompts.
+                            if (isPrompt == 1 && forceDecodeThisIteration) {
+                                continue;
+                            }
                             if (isPrompt == 0 && seqLens.size() > 0) {
                                 continue;
                             }
@@ -2868,13 +3062,34 @@ namespace fastllm {
                             for (auto &ii : orders) {
                                 auto &it = *model->responseContextDict.dicts.find(ii.second);
                                 // if (model->model_struct == "deepseek_v2" && isPrompt && seqLens.size() > 0) {
-                                if (isPrompt && seqLens.size() > 0) {
+                                if (isPrompt && seqLens.size() > 0 && !batchPrefill) {
                                     // TODO: multicuda支持多prompt一起推理
                                     continue;
                                 }
+                                // Filter phases before counting active caches, so
+                                // steady decode does not repeat a prefill scan.
+                                if (it.second->isEnding) {
+                                    continue;
+                                }
+                                const bool pendingPrefill = batchPrefill ? it.second->curTokens == 0 : it.second->preTokens == 0;
+                                if (isPrompt && !pendingPrefill) {
+                                    continue;
+                                }
+                                if (!isPrompt && pendingPrefill) {
+                                    continue;
+                                }
+
                                 if (isPrompt) {
+                                    if (batchPrefill && !plannedPrefills.count(it.first)) {
+                                        // Invalid requests still take the normal error path below.
+                                        if (it.second->cacheLen + it.second->currentTokens.size() <= (size_t)maxTotalLens &&
+                                            it.second->cacheLen + it.second->currentTokens.size() <= (size_t)model->max_positions)
+                                            continue;
+                                    }
                                     int alive = 0;
-                                    for (auto &it: model->responseContextDict.dicts) {
+                                    if (batchPrefill) {
+                                        alive = activeDecode + seqLens.size();
+                                    } else for (auto &it: model->responseContextDict.dicts) {
                                         if (it.second->isEnding) {
                                             continue;
                                         }
@@ -2885,16 +3100,6 @@ namespace fastllm {
                                     if (alive >= maxBatch) {
                                         continue;
                                     }
-                                }
-
-                                if (it.second->isEnding) {
-                                    continue;
-                                }
-                                if (isPrompt && it.second->preTokens != 0) {
-                                    continue;
-                                }
-                                if (!isPrompt && it.second->preTokens == 0) {
-                                    continue;
                                 }
 
                                 if (it.second->cacheLen + it.second->currentTokens.size() > maxTotalLens ||
@@ -2922,8 +3127,20 @@ namespace fastllm {
                                     continue;
                                 }
 
+                                if (isPrompt && !batchPrefill && model->DeferHistoryCacheRestore()) {
+                                    const auto &cache = it.second->pastKeyValues[model->kvCacheId].first;
+                                    const long long before = allocatedTokens(cache);
+                                    RestoreResidentPrefix(model, it.second);
+                                    RestoreDeferredHistory(model, it.second);
+                                    lenSum += allocatedTokens(cache) - before;
+                                }
                                 if (!isPrompt) {
-                                    if (it.second->pastKeyValues[model->kvCacheId].first.isPagedKVCache) {
+                                    if (preallocatedPagedCache) {
+                                        if (!reservePagedAppend(it.second->pastKeyValues[model->kvCacheId].first,
+                                                                it.second->currentTokens.size())) {
+                                            continue;
+                                        }
+                                    } else if (it.second->pastKeyValues[model->kvCacheId].first.isPagedKVCache) {
                                         if (it.second->pastKeyValues[model->kvCacheId].first.pageLen == it.second->pastKeyValues[model->kvCacheId].first.lastPageLen) {
                                             int sur = it.second->generationConfig.output_token_limit - it.second->curTokens;
                                             int predictLen = 256;
@@ -2936,7 +3153,7 @@ namespace fastllm {
                                             lenSum += predictLen;
                                         }
                                     } else {
-                                        if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims[1] == it.second->pastKeyValues[0].first.dims[1]) {
+                                        if (it.second->pastKeyValues[model->kvCacheId].first.expansionDims[1] == it.second->pastKeyValues[model->kvCacheId].first.dims[1]) {
                                             int sur = it.second->generationConfig.output_token_limit - it.second->curTokens;
                                             int predictLen = 256;
                                             if (sur > 0) {
@@ -2949,11 +3166,18 @@ namespace fastllm {
                                         }
                                     }
                                 } else {
-                                    if (it.second->currentTokens.size() * 2 < currentMaxLen) {
+                                    if (!batchPrefill && it.second->currentTokens.size() * 2 < currentMaxLen) {
                                         continue;
                                     }
                                     currentMaxLen = std::max(currentMaxLen, (int)it.second->currentTokens.size());
-                                    lenSum += it.second->currentTokens.size();
+                                    if (preallocatedPagedCache) {
+                                        if (!reservePagedAppend(it.second->pastKeyValues[model->kvCacheId].first,
+                                                                it.second->currentTokens.size())) {
+                                            continue;
+                                        }
+                                    } else {
+                                        lenSum += it.second->currentTokens.size();
+                                    }
                                     currentActivate++;
                                 }
 
@@ -2961,7 +3185,14 @@ namespace fastllm {
                                 model->PrepareToolCallConstraint(it.second, generationConfigs.back());
                                 logits.push_back(CreatePendingResultLogits(it.second->generationConfig));
 
-                                tokensManager.units.push_back(it.second->tokens);
+                                // Keep one slot per request, but plain greedy decoding
+                                // does not consume repetition history. Avoid copying
+                                // its multiset/queue (including vector-growth copies).
+                                const auto &sampling = generationConfigs.back();
+                                if (sampling.IsSimpleGreedy() && !sampling.output_logits)
+                                    tokensManager.units.emplace_back(sampling.last_n);
+                                else
+                                    tokensManager.units.push_back(it.second->tokens);
                                 handles.push_back(it.first);
 
                                 if (it.second->preTokens == 0) {
@@ -2971,34 +3202,49 @@ namespace fastllm {
                                 } else {
                                     it.second->intParams["index"]++;
                                 }
-                                Data inputIds, attentionMask, curPositionIds;
-                                std::vector<std::vector<float> > tokens;
-                                tokens.resize(1);
-                                for (int i: it.second->currentTokens) {
-                                    tokens[0].push_back(i);
-                                }
-                                model->FillLLMInputs(tokens, it.second->intParams, inputIds, attentionMask, curPositionIds);
-                                ToDataType(attentionMask, model->dataType);
-
-                                seqLens.push_back(inputIds.Count(0));
-                                if (isPrompt) {
-                                    prefillTokens += seqLens.back();
-                                }
-                                for (int i = 0; i < inputIds.Count(0); i++) {
-                                    ids.push_back(((float *) inputIds.cpuData)[i]);
-                                }
-                                if (attentionMask.dims.size() == 0) {
+                                if (fastDecodeInput && !isPrompt && it.second->multimodalInput.empty() &&
+                                    it.second->currentTokens.size() == 1) {
+                                    const size_t row = seqLens.size();
+                                    decodePositions[row] = (float)it.second->intParams["promptLen"] +
+                                        it.second->intParams["index"] - 1;
+                                    if (decodePositionIds.size() <= row)
+                                        decodePositionIds.emplace_back(FLOAT32, std::vector<int>{1, 1},
+                                            DataDevice::CPU, &decodePositions[row]);
+                                    ids.push_back((float)it.second->currentTokens[0]);
+                                    seqLens.push_back(1);
                                     attentionMasks.push_back(nullptr);
+                                    positionIds.push_back(&decodePositionIds[row]);
                                 } else {
-                                    attentionMasks.push_back(new Data());
-                                    attentionMask.ToDevice(DataDevice::CPU);
-                                    attentionMasks.back()->CopyFrom(attentionMask);
-                                }
-                                if (curPositionIds.dims.size() == 0) {
-                                    positionIds.push_back(nullptr);
-                                } else {
-                                    positionIds.push_back(new Data());
-                                    positionIds.back()->CopyFrom(curPositionIds);
+                                    Data inputIds, attentionMask, curPositionIds;
+                                    std::vector<std::vector<float> > tokens;
+                                    tokens.resize(1);
+                                    for (int i: it.second->currentTokens) {
+                                        tokens[0].push_back(i);
+                                    }
+                                    model->FillLLMInputs(tokens, it.second->intParams, inputIds, attentionMask, curPositionIds);
+                                    ToDataType(attentionMask, model->dataType);
+
+                                    seqLens.push_back(inputIds.Count(0));
+                                    if (isPrompt) {
+                                        prefillTokens += seqLens.back();
+                                    }
+                                    for (int i = 0; i < inputIds.Count(0); i++) {
+                                        ids.push_back(((float *) inputIds.cpuData)[i]);
+                                    }
+                                    if (attentionMask.dims.size() == 0) {
+                                        attentionMasks.push_back(nullptr);
+                                    } else {
+                                        attentionMasks.push_back(new Data());
+                                        attentionMask.ToDevice(DataDevice::CPU);
+                                        attentionMasks.back()->CopyFrom(attentionMask);
+                                    }
+                                    if (curPositionIds.dims.size() == 0) {
+                                        positionIds.push_back(nullptr);
+                                    } else {
+                                        positionIds.push_back(new Data());
+                                        ownedPositionIds.push_back(positionIds.back());
+                                        positionIds.back()->CopyFrom(curPositionIds);
+                                    }
                                 }
                                 it.second->preTokens += seqLens.back();
                                 for (int i = 0; i < model->block_cnt; i++) {
@@ -3008,7 +3254,7 @@ namespace fastllm {
                                 if (isPrompt) {
                                     cnt += it.second->currentTokens.size();
 
-                                    if (cnt > 1024) {
+                                    if (batchPrefill ? cnt >= prefillBatchLimit || seqLens[0] > prefillChunk : cnt > 1024) {
                                         break;
                                     }
                                     // break;
@@ -3019,10 +3265,19 @@ namespace fastllm {
                                 }
                             }
                         }
+                        // 闩锁在这里更新，而不是前向之后：空批会走下面那个 else 分支，
+                        // 放在前向块里会让闩锁永远卡在置位状态，反过来把 prompt 饿死。
+                        // 本轮选了 prompt 且还有别的请求在输出 -> 下一轮强制让给 decode；
+                        // 其余情况（纯 decode、空批、没有别的活跃请求）一律清位。
+                        needDecodeYield = (prefillTokens > 0 && activeBeforeSelection > 0);
+
                         if (seqLens.size() > 0) {
                             std::vector <std::pair <Data, Data> > *pastKeyValue1;
+                            bool isSingleText = false;
                             if (seqLens.size() == 1) {
-                                pastKeyValue1 = &model->responseContextDict.dicts[handles[0]]->pastKeyValues;
+                                auto context = model->responseContextDict.dicts[handles[0]];
+                                pastKeyValue1 = &context->pastKeyValues;
+                                isSingleText = context->multimodalInput.empty();
                             }
                             dictLocker.unlock();
                             forwardLocker.lock();
@@ -3041,6 +3296,9 @@ namespace fastllm {
                                 ClearProfiler();
                             }
                             auto prefillStartTime = std::chrono::steady_clock::now();
+#ifdef USE_CUDA
+                            try {
+#endif
                             if (seqLens.size() > 1) {
                                 if (!model->canDoBatchForward) {
                                     dictLocker.lock();
@@ -3063,14 +3321,22 @@ namespace fastllm {
                             } else {
                                 int first, part;
                                 first = part = model->GetChunkedPrefillSize();
-                                if (seqLens[0] > first) {
+                                int chunkedPrefillToken = -1;
+                                if (isSingleText && seqLens[0] > first &&
+                                    model->TryForwardChunkedPrefill(
+                                        inputIds, attentionMasks[0] == nullptr ? Data() : *attentionMasks[0],
+                                        positionIds[0] == nullptr ? Data() : *positionIds[0],
+                                        *pastKeyValue1, generationConfigs[0], tokensManager,
+                                        logits[0], chunkedPrefillToken)) {
+                                    ret = {chunkedPrefillToken};
+                                } else if (seqLens[0] > first) {
                                     int len = seqLens[0];
                                     for (int st = 0; st < len; ) {
                                         auto chunkStartTime = std::chrono::steady_clock::now();
                                         int curLen = std::min(st == 0 ? first : part, len - st);
                                         Data curInput, curPositionIds;
-                                        Split(inputIds, 1, st, st + curLen, curInput);
-                                        Split(*positionIds[0], 1, st, st + curLen, curPositionIds);
+                                        SplitPrefillInput(inputIds, st, curLen, curInput);
+                                        SplitPrefillInput(*positionIds[0], st, curLen, curPositionIds);
 
                                         ret = std::vector <int> {model->Forward(curInput, Data(), curPositionIds,
                                             *pastKeyValue1, generationConfigs[0], tokensManager, logits[0])};
@@ -3101,13 +3367,32 @@ namespace fastllm {
                             if (model->verbose && prefillTokens > 0) {
                                 double spend = std::chrono::duration<double>(
                                     std::chrono::steady_clock::now() - prefillStartTime).count();
-                                printf("[Prompt] %d Tokens. Time: %.3f s. Speed: %.2f tokens / s.\n",
-                                       prefillTokens, spend, spend > 0 ? prefillTokens / spend : 0);
+                                printf("[Prompt] %d Tokens. Time: %.3f s. Speed: %.2f tokens / s. Batch: %d.\n",
+                                       prefillTokens, spend, spend > 0 ? prefillTokens / spend : 0, (int)seqLens.size());
                                 fflush(stdout);
                             }
                             if (printProfile) {
                                 PrintLoopProfile("old", seqLens, (int)ret.size(), profileStartTime);
                             }
+#ifdef USE_CUDA
+                            } catch (const CudaWorkspaceExhausted &error) {
+                                forwardLocker.unlock();
+                                if (!dictLocker.owns_lock()) dictLocker.lock();
+                                fprintf(stderr, "[Fastllm] %s\n", error.what());
+                                for (int handle : handles) {
+                                    auto *context = model->responseContextDict.GetHandle(handle);
+                                    if (context) {
+                                        context->isEnding = true;
+                                        context->error = ResponseContextErrorPromptTooLong;
+                                    }
+                                }
+                                model->dictCV.notify_all();
+                                ReleasePendingResultLogits(logits);
+                                for (auto *mask : attentionMasks) delete mask;
+                                for (auto *position : positionIds) delete position;
+                                continue;
+                            }
+#endif
                             forwardLocker.unlock();
                             dictLocker.lock();
 
@@ -3161,6 +3446,7 @@ namespace fastllm {
                                     it.second->tokens.Push(curRet);
                                     it.second->curTokens++;
                                     if (it.second->curTokens == it.second->generationConfig.output_token_limit
+                                        || (maxTotalLens > 0 && it.second->allTokens.size() >= maxTotalLens)
                                         || it.second->allTokens.size() >= model->max_positions) {
                                         it.second->isEnding = true;
                                         it.second->TryRecord(model);
@@ -3170,6 +3456,20 @@ namespace fastllm {
                             model->dictCV.notify_all();
                             ReleasePendingResultLogits(logits);
                         } else {
+                            // Finished requests keep their pages until the
+                            // caller drains their output and removes them.
+                            // Wait for that release instead of terminating a
+                            // live request which could then fit in the pool.
+                            if (preallocatedPagedCache && std::any_of(
+                                    model->responseContextDict.dicts.begin(),
+                                    model->responseContextDict.dicts.end(),
+                                    [&](const auto &entry) {
+                                        return entry.second->isEnding && allocatedTokens(
+                                            entry.second->pastKeyValues[model->kvCacheId].first) > 0;
+                                    })) {
+                                model->dictCV.wait(dictLocker);
+                                continue;
+                            }
                             int maxLen = -1, select = -1;
                             for (auto &it: model->responseContextDict.dicts) {
                                 if (it.second->isEnding) {
@@ -3192,9 +3492,7 @@ namespace fastllm {
                         for (int i = 0; i < attentionMasks.size(); i++) {
                             delete attentionMasks[i];
                         }
-                        for (int i = 0; i < positionIds.size(); i++) {
-                            delete positionIds[i];
-                        }
+                        for (Data *position : ownedPositionIds) delete position;
 
                         if (seqLens.size() == 0) {
                             model->dictCV.wait(dictLocker);
@@ -3218,9 +3516,15 @@ namespace fastllm {
         context->multimodalInput = multimodalInput;
         context->tokens = LastTokensUnit(generationConfig.last_n);
 
-        bool restoredNativeHistory = this->TryRestoreHistoryCache(context->currentTokens, context->cacheLen);
+        // A restored text prefix can bypass the multimodal prefill path, while
+        // a restored media prefix may belong to different images with the same
+        // placeholder tokens. Keep request-local KV reuse, but do not restore
+        // cross-request token-only caches for multimodal prompts.
+        bool allowHistoryCache = context->multimodalInput.empty();
+        bool restoredNativeHistory = allowHistoryCache && !this->DeferHistoryCacheRestore() &&
+            this->TryRestoreHistoryCache(context->currentTokens, context->cacheLen);
 
-        auto cache = restoredNativeHistory || !this->UseGenericHistoryCache() ?
+        auto cache = !allowHistoryCache || restoredNativeHistory || !this->UseGenericHistoryCache() ?
                      std::make_pair((PastKVCacheMemory*)nullptr, 0) :
                      pastKVCacheManager.Get(inputTokens);
         if (cache.first != nullptr && cache.second > 0) {
@@ -3265,6 +3569,13 @@ namespace fastllm {
         }
     }
 
+    static void CopyResponseStatistics(const ResponseContext &context, int *statistics) {
+        int inputTokens = std::max(0, context.inputTokens);
+        statistics[0] = std::min(inputTokens, std::max(0, context.cacheLen));
+        statistics[1] = inputTokens - statistics[0];
+        statistics[2] = std::max(0, context.curTokens);
+    }
+
     bool basellm::GetResponseStatistics(int handleId, int &cachedInputTokens,
                                         int &missedInputTokens, int &outputTokens) {
         std::unique_lock<std::mutex> dictLocker(this->dictLocker);
@@ -3276,10 +3587,11 @@ namespace fastllm {
             return false;
         }
 
-        int inputTokens = std::max(0, context->inputTokens);
-        cachedInputTokens = std::min(inputTokens, std::max(0, context->cacheLen));
-        missedInputTokens = inputTokens - cachedInputTokens;
-        outputTokens = std::max(0, context->curTokens);
+        int statistics[3];
+        CopyResponseStatistics(*context, statistics);
+        cachedInputTokens = statistics[0];
+        missedInputTokens = statistics[1];
+        outputTokens = statistics[2];
         return true;
     }
 
@@ -3292,6 +3604,7 @@ namespace fastllm {
         } else {
             context->isAbort = true;
         }
+        dictCV.notify_all();
     }
 
     int basellm::FetchResponseTokens(int handleId) {
@@ -3326,6 +3639,14 @@ namespace fastllm {
 
     int basellm::FetchResponseTokensBatch(int handleId, int *output,
                                           int maxTokens) {
+        return FetchResponseTokensBatch(handleId, output, maxTokens, nullptr);
+    }
+
+    int basellm::FetchResponseTokensBatch(int handleId, int *output,
+                                          int maxTokens, int *statistics) {
+        if (statistics != nullptr) {
+            std::fill(statistics, statistics + 3, -1);
+        }
         if (output == nullptr || maxTokens <= 0) {
             return 0;
         }
@@ -3335,6 +3656,9 @@ namespace fastllm {
             return -1;
         }
         while (true) {
+            if (statistics != nullptr) {
+                CopyResponseStatistics(*context, statistics);
+            }
             if (!context->resultTokenQueue.empty()) {
                 int count = 0;
                 while (count < maxTokens &&
@@ -3572,6 +3896,7 @@ namespace fastllm {
     }
 
     int basellm::GetChunkedPrefillSize() {
+        if (kvMemConfig.enabled) return kvMemConfig.prefillTokens;
         if (this->chunkedPrefillSize >= 0) {
             return this->chunkedPrefillSize;
         }
@@ -3579,7 +3904,18 @@ namespace fastllm {
     }
 
     int basellm::GetBatchedPrefillTokenLimit() {
+        if (SupportsPrefillBatching() && prefillBatchPolicy.targetTokens > 0)
+            return std::max(GetChunkedPrefillSize(), prefillBatchPolicy.targetTokens);
         return this->GetChunkedPrefillSize();
+    }
+
+    bool basellm::SetPrefillBatching(int targetTokens, int maxWaitMs) {
+        std::lock_guard<std::mutex> lock(mainLoopLocker);
+        if (mainLoop != nullptr || targetTokens < 0 || maxWaitMs < 0 ||
+            (maxWaitMs > 0 && targetTokens == 0) ||
+            (targetTokens > 0 && !SupportsPrefillBatching())) return false;
+        prefillBatchPolicy = {targetTokens, maxWaitMs};
+        return true;
     }
 
     void basellm::SetDataType(DataType dataType) {
@@ -3612,6 +3948,7 @@ namespace fastllm {
                             this->model_struct == "deepseek_v2" ||
                             this->model_struct == "deepseek_v4" ||
                             this->model_struct == "dots3_note" ||
+                            this->model_struct == "naive_n05_flash" ||
                             this->model_struct == "qwen3_moe" ||
                             this->model_struct == "minimax_m2" ||
                             this->model_struct == "hunyuan" ||
@@ -3630,6 +3967,10 @@ namespace fastllm {
         if (!this->useCustomKVCacheDataType) {
             this->kvCacheDataType = dataType;
         }
+    }
+
+    void basellm::SetIndexerDataType(DataType dataType) {
+        AssertInFastLLM(dataType == DATA_AUTO_NONE, "--indexer_dtype is not supported by this model.");
     }
 
     void basellm::SetKVCacheDataType(DataType dataType) {
@@ -3753,6 +4094,7 @@ namespace fastllm {
     }
 
     static int GetCacheLen(const Data &cache) {
+        if (cache.kvMemConfig) return cache.dims.size() > 1 ? cache.dims[1] : 0;
         if (cache.isPagedKVCache) {
             if (cache.pageIndex.empty()) {
                 return 0;
@@ -4049,6 +4391,10 @@ namespace fastllm {
         fflush(stdout);
         Prepare();
         WarmupNumaMoeWeights();
+        if (kvMemConfig.enabled) {
+            WarmupKvMem();
+            return;
+        }
 
         int pageLen = fastllm::GetPageLen();
         int len = this->GetChunkedPrefillSize();

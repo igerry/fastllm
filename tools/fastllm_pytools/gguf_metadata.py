@@ -151,11 +151,14 @@ _ARCHITECTURE_CONFIGS = {
     "qwen3_5": ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
     "qwen35moe": ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
     "qwen3_5_moe": ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
+    "qwen4exp": ("qwen4_exp", "Qwen4ExpForCausalLM"),
     "deepseek2": ("deepseek_v2", "DeepseekV2ForCausalLM"),
     "deepseek_v2": ("deepseek_v2", "DeepseekV2ForCausalLM"),
     "deepseek_v3": ("deepseek_v3", "DeepseekV3ForCausalLM"),
     "glm-dsa": ("glm_moe_dsa", "GlmMoeDsaForCausalLM"),
     "glm_moe_dsa": ("glm_moe_dsa", "GlmMoeDsaForCausalLM"),
+    "glm5next": ("glm5_next", "Glm5NextForConditionalGeneration"),
+    "glm5-next": ("glm5_next", "Glm5NextForConditionalGeneration"),
     "minimax_m2": ("minimax_m2", "MiniMaxM2ForCausalLM"),
 }
 
@@ -201,6 +204,12 @@ def get_gguf_model_config(path):
 
 
 _GPT2_PRETOKENIZER_PATTERNS = {
+    "glm4": (
+        r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|"
+        r"[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}|"
+        r" ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|"
+        r"\s+(?!\S)|\s+"
+    ),
     "qwen35": (
         r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|"
         r"[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}|"

@@ -40,6 +40,9 @@ namespace fastllm {
     void Float32ToBFloat16(float *float32, uint16_t *bfloat16, int len);
     void BFloat16ToFloat32(uint16_t *bfloat16, float *float32, int len);
     extern bool Float32ToBFloat16_AVX512BF16_RNE(float *float32, uint16_t *bfloat16, int len);
+    extern bool FastllmGemmBFloat16IQ4XS_AVX512BF16(
+        const void *A, long lda, const void *B, long ldb, void *C, long ldc,
+        int n, int m, int k, int st, int end);
     extern bool FastllmGemmBFloat16NVFP4Block16_AVX512BF16(
         const void *A, long lda, const void *B, long ldb, void *C, long ldc,
         int n, int m, int k, int st, int end, bool planar);
@@ -231,8 +234,9 @@ namespace fastllm {
         }
 
         auto *pool = GetAlivePool();
-        int workerCount = std::min(
-            (int)pool->threads.size(), (int)tasks.size());
+        const int first = pool->curActivateThreadInterval.first;
+        const int available = pool->curActivateThreadInterval.second - first;
+        int workerCount = std::min(available, (int)tasks.size());
         std::atomic<int> next(workerCount);
         std::vector<MultiThreadDeepSeekV4MoeTaskQueueOp> workers;
         workers.reserve(workerCount);
@@ -240,10 +244,10 @@ namespace fastllm {
             workers.emplace_back(&tasks, &next, i);
         }
         for (int i = 0; i < workerCount; i++) {
-            pool->PushOp(i, &workers[i]);
+            pool->PushOp(first + i, &workers[i]);
         }
         for (int i = 0; i < workerCount; i++) {
-            pool->Wait(i);
+            pool->Wait(first + i);
         }
         if (deleteTasks) {
             for (auto *task : tasks) {
@@ -1993,6 +1997,31 @@ namespace fastllm {
         int st, int end, // calc C[0 : n, st : end]
         DataType AType, DataType BType, DataType CType
     ) {
+        if (AType == DataType::FP8_E4M3_BLOCK_128 && BType == AType && CType == DataType::FLOAT32) {
+            if (cpuInstructInfo.hasAVX512BF16 && FastllmGemmFP8Block128_AVX512BF16(
+                    A, lda, B, ldb, C, ldc, n, m, st, end)) return;
+            if (cpuInstructInfo.hasAVX2 && FastllmGemmFP8Block128_AVX2(
+                    A, lda, B, ldb, C, ldc, n, m, st, end)) return;
+            for (int row = 0; row < n; row++) {
+                float *out = (float *)((uint8_t *)C + (size_t)row * ldc);
+                for (int col = st; col < end; col++) {
+                    float sum = 0;
+                    for (int start = 0; start < m; start += 128) {
+                        const uint8_t *a = (const uint8_t *)A + (size_t)row * lda + (start / 128) * 132;
+                        const uint8_t *b = (const uint8_t *)B + (size_t)col * ldb + (start / 128) * 132;
+                        int count = std::min(128, m - start);
+                        float dot = 0, as, bs;
+                        for (int c = 0; c < count; c++)
+                            dot += fp8e4m3tofp32.dict[a[c]] * fp8e4m3tofp32.dict[b[c]];
+                        memcpy(&as, a + count, sizeof(as));
+                        memcpy(&bs, b + count, sizeof(bs));
+                        sum += (dot * as) * bs;
+                    }
+                    out[col] = sum;
+                }
+            }
+            return;
+        }
         bool finish = false;
 // printf("into fastllm gemm %s %s %s\n", GetDataTypeName(AType).c_str(), GetDataTypeName(BType).c_str(), GetDataTypeName(CType).c_str());
         if (AType >= DataType::DATA_GGUF_FORMAT && AType < DataType::DATA_GGUF_FORMAT_END) {
@@ -2400,9 +2429,13 @@ namespace fastllm {
                         LinearBFloat16_AWQ4BIT128_Kernel((uint16_t*)A, (uint8_t*)B, nullptr, (float*)C, n, m, ldc / sizeof(float), st, end);
                     } */ 
                 } else if (BType >= DataType::DATA_GGUF_FORMAT && BType < DataType::DATA_GGUF_FORMAT_END) {
+                    const ggml_type weightType = (ggml_type)((int)BType - (int)DataType::DATA_GGUF_FORMAT);
+                    if (weightType == GGML_TYPE_IQ4_XS && cpuInstructInfo.hasAVX512BF16 &&
+                        FastllmGemmBFloat16IQ4XS_AVX512BF16(A, lda, B, ldb, C, ldc, n, m, k, st, end)) {
+                        return;
+                    }
                     std::vector <float> fp32B_temp((end - st) * m);
                     std::vector <uint16_t> bf16B_temp((end - st) * m);
-                    ggml_type weightType = (ggml_type)((int)BType - (int)DataType::DATA_GGUF_FORMAT);
 
                     auto toFloat = ggml_type_to_float(weightType);
                     AssertInFastLLM(toFloat != nullptr, "WeightImportGGUFTensor: weight (type " + std::string(ggml_type_name(weightType)) + ") can't convert to fp32.");
@@ -2581,26 +2614,28 @@ namespace fastllm {
             int swigluColSt = globalSt / 2;   // swiglu 输出的列起始位置
             const long ldc = GetDataBytes(gateUpOutputDataType, 1, k);
 
-            // Group-32 activation quantization needs a complete group to
-            // calculate its scale and sum. NUMA MergeMOE aligns these tasks
+            // Group-32 and GGUF Q8_0 quantization need a complete group to
+            // calculate quantization parameters. NUMA MergeMOE aligns tasks
             // to 64 gate/up columns, so compute each 32-value SwiGLU group in
             // a small L1-resident buffer and quantize it immediately. This
             // avoids both the large float intermediate write and a second
             // thread-pool pass over all routed experts.
+            constexpr DataType q8_0 = static_cast<DataType>(
+                DataType::DATA_GGUF_FORMAT + GGML_TYPE_Q8_0);
             if (dstOutputData != nullptr &&
-                    dstOutputDataType == DataType::INF_INT8_GROUP32) {
+                    (dstOutputDataType == DataType::INF_INT8_GROUP32 ||
+                     dstOutputDataType == q8_0)) {
                 constexpr int groupSize = 32;
                 AssertInFastLLM(
                     globalSt % (groupSize * 2) == 0 &&
                         localCols % (groupSize * 2) == 0 &&
-                        swigluColSt % groupSize == 0 &&
-                        swigluCols % groupSize == 0,
-                    "MultiThreadGemmAndCrossSwigluOp: INF_INT8_GROUP32 "
+                        interDim % groupSize == 0,
+                    "MultiThreadGemmAndCrossSwigluOp: group32/Q8_0 "
                     "destination requires group-aligned columns.\n");
                 const size_t dstRowBytes = GetDataBytes(
                     dstOutputDataType, 1, interDim);
                 const size_t dstGroupBytes = GetDataBytes(
-                    DataType::INF_INT8_PERCHANNEL, 1, groupSize);
+                    dstOutputDataType, 1, groupSize);
                 for (int row = 0; row < n; row++) {
                     const float *gateUpRow = (const float*)(
                         gateUpOutputData + ldc * row);
@@ -2613,7 +2648,7 @@ namespace fastllm {
                         CrossSwigluFloat32Chunk(
                             cur + group * 2, groupSize, values);
                         ConvertFromFloat32(
-                            dst, DataType::INF_INT8_GROUP32,
+                            dst, dstOutputDataType,
                             values, 1, groupSize);
                         dst += dstGroupBytes;
                     }
@@ -4683,9 +4718,9 @@ namespace fastllm {
                     fLastOutput = tempOutput.data();
                 }
                 if (useDeepSeekV4MoeFast) {
+                    const int first = pool->curActivateThreadInterval.first;
                     int reduceThreads = std::min(
-                        {(int)pool->threads.size(),
-                         16, m});
+                        {pool->curActivateThreadInterval.second - first, 16, m});
                     std::vector<MultiThreadDeepSeekV4MoeReduceOp> reduceOps;
                     reduceOps.reserve(reduceThreads);
                     int per = m / reduceThreads;
@@ -4702,10 +4737,10 @@ namespace fastllm {
                         cur = end;
                     }
                     for (int i = 0; i < reduceThreads; i++) {
-                        pool->PushOp(i, &reduceOps[i]);
+                        pool->PushOp(first + i, &reduceOps[i]);
                     }
                     for (int i = 0; i < reduceThreads; i++) {
-                        pool->Wait(i);
+                        pool->Wait(first + i);
                     }
                 } else for (int j = 0; j < v.size(); j++) {
                     float value = deepSeekV4Mode ? 1.0f : v[j].second;
@@ -5573,7 +5608,12 @@ ops += (long long)lines * inputDim * interDim * 2;
         AssertInFastLLM(weight.dims.size() == 2, "Embedding's weight's dim should be 2.\n");
         AssertInFastLLM(weight.dataType == DataType::FLOAT32 ||
                         weight.dataType == DataType::FLOAT16 ||
-                        weight.dataType == DataType::BFLOAT16, "Embedding's weight's type should be float32 or float16 or bfloat16.\n");
+                        weight.dataType == DataType::BFLOAT16 ||
+                        (weight.dataType == DataType::DATA_GGUF_FORMAT &&
+                         !weight.IsRepacked && weight.ggmlType >= 0 &&
+                         weight.ggmlType < GGML_TYPE_COUNT &&
+                         ggml_type_to_float((ggml_type)weight.ggmlType) != nullptr),
+                        "Embedding requires floating-point or unpacked GGUF weights.\n");
         AssertInFastLLM(input.dataType == DataType::FLOAT32 ||
                         input.dataType == DataType::FLOAT16, 
                         "Embedding's input's type should be float32 or float16.\n");
@@ -5682,7 +5722,25 @@ ops += (long long)lines * inputDim * interDim * 2;
             return token;
         };
 
-        if (GetLowMemMode() && !weight.fileName.empty()) {
+        if (weight.dataType == DataType::DATA_GGUF_FORMAT) {
+            const auto type = (ggml_type)weight.ggmlType;
+            AssertInFastLLM(weight.cpuData != nullptr &&
+                            embSize % ggml_blck_size(type) == 0,
+                            "Embedding requires resident, block-aligned GGUF rows.\n");
+            const size_t rowBytes = ggml_row_size(type, embSize);
+            const auto toFloat = ggml_type_to_float(type);
+            // Keep the same FP32 values as full-table import, with only one
+            // row of scratch when the output requires a subsequent cast.
+            std::vector<float> row(output.dataType == DataType::FLOAT32 ? 0 : embSize);
+            for (int i = 0; i < inputLen; ++i) {
+                const int token = getToken(i);
+                float *destination = output.dataType == DataType::FLOAT32
+                    ? reinterpret_cast<float *>(output.cpuData) + (uint64_t)i * embSize
+                    : row.data();
+                toFloat(weight.cpuData + (uint64_t)token * rowBytes, destination, embSize);
+                if (output.dataType != DataType::FLOAT32) writeFloatOutputRow(i, destination);
+            }
+        } else if (GetLowMemMode() && !weight.fileName.empty()) {
             FILE *fi = fopen(weight.fileName.c_str(), "rb");
             if (fi == nullptr) {
                 ErrorInFastLLM("Embedding error: failed to open low-memory weight file " + weight.fileName + ".\n");
@@ -12471,17 +12529,7 @@ ops += (long long)lines * inputDim * interDim * 2;
         }
 
         std::vector<int> previewNewPages;
-        previewNewPages.reserve(newPageCount);
-        if (newPageCount > 0) {
-            std::lock_guard<std::mutex> guard(manager.pageIndexLocker);
-            for (int i = 0; i < newPageCount && i < (int)manager.freePages.size(); i++) {
-                previewNewPages.push_back(manager.freePages[(int)manager.freePages.size() - 1 - i]);
-            }
-            int trieOffset = newPageCount - (int)previewNewPages.size();
-            for (int i = 0; i < trieOffset && i < (int)manager.triePages.size(); i++) {
-                previewNewPages.push_back(manager.triePages[(int)manager.triePages.size() - 1 - i]);
-            }
-        }
+        manager.PreviewUnusedPageIndices(newPageCount, previewNewPages);
         AssertInFastLLM((int)previewNewPages.size() >= newPageCount,
                         "CpuGenerateAppendPagedCacheBatchParamsOp: no enough pages for batch append.\n");
 

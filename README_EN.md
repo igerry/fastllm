@@ -1,6 +1,6 @@
 # FastLLM
 
-[中文](README.md) · [Quick start](#quick-start) · [Model deployment guides](#model-deployment-guides) · [Benchmarks](docs/benchmark_en.md) · [Common options](#common-options) · [Changelog](docs/version_en.md)
+[中文](README.md) · [Quick start](#quick-start) · [Model deployment guides](#model-deployment-guides) · [Flash-Next user guide](docs/qwen3.8-flash-next/README_EN.md) · [Benchmarks](docs/benchmark_en.md) · [Common options](#common-options) · [Changelog](docs/version_en.md)
 
 FastLLM is a high-performance inference engine for running and serving large language models. Its core runtime is implemented in C++ and does not depend on PyTorch. It supports dense and MoE models across CUDA, ROCm, CPU, NUMA, disk-assisted hybrid inference, and multi-GPU tensor parallelism.
 
@@ -157,7 +157,7 @@ Attention architecture, MoE placement, speculative decoding, and quantization di
 
 | Model | Deployment guide | Recommended configuration topics | Benchmark |
 | --- | --- | --- | --- |
-| Qwen4-Exp / Qwen3.8-Flash-Next | [Qwen4-Exp guide](docs/qwen4_exp.md) | PLE, QSA, CUDA/NUMA, and `--ngram_device disk` | [Qwen4 benchmark](docs/benchmarks/qwen4_exp_en.md) |
+| Qwen4-Exp / Qwen3.8-Flash-Next | [Flash-Next user guide](docs/qwen3.8-flash-next/README_EN.md) | Dual-GPU serial / TP2, expert cache, resident GPU expert layers, MTP | [Measured performance](docs/qwen3.8-flash-next/README_EN.md#performance) |
 | Qwen3.5 / Qwen3.6 / Qwen3.8 | [Current Qwen guide](docs/qwen3_en.md) | Single GPU, TP, hybrid MoE, MTP, and DFlash2 | [Qwen3 benchmarks](docs/benchmarks/qwen3_en.md) |
 | DeepSeek-V4 / V4-Flash | [DeepSeek-V4 guide](docs/deepseek_en.md) | CUDA + NUMA, disk experts, TP, and embedded DSpark | [DeepSeek-V4 benchmark](docs/benchmarks/deepseek_v4_en.md) |
 | Kimi-K3 | [Kimi-K3 guide](docs/kimi_k3_en.md) | KDA/MLA, hybrid and disk experts, external DSpark | [Kimi-K3 benchmark](docs/benchmarks/kimi_k3_en.md) |
@@ -214,7 +214,7 @@ ftllm server /data/models/Qwen3.8-27B-FP8 \
 
 `--tokens` sets the KV pool capacity shared by all sessions; omitting it enables automatic budgeting. Startup fails if an explicit target exceeds the configured RoPE range or the KV capacity calibrated during warmup. `/v1/models` reports the effective window, original model limit, and requested target. The 1M example requires sufficient GPU memory: the tested configuration with two 24GB GPUs cannot fit it, and a full 1M input has not been validated.
 
-Extension currently supports HF Qwen2, Qwen3, and Qwen3.5 layouts, including Qwen3.8 checkpoints based on Qwen3.5. Launcher's advanced "RoPE extension" field accepts the same configuration. GGUF, FLM, and custom GraphLLM loaders retain their existing shrink-only length behavior and do not support the new RoPE extension options. See the [context extension guide](docs/context-length-extension-design.md) for parameters, supported layouts, and validation results.
+Extension supports Qwen2, Qwen3, and Qwen3.5 layouts, including Qwen3.8 checkpoints based on Qwen3.5. Launcher's advanced "RoPE extension" field accepts the same configuration. HF directories and GGUF files accept explicit `--rope_scaling` options, subject to model layout support. Setting only a length in the CLI retains shrink-only behavior for GGUF, FLM, and custom GraphLLM; FLM and custom GraphLLM do not support RoPE extension. See the [context extension guide](docs/context-length-extension.md) for parameters, supported layouts, and validation results.
 
 ### Speculative decoding
 
@@ -242,7 +242,7 @@ ftllm server /data/models/qwen3.8 \
 
 `--draft` detects MTP, DFlash2, or DSpark from the draft checkpoint. Standalone MTP currently targets Qwen3.5 GGUF and may be either a directory containing `config.json` plus `mtp.safetensors`, or the `mtp.safetensors` file itself; it defaults to five draft tokens. For DFlash2, `--draft_tokens` counts actual draft tokens and excludes the anchor token.
 
-See the [Qwen3.8 DFlash2 report](docs/dflash2_qwen38_27b_tp2_20260819.md) for the complete configuration and validation results.
+See the [Qwen3.8 DFlash2 report](docs/benchmarks/qwen38_27b_dflash2.md) for the complete configuration and validation results.
 
 ### Disk-backed Qwen4 PLE
 
@@ -254,7 +254,7 @@ ftllm server /data/models/qwen4-exp \
   --ngram_device disk
 ~~~
 
-Disk mode reduces resident memory at the cost of random I/O; a fast SSD is recommended. See the [Qwen4-Exp guide](docs/qwen4_exp.md) for details.
+Disk mode reduces resident memory at the cost of random I/O; a fast SSD is recommended. See the [Flash-Next user guide](docs/qwen3.8-flash-next/README_EN.md) for details.
 
 ## Common options
 
@@ -310,6 +310,30 @@ The CLI evolves continuously, so `ftllm <command> --help` is authoritative for t
 | `--cache_dir` | Local cache directory for online models |
 | `--ori` | Original model configuration and tokenizer directory for selected GGUF models |
 | `--mmproj` | Matching vision-module GGUF for Qwen3.5-family GGUF models; see [GGUF multimodal deployment](docs/qwen3_en.md#gguf-multimodal) for configuration requirements and an example |
+
+Qwen4 CUDA inference keeps MTP draft experts on the GPU: on the single device, on the final CUDA stage for PP, or as resident shards on each TP rank. Draft experts require additional VRAM outside the target expert-cache budget set by `--moe_cuda_cache`. CPU inference retains the configured MoE placement.
+
+Qwen3.5 MTP and DFlash drafts support the following settings. Compatible paths use NVFP4 by default once the corresponding draft algorithm is enabled. Environment variables can override these defaults before startup:
+
+| Environment variable | Default | Description |
+| --- | --- | --- |
+| `FASTLLM_DRAFT_QUANT` | `nvfp4` | `off` disables NVFP4 conversion; `nvfp4_head` converts only the separate draft output head; `nvfp4` converts the draft backbone and head. The target head retains its original weights; unsupported devices, types or shapes keep their original path |
+| `FASTLLM_CUDA_NVFP4_SWIGLU_MULTIROW` | `1` | Allows multirow NVFP4 Linear + SwiGLU fusion; `0` disables it. The current multirow kernel supports SM75, FP16 input and M=2–8, subject to shape, layout and scratch checks; other cases fall back |
+| `FASTLLM_TP_NVFP4_MLP_SWIGLU` | `1` | Tries NVFP4 Linear + SwiGLU fusion in TP MLPs; `0` disables it. Kernel capability checks select the implementation, with the original Linear + SwiGLU as fallback |
+| `FASTLLM_TP_NATIVE_GREEDY` | `1` | Enables native-type logits in Qwen3.5 TP greedy sampling, avoiding FP16→FP32 conversion during eager speculative verification; `0` disables it. Sampling, returned logits, graphs and GPU token handoff retain FP32 |
+| `FASTLLM_DFLASH_BATCH_PREFIX_SNAPSHOTS` | `1` | DFlash2 CUDA verification restores each accepted prefix without target replay. Deployments with max_batch≤4 retain per-position state snapshots; larger deployments retain compact activations and recover conv/GDN state in a batch, including when the active batch shrinks. There is no 16-request limit. Recovery buffers and draft-window KV are budgeted automatically, reducing target KV capacity. `0` restores the full-prefix replay fallback; the single-request path is unchanged. No SM restriction; state kernels validated through batch 32 on SM75 |
+| `FASTLLM_MTP_BATCH_SAMPLING` | `1` | Batch Qwen3.5 CUDA MTP draft and target rejection sampling across independent per-request proposal caches, with combined result readback. Mixed greedy/sampling batches and incompatible verification lengths retain the existing path. `0` restores per-request sampling. Preserves the sampling distribution, not identical random token sequences |
+| `FASTLLM_MTP_FP8_MARLIN` | `1` | Prepare eligible Qwen3.5 TP MTP FP8 draft shards in the existing Marlin layout during initialization so multirow draft calls do not miss lazy conversion. Retains the weight quantization format and existing architecture/backend preferences. `0` restores lazy preparation. Validated on SM75/TP2 |
+| `FASTLLM_CUDA_GDN_SEQUENCE_PREPARE` | `1` | Precompute normalized Q/K and gate coefficients for eager batched short-sequence GDN with 128-wide K/V and batch≥4, avoiding repeated work across state tiles. Preserves per-token FP16 state rounding and prefix snapshots. Small batches, other V dimensions and graph scopes retain the existing path. `0` disables; validated on SM75/TP2 |
+| `FASTLLM_MTP_DRAFT_TOKEN_IDS` | Unset | Optional single- or multi-GPU MTP draft vocabulary token-ID file, used only when NVFP4 conversion is enabled. Unset or `0` keeps the full vocabulary. Multi-GPU runs select rows within each original vocabulary shard and map results back to global token IDs; alignment padding repeats existing candidates. The shortlist is used only for greedy drafts; sampling uses the full output head and target verification retains the full vocabulary |
+| `FASTLLM_DFLASH_DRAFT_TOKEN_IDS` | Unset | Optional whitespace-separated token ID file for greedy DFlash2. Supports original-encoding GGUF or NVFP4 draft heads on one GPU, and NVFP4 on multiple GPUs; each contiguous vocabulary shard needs at least selector top-k candidates. Padding is removed before top-k and selected IDs are mapped back to original tokens. The full target head is retained, so the shortlist adds draft-head memory; limited coverage can reduce acceptance. Validate task throughput and output consistency before enabling. Sampling uses the full vocabulary; invalid or unsupported lists fall back to the full vocabulary. Disabled when `FASTLLM_DRAFT_QUANT=off` |
+| `FASTLLM_DFLASH_ATTENTION` | Unset: on for SM75, off otherwise | Unified switch for fused FP16 DFlash sliding-window attention: `0` disables it; `1` enables it on supported devices. Requires head_dim=128, 1–16 queries, queries × GQA group size ≤64, queries ≤ window ≤4096, and available FlashInfer support; unsupported cases retain the original path. Correctness and speed of the Q64 path on SM80 and newer have not been validated on those GPUs. SM70 and older always retain their original path |
+
+DFlash2 dynamic convolution, QKV preparation and Gateup preparation select fused implementations automatically when the device, types and shapes are supported, otherwise falling back to regular operators. TP selector projection is always queued early on rank 0's head worker stream. The former switches `FASTLLM_CUDA_DFLASH_FUSED_CONV`, `FASTLLM_CUDA_DFLASH_FUSED_QKV_PREPARE`, `FASTLLM_CUDA_DFLASH_FUSED_GATEUP_PREPARE` and `FASTLLM_DFLASH_TP_EARLY_SELECTOR` have been removed; setting them no longer changes execution.
+
+Unset variables use the defaults listed above; kernel capability checks still apply. Draft NVFP4 supports single- and multi-GPU runs, converting eligible shards after splitting. MTP requires a dense model and FP16 compute; DFlash adapts quantized Linear inputs to FP16 and restores the original activation type. Quantization can change draft acceptance, and separate head and view copies change memory use, so it does not guarantee a speedup for every model. Target weights and full-vocabulary verification stay unchanged. Set `FASTLLM_DRAFT_QUANT=off` to keep the original draft precision; the existing multi-GPU FP8 draft-head switch remains effective.
+
+NVFP4 small-matrix decode tuning is enabled by default on SM75 devices with 68 SMs, such as the RTX 2080 Ti. It covers M=1–8 for fused SwiGLU with N×K=17408×5120 and Linear with N×K=5120×8704 or 5120×3072, subject to the runtime block-residency check. Other architectures, shapes, and prefill with an original M>8 retain their existing paths. Set `FASTLLM_CUDA_NVFP4_SM75_DECODE_TUNE=0` to disable tuning, `1` to explicitly enable both parts, or `linear` / `swiglu` to select one part. The multirow SwiGLU fusion entry remains controlled separately by `FASTLLM_CUDA_NVFP4_SWIGLU_MULTIROW`.
 
 ### API server
 
@@ -410,7 +434,7 @@ Additional platform documentation:
 | Topic | Documents |
 | --- | --- |
 | Releases | [Stable changelog](docs/version_en.md) · [Nightly usage](docs/nightly.md) · [Nightly changelog](docs/nightly_changelog.md) |
-| Model deployment | [Qwen4-Exp](docs/qwen4_exp.md) · [Qwen3.5/3.6/3.8](docs/qwen3_en.md) · [DeepSeek-V4](docs/deepseek_en.md) · [Kimi-K3](docs/kimi_k3_en.md) · [Dots3-Note](docs/dots3_note_en.md) · [GLM-5](docs/glm5_en.md) · [Laguna](docs/laguna_en.md) |
+| Model deployment | [Qwen3.8-Flash-Next](docs/qwen3.8-flash-next/README_EN.md) · [Qwen3.5/3.6/3.8](docs/qwen3_en.md) · [DeepSeek-V4](docs/deepseek_en.md) · [Kimi-K3](docs/kimi_k3_en.md) · [Dots3-Note](docs/dots3_note_en.md) · [GLM-5](docs/glm5_en.md) · [Laguna](docs/laguna_en.md) |
 | Hybrid inference | [GPU, NUMA, and disk deployment](docs/mixforward.md) |
 | Performance and validation | [Benchmarks by model](docs/benchmark_en.md) |
 | Quantization | [Dynamic quantization configuration](docs/dtype_config.md) |
@@ -442,6 +466,7 @@ FastLLM uses or draws implementation ideas from the following projects and artic
 - [PyTorch](https://github.com/pytorch/pytorch) for low-level operator implementation ideas.
 - [Transformers](https://github.com/huggingface/transformers) for model architectures and reference implementations.
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) and [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) for GGUF quantization formats and kernels.
+- [KVMem / kvmem-llama.cpp](https://github.com/kvmem/kvmem-llama.cpp) for design ideas behind tiered KV caching and content-based retrieval, including a bounded GPU working set, host-backed KV storage, and pre-RoPE mean-K retrieval. See the [KVMem documentation](docs/kvmem.md) for the FastLLM integration.
 - [FlashInfer](https://github.com/flashinfer-ai/flashinfer) for attention, MLA, and related operators.
 - [TurboMind / LMDeploy GEMM kernels](https://github.com/InternLM/lmdeploy/tree/main/src/turbomind/kernels/gemm): the SM70 s884 (`SM70_MMA_884` / HMMA 8x8x4) core bundled under `third_party/turbomind` is ported from this source and is used for AWQ INT4, block-scaled FP8, and NVFP4 Linear paths.
 - [1Cat-vLLM's SM70 TurboMind integration](https://github.com/1CatAI/1Cat-vLLM/tree/main/csrc/sm70_turbomind) for the AWQ integration and the FP8/NVFP4 type, layout, and small-batch tactic references. FastLLM separately implements its Torch-free raw-pointer bridge, model-weight format conversion, unaligned padding, fallbacks, and dispatch.

@@ -49,7 +49,6 @@ namespace fastllm {
         bool cudaTriton = false;
         bool useFusedTransferAttn = true;
         bool useFusedGdnPrefill = true;
-        std::string debugTokenId;
     };
 
     const FastllmEnv &GetFastllmEnv();
@@ -491,6 +490,8 @@ namespace fastllm {
     };
 
     class PagedCacheManager;
+    struct KvMemConfig;
+    class KvMemCache;
 
     class Data {
     public:
@@ -498,12 +499,18 @@ namespace fastllm {
 
         long long cacheUid = 0; // 用来标注Cache id
         bool isKVCache = false; // 是否是KV Cache TODO: 做一些KVCache的管理
+        // Naive DSA: the key row ends in 128 E4M3 values + FP32 scale,
+        // padded to 144 bytes so the main attention row remains aligned.
+        bool kvCacheFp8Indexer = false;
         bool isLinearAttention = false; // 是否是线性attention的缓存（永远保持同样的形状）
         bool isLinearAttentionTransposed = false; // 线性attention recurrent state是否物理存成[V,K]
 
         // Paged KV Cache的相关信息
         // 当isKVCache = true且isPagedKVCache = true时，下面这些信息才有意义
         bool isPagedKVCache = false; // 是否是分片的KV Cache
+        // Optional request-owned sparse KV storage; pageIndex is a borrowed view.
+        std::shared_ptr<const KvMemConfig> kvMemConfig;
+        std::shared_ptr<KvMemCache> kvMemCache;
         int pageLen = 128; // 每个page的长度（token数）
         PagedCacheManager *pagedKVCacheData = nullptr; // 存储kv cached的数据，shape为 [maxPages, pageLen, numHeads, headDim]
         std::vector <int> pageIndex; // 目前使用的Index编号
@@ -705,6 +712,9 @@ namespace fastllm {
     struct CacheTrieNode {
         int pageId = -1;
         long long timestamp = 0;
+        long long lastAccess = 0;
+        int unusedIndex = -1;
+        bool evictable = false;
         std::unordered_map<uint64_t, CacheTrieNode*> children;
         CacheTrieNode *parent = nullptr;
         uint64_t edgeHash = 0;
@@ -757,6 +767,18 @@ namespace fastllm {
             static uint64_t HashTokenPage(const int *tokens, int len);
             void Record(const std::vector<int> &tokens, const std::vector<int> &pages);
             void Query(const std::vector<int> &tokens, std::vector<int> &cachedPageIds);
+
+            // Materialize free pages in the same order used by allocation.
+            // This may evict unreferenced cache entries, but never reserves pages.
+            void PreviewUnusedPageIndices(int count, std::vector<int> &pages);
+            bool IsCachedPage(int pageIndex, long long generation);
+
+        private:
+            std::set<std::pair<long long, int>> evictableLeaves;
+            void UpdateEvictableLeaf(CacheTrieNode *node);
+            void RemoveTriePage(int pageIndex);
+            void ReleasePageIndexLocked(int pageIndex);
+            void PrepareFreePages(int count);
     };
 
     struct PartitionLinkNode {

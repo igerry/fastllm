@@ -164,6 +164,10 @@ class FastLLmCompletion:
           temperature = 1.0
           top_k = 1
           top_p = 1.0
+      elif top_k is not None and top_k <= 0:
+          # API top_k <= 0 disables truncation. Native backends expect a
+          # positive candidate count and otherwise take their greedy path.
+          top_k = self.model.get_vocab_size()
       return do_sample, top_p, top_k, temperature
 
   def _normalize_stop_strings(
@@ -243,7 +247,9 @@ class FastLLmCompletion:
       max_length: Optional[int],
       stopped_by_stop_string: bool = False,
   ) -> str:
-      if (not stopped_by_stop_string and max_length is not None
+      # Negative legacy budgets select native unlimited output. They must not
+      # turn a natural EOS into a truncation signal for agent clients.
+      if (not stopped_by_stop_string and max_length is not None and max_length > 0
               and completion_tokens >= max_length):
           return "length"
       return "stop"
@@ -364,6 +370,12 @@ class FastLLmCompletion:
   def _is_qwen_reasoning_model(self) -> bool:
       return self._is_qwen3_5_model() or self._is_qwen4_exp_model()
 
+  def _is_naive_n05_model(self) -> bool:
+      try:
+          return self.model.get_type() == "naive_n05_flash"
+      except Exception:
+          return False
+
   def _is_qwen3_5_reasoning_response(self, enable_thinking: bool) -> bool:
       return (enable_thinking and self._is_qwen_reasoning_model()
               and not getattr(self.model, "force_chat_template", False))
@@ -395,6 +407,8 @@ class FastLLmCompletion:
               or self._is_kimi_k3_reasoning_response(enable_thinking)
               or self._is_glm5_next_reasoning_response()
               or self._is_qwen3_5_reasoning_response(enable_thinking)
+              or (enable_thinking and self._is_naive_n05_model()
+                  and not getattr(self.model, "force_chat_template", False))
               or self._is_dots3_note_reasoning_response(enable_thinking))
 
   def _resolve_kimi_k3_reasoning_effort(
@@ -466,11 +480,12 @@ class FastLLmCompletion:
       if effort is None:
           effort = template_kwargs.get(
               "reasoning_effort", template_kwargs.get("thinking_effort"))
-      if effort in {None, "none"}:
+      # Generic clients may send high/max/minimal or a numeric budget. Keep
+      # Qwen's native default instead of rejecting an otherwise valid request.
+      # "none" controls enable_thinking separately; the template still needs
+      # a supported effort even when thinking is disabled.
+      if effort not in ("low", "medium", "xhigh"):
           effort = "xhigh"
-      if effort not in {"low", "medium", "xhigh"}:
-          raise ValueError(
-              "Qwen reasoning_effort must be one of: none, low, medium, xhigh")
       return effort
 
   def _resolve_glm5_next_reasoning_effort(
@@ -826,6 +841,45 @@ class FastLLmCompletion:
           if text.endswith(tag[:length]):
               return length
       return 0
+
+  def _new_reasoning_state(self, emit_reasoning_content, preserve_xtml=False):
+      reasoning_format = "kimi_k3" if self._is_kimi_k3_model() else "think"
+      return {
+          "active": emit_reasoning_content,
+          "buffer": "",
+          "started": False,
+          "format": reasoning_format,
+          "phase": "reasoning" if emit_reasoning_content else "content",
+          "reasoning_started": False,
+          "preserve_xtml": preserve_xtml,
+          "content_buffer": "",
+          "content_started": False,
+          "content_done": False,
+      }
+
+  def _split_reasoning_response(self, result, emit_reasoning_content,
+                               preserve_xtml=False):
+      if self._is_kimi_k3_model():
+          if emit_reasoning_content:
+              result, reasoning_content = self._split_kimi_k3_reasoning(
+                  result,
+                  emit_reasoning_content,
+                  preserve_xtml=preserve_xtml)
+          else:
+              reasoning_content = None
+              if not preserve_xtml:
+                  result = self._strip_kimi_k3_response_wrapper(result)
+      elif (self._is_qwen_reasoning_model()
+            or self._is_dots3_note_model() or self._is_naive_n05_model()):
+          result, reasoning_content = self._split_qwen3_5_reasoning(
+              result, emit_reasoning_content)
+      elif self._is_glm5_next_model():
+          result, reasoning_content = self._split_glm5_next_reasoning(
+              result, emit_reasoning_content)
+      else:
+          result, reasoning_content = self._split_deepseek_v4_reasoning(
+              result, emit_reasoning_content)
+      return result, reasoning_content
 
   def _split_deepseek_v4_reasoning(
       self,
@@ -1603,10 +1657,10 @@ class FastLLmCompletion:
           force_chat_template = self.model.force_chat_template,
           force_type = getattr(self.model, "tool_call_parser", "auto"))
 
-  def _apply_qwen4_tool_choice(
+  def _apply_qwen_xml_tool_choice(
       self, messages, tools, tool_choice, parallel_tool_calls=None,
   ):
-      if self.model.get_type() != "qwen4_exp" or not tools:
+      if self.model.get_type() not in ("qwen4_exp", "naive_n05_flash") or not tools:
           return messages, tools
       if tool_choice != "required" and not isinstance(tool_choice, dict):
           return messages, tools
@@ -1792,6 +1846,7 @@ class FastLLmCompletion:
 
       if role == "assistant":
           text_blocks: List[str] = []
+          reasoning_blocks: List[str] = []
           tool_calls: List[Dict[str, Any]] = []
           for block in content:
               if not isinstance(block, dict):
@@ -1799,6 +1854,8 @@ class FastLLmCompletion:
               block_type = block.get("type")
               if block_type == "text":
                   text_blocks.append(block.get("text", ""))
+              elif block_type == "thinking":
+                  reasoning_blocks.append(block.get("thinking", ""))
               elif block_type == "tool_use":
                   tool_calls.append({
                       "id": block.get("id") or f"toolu_{shortuuid.random()}",
@@ -1816,6 +1873,7 @@ class FastLLmCompletion:
               role = role,
               content = text_content,
               tool_calls = tool_calls or None,
+              reasoning_content = "\n".join(reasoning_blocks) if reasoning_blocks else None,
           )], LoadedMedia()
 
       if role == "user":
@@ -1910,7 +1968,7 @@ class FastLLmCompletion:
 
   def _get_anthropic_stop_reason(self, completion_tokens: int,
                                  max_tokens: Optional[int]) -> str:
-      if max_tokens is not None and completion_tokens >= max_tokens:
+      if max_tokens is not None and max_tokens > 0 and completion_tokens >= max_tokens:
           return "max_tokens"
       return "end_turn"
 
@@ -2121,7 +2179,7 @@ class FastLLmCompletion:
               messages.append({
                   "role": "tool",
                   "tool_call_id": item.get("call_id") or item.get("id"),
-                  "content": self._stringify_responses_tool_output(
+                  "content": self._convert_responses_content_to_chat_content(
                       item.get("output", "")),
               })
               continue
@@ -2661,6 +2719,29 @@ class FastLLmCompletion:
           traceback.print_exc()
           return self.create_error_response(str(e))
 
+      if getattr(raw_request, "headers", {}).get("x-fastllm-codex-title-mode") == "local":
+          from .codex_title import local_codex_title
+          title = local_codex_title(request, chat_request.messages)
+          if title is not None:
+              error = await self._check_model(request)
+              if error is not None:
+                  return error
+              content = json.dumps({"title": title}, ensure_ascii=False)
+              response_id = f"resp_{shortuuid.random()}"
+              created_at = int(time.time())
+              if request.stream:
+                  async def title_stream():
+                      yield "data: " + json.dumps({
+                          "id": response_id, "created": created_at,
+                          "choices": [{"delta": {"content": content}, "finish_reason": "stop"}],
+                          "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                      }, ensure_ascii=False) + "\n\n"
+                  return self.responses_stream_generator(request, title_stream()), None
+              return self._responses_response_object(
+                  request, response_id, created_at, "completed",
+                  [self._responses_message_item(f"msg_{shortuuid.random()}", content)],
+                  ResponsesUsageInfo(), output_text=content)
+
       generator = await self.create_chat_completion(chat_request, raw_request)
       if isinstance(generator, ErrorResponse):
           return generator
@@ -2947,6 +3028,8 @@ class FastLLmCompletion:
                   msg_dict["tool_call_id"] = msg.tool_call_id
               if msg.name is not None:
                   msg_dict["name"] = msg.name
+              if msg.reasoning_content is not None:
+                  msg_dict["reasoning_content"] = msg.reasoning_content
               messages.append(msg_dict)
       except Exception as e:
           logging.error("Error in applying anthropic request: %s", e)
@@ -3048,18 +3131,21 @@ class FastLLmCompletion:
       result_generator = self._stream_response_handle_with_statistics(
           handle, response_statistics)
 
+      emit_reasoning_content = self._uses_tagged_reasoning_response(enable_thinking)
       if request.stream:
           return (self.anthropic_message_stream_generator(
               request, raw_request, result_generator, request_id,
               input_token_len, parser_request, handle = handle,
-              response_statistics = response_statistics),
+              response_statistics = response_statistics,
+              emit_reasoning_content = emit_reasoning_content),
               BackgroundTask(self.check_disconnect, raw_request, request_id, handle))
       else:
           try:
               return await self.anthropic_message_full_generator(
                   request, raw_request, handle, result_generator, request_id,
                   input_token_len, parser_request,
-                  response_statistics = response_statistics)
+                  response_statistics = response_statistics,
+                  emit_reasoning_content = emit_reasoning_content)
           except PromptTooLongError as e:
               self._release_conversation_handle(request_id, handle)
               return self.create_error_response(str(e))
@@ -3206,7 +3292,7 @@ class FastLLmCompletion:
       try:
           messages, tools = self._apply_dots_tool_choice(
               messages, tools, tool_choice)
-          messages, tools = self._apply_qwen4_tool_choice(
+          messages, tools = self._apply_qwen_xml_tool_choice(
               messages, tools, tool_choice, request.parallel_tool_calls)
       except ValueError as error:
           self._cleanup_temp_paths(media.temp_paths)
@@ -3363,26 +3449,8 @@ class FastLLmCompletion:
            return self.create_error_response("Client disconnected")
 
       history_raw = result
-      if self._is_kimi_k3_model():
-          if emit_reasoning_content:
-              result, reasoning_content = self._split_kimi_k3_reasoning(
-                  result,
-                  emit_reasoning_content,
-                  preserve_xtml=bool(request.tools))
-          else:
-              reasoning_content = None
-              if not request.tools:
-                  result = self._strip_kimi_k3_response_wrapper(result)
-      elif (self._is_qwen_reasoning_model()
-            or self._is_dots3_note_model()):
-          result, reasoning_content = self._split_qwen3_5_reasoning(
-              result, emit_reasoning_content)
-      elif self._is_glm5_next_model():
-          result, reasoning_content = self._split_glm5_next_reasoning(
-              result, emit_reasoning_content)
-      else:
-          result, reasoning_content = self._split_deepseek_v4_reasoning(
-              result, emit_reasoning_content)
+      result, reasoning_content = self._split_reasoning_response(
+          result, emit_reasoning_content, preserve_xtml=bool(request.tools))
       result, stopped_by_stop_string = self._truncate_at_stop(
           result, self._normalize_stop_strings(request.stop))
       usage = self._chat_usage(
@@ -3568,19 +3636,8 @@ class FastLLmCompletion:
         history_tool_calls = []
         history_raw_parts = []
         history_reasoning_parts = []
-        reasoning_format = "kimi_k3" if self._is_kimi_k3_model() else "think"
-        reasoning_state = {
-            "active": emit_reasoning_content,
-            "buffer": "",
-            "started": False,
-            "format": reasoning_format,
-            "phase": "reasoning" if emit_reasoning_content else "content",
-            "reasoning_started": False,
-            "preserve_xtml": bool(request.tools),
-            "content_buffer": "",
-            "content_started": False,
-            "content_done": False,
-        }
+        reasoning_state = self._new_reasoning_state(
+            emit_reasoning_content, preserve_xtml=bool(request.tools))
 
         stream_exhausted = False
         async for res in result_generator:
@@ -3865,7 +3922,8 @@ class FastLLmCompletion:
               request_id: str,
               input_token_len: int,
               parser_request: Optional[ChatCompletionRequest],
-              response_statistics: Optional[Dict[str, int]] = None
+              response_statistics: Optional[Dict[str, int]] = None,
+              emit_reasoning_content: bool = False
               ) -> Union[ErrorResponse, AnthropicMessageResponse]:
       model_name = self.model_name
       result = ""
@@ -3883,19 +3941,29 @@ class FastLLmCompletion:
            logging.info(f"Abort request: {request_id}")
            return self.create_error_response("Client disconnected")
 
+      usage = self._anthropic_usage(
+          handle, response_statistics, input_token_len, completion_tokens)
+      self._release_conversation_handle(request_id, handle)
+      result, reasoning_content = self._split_reasoning_response(
+          result, emit_reasoning_content, preserve_xtml=bool(request.tools))
       if request.tools and parser_request is not None:
-          tool_parser = self._create_tool_parser()
-          tool_call_info = tool_parser.extract_tool_calls(result, parser_request)
+          tool_call_info = self._parse_non_stream_tool_calls(
+              result, parser_request,
+              finish_reason=self._chat_finish_reason(
+                  usage.output_tokens, request.max_tokens or 32768))
+          if isinstance(tool_call_info, ErrorResponse):
+              return tool_call_info
       else:
           tool_call_info = ExtractedToolCallInformation(
               tools_called = False, tool_calls = [], content = result)
 
-      usage = self._anthropic_usage(
-          handle, response_statistics, input_token_len, completion_tokens)
+      blocks = self._build_anthropic_response_blocks(
+          tool_call_info.content, tool_call_info.tool_calls)
+      if reasoning_content:
+          blocks.insert(0, AnthropicThinkingContentBlock(thinking=reasoning_content))
       response = AnthropicMessageResponse(
           id = request_id,
-          content = self._build_anthropic_response_blocks(
-              tool_call_info.content, tool_call_info.tool_calls),
+          content = blocks,
           model = model_name,
           stop_reason = ("tool_use" if tool_call_info.tools_called
                          else self._get_anthropic_stop_reason(
@@ -3915,19 +3983,16 @@ class FastLLmCompletion:
           input_token_len: int,
           parser_request: Optional[ChatCompletionRequest],
           handle: Optional[int] = None,
-          response_statistics: Optional[Dict[str, int]] = None
+          response_statistics: Optional[Dict[str, int]] = None,
+          emit_reasoning_content: bool = False
           ) -> AsyncGenerator[str, None]:
       model_name = self.model_name
       completion_tokens = 0
       next_content_index = 0
       text_block_index = None
+      thinking_block_index = None
       tool_blocks: Dict[int, Dict[str, Any]] = {}
       emitted_tool_use = False
-
-      previous_token_ids = []
-      current_token_ids = []
-      previous_text = ""
-      current_text = ""
 
       try:
           message = AnthropicMessageResponse(
@@ -3943,40 +4008,92 @@ class FastLLmCompletion:
               "message_start", MessageStartEvent(message = message))
 
           tool_parser = (
-              self._create_tool_parser()
+              self._create_function_call_parser(parser_request)
               if request.tools and parser_request is not None
               else None
           )
 
-          async for res in result_generator:
-              if (res == "[unused16]"):
-                  res = "<think>"
-              elif (res == "[unused17]"):
-                  res = "</think>"
-              completion_tokens += 1
-              delta_text = res
+          reasoning_state = self._new_reasoning_state(
+              emit_reasoning_content, preserve_xtml=bool(request.tools))
 
-              if request.tools and parser_request is not None and tool_parser:
+          async def parsed_deltas():
+              nonlocal completion_tokens
+              previous_text = ""
+              previous_token_ids = []
+              async for res in result_generator:
+                  delta_text = self._normalize_model_delta(res)
+                  completion_tokens += 1
+                  reasoning_deltas, delta_text = self._consume_tagged_reasoning_delta(
+                      delta_text, reasoning_state)
+                  for reasoning_delta in reasoning_deltas:
+                      yield reasoning_delta
+                  if not delta_text:
+                      continue
+                  if tool_parser is None:
+                      yield DeltaMessage(content=delta_text)
+                      continue
                   now_ids = tool_parser.get_token_ids(delta_text)
-                  current_text += delta_text
-                  current_token_ids += now_ids
-
-                  delta_message = tool_parser.extract_tool_calls_streaming(
-                                  previous_text = previous_text,
-                                  current_text = current_text,
-                                  delta_text = delta_text,
-                                  previous_token_ids = previous_token_ids,
-                                  current_token_ids = current_token_ids,
-                                  delta_token_ids = [0],
-                                  request = parser_request)
-
+                  parsed = tool_parser.parse_stream_chunk(
+                      previous_text=previous_text,
+                      current_text=previous_text + delta_text,
+                      delta_text=delta_text,
+                      previous_token_ids=previous_token_ids,
+                      current_token_ids=previous_token_ids + now_ids,
+                      delta_token_ids=now_ids)
                   previous_text += delta_text
                   previous_token_ids += now_ids
-              else:
-                  delta_message = DeltaMessage(content = delta_text)
+                  yield DeltaMessage(content=parsed.content,
+                                     tool_calls=parsed.valid_tool_calls)
 
+              # A terminal native handle may be reused before we yield the
+              # parser's last buffered call or the closing SSE events.
+              self._release_conversation_handle(request_id, handle)
+              if (emit_reasoning_content
+                      and reasoning_state.get("format") != "kimi_k3"
+                      and reasoning_state.get("active")
+                      and reasoning_state.get("buffer")):
+                  yield DeltaMessage(reasoning_content=reasoning_state["buffer"])
+                  reasoning_state["buffer"] = ""
+              if tool_parser is None:
+                  return
+              usage = self._anthropic_usage(
+                  handle, response_statistics, input_token_len, completion_tokens)
+              diagnostics = tool_parser.finalize_stream(
+                  finish_reason=self._chat_finish_reason(
+                      usage.output_tokens, request.max_tokens or 32768))
+              if diagnostics:
+                  raise ValueError("Invalid tool call: " +
+                                   self._format_tool_call_diagnostics(diagnostics))
+              # Qwen can finish after </function> with the outer delimiter
+              # absent. Without finalization, clients see only the preceding
+              # text and end_turn, silently dropping the intended action.
+              parsed = tool_parser.flush_stream_tool_calls()
+              yield DeltaMessage(content=parsed.content,
+                                 tool_calls=parsed.valid_tool_calls)
+
+          async for delta_message in parsed_deltas():
               if not delta_message:
                   continue
+
+              if delta_message.reasoning_content:
+                  if thinking_block_index is None:
+                      thinking_block_index = next_content_index
+                      next_content_index += 1
+                      yield self._create_anthropic_sse_event(
+                          "content_block_start", ContentBlockStartEvent(
+                              index=thinking_block_index,
+                              content_block=AnthropicThinkingContentBlock(thinking="")))
+                  yield self._create_anthropic_sse_event(
+                      "content_block_delta", ContentBlockDeltaEvent(
+                          index=thinking_block_index,
+                          delta=AnthropicThinkingDelta(
+                              thinking=delta_message.reasoning_content)))
+
+              if (thinking_block_index is not None
+                      and (delta_message.content or delta_message.tool_calls)):
+                  yield self._create_anthropic_sse_event(
+                      "content_block_stop", ContentBlockStopEvent(index=thinking_block_index))
+                  thinking_block_index = None
 
               if delta_message.content:
                   if tool_blocks:
@@ -4056,6 +4173,9 @@ class FastLLmCompletion:
           # the old BackgroundTask abort a newly recycled numeric handle.
           self._release_conversation_handle(request_id, handle)
 
+          if thinking_block_index is not None:
+              yield self._create_anthropic_sse_event(
+                  "content_block_stop", ContentBlockStopEvent(index=thinking_block_index))
           if text_block_index is not None:
               yield self._create_anthropic_sse_event(
                   "content_block_stop",

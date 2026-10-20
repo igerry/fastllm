@@ -1,9 +1,12 @@
 #include "fastllm.h"
 #include "devices/moe_decode_scheduler.h"
+#include "devices/cuda/fastllm-cuda-moe-policy.h"
 #include "fastllm-cuda.cuh"
+#include "cuda_moe_prefill_test.h"
 #include "fastllm-cuda-shared-weight.cuh"
 #include "devices/cpu/cpudevice.h"
 #include "devices/cuda/cudadevice.h"
+#include "models/qwen4_exp.h"
 #ifdef USE_NUMAS
 #include "devices/numas/numasdevice.h"
 #include "devices/numas/numas.h"
@@ -16,9 +19,11 @@ namespace fastllm { NumaConfig *GetNumaConfig(); }
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <random>
 #include <stdexcept>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -46,6 +51,36 @@ static size_t ExpertRecordBytes(const fastllm::Data &gate, const fastllm::Data &
     const size_t scaleBytes = gate.dataType == fastllm::DataType::FP8_E4M3_BLOCK_128 ? 0 :
         (gate.scales.size() + down.scales.size()) * sizeof(float);
     return (scalesOffset + scaleBytes + 127) / 128 * 128;
+}
+
+static void CheckLayeredModelCache(std::vector<fastllm::Data *> &hostWeights) {
+    fastllm::Qwen4ExpModel model;
+    model.block_cnt = 2;
+    model.deviceMap = model.moeDeviceMap = {{"cuda:0", 1}};
+    model.layeredMoeDeviceMap = {{"cpu", 1}};
+    model.moeDeviceLayers = 1;
+    // The first table represents a GPU layer that must never be snapshotted.
+    std::vector<std::vector<fastllm::Data *>> layers{
+        std::vector<fastllm::Data *>(hostWeights.size(), nullptr), hostWeights};
+    int devices = 0;
+    Check(cudaGetDeviceCount(&devices));
+    devices = std::min(devices, 2);
+    for (int pass = 0; pass < 2; ++pass) {
+        Require(model.PrepareMoeCudaCache(layers), "host layer after CUDA layer not registered");
+        for (int device = 0; device < devices; ++device) {
+            Check(cudaSetDevice(device));
+            Require(model.MoeCudaCacheAvailable(layers[1]), "per-device cache unavailable");
+            Require(!model.MoeCudaCacheAvailable(layers[0]), "CUDA layer was registered");
+        }
+        model.ReleaseMoeCudaCache(layers);
+        for (int device = 0; device < devices; ++device) {
+            Check(cudaSetDevice(device));
+            Require(!model.MoeCudaCacheAvailable(layers[1]), "later host layer cache leaked");
+        }
+        Check(cudaSetDevice(0));
+    }
+    model.moeDeviceLayers = 0;
+    Require(!model.PrepareMoeCudaCache(layers), "all-CUDA placement prepared host cache");
 }
 
 template<class T>
@@ -182,6 +217,9 @@ static void Run(fastllm::DataType dtype, int hidden, int inter,
     FastllmCudaReleaseMoeCache(weights.data(), weights.size());
     Require(!supported(), "released table still registered");
     FastllmCudaReleaseMoeCache(weights.data(), weights.size());
+    if (dtype == fastllm::DataType::FLOAT32 && hidden == 128 && batch == 1) {
+        CheckLayeredModelCache(weights);
+    }
     fastllm::SetMoeCudaCacheBytes(0);
     std::printf("PASS adapter weight=%d dtype=%d hidden=%d inter=%d batch=%d, graph/eviction/release/validation\n",
                 int(weightType), int(dtype), hidden, inter, batch);
@@ -313,12 +351,205 @@ static void CompareFP8(fastllm::DataType dtype, fastllm::DataType weightType,
                 int(weightType), int(dtype), batch);
 }
 
+#ifdef USE_NUMAS
+static void CheckExpertParallel(std::vector<fastllm::Data *> &reference,
+                                std::vector<fastllm::Data *> &weights,
+                                bool disableSecondDevice, bool reverseDevices = false,
+                                int maxRows = 1, bool singleDeviceHybrid = false) {
+    using namespace fastllm;
+    const int ranks = singleDeviceHybrid ? 1 : 2;
+    int devices = 0;
+    Check(cudaGetDeviceCount(&devices));
+    if (devices < ranks) return;
+    const char *overrideName = "FASTLLM_MOE_CUDA_CACHE_BYTES_1";
+    const char *previous = std::getenv(overrideName);
+    const bool hadOverride = previous != nullptr;
+    const std::string previousValue = previous ? previous : "";
+    if (disableSecondDevice) setenv(overrideName, "0", 1);
+    auto context = FastllmCudaCreateMoeExpertParallel(2);
+    const int hidden = weights[2]->dims[1], topk = 7;
+    Data inputs[2]{{FLOAT32, {maxRows, hidden}}, {FLOAT32, {maxRows, hidden}}};
+    Data ids(INT32, {maxRows, topk}), scores(FLOAT32, {maxRows, topk}), results[2];
+    Data refIds(INT32, {maxRows, topk}), refScores(FLOAT32, {maxRows, topk}), refInput(FLOAT32, {maxRows, hidden});
+    Data refGate, refOutput;
+    for (int r = 0; r < ranks; ++r) {
+        Check(cudaSetDevice(reverseDevices ? 1 - r : r));
+        inputs[r].ToDevice(DataDevice::CUDA, std::vector<int>{reverseDevices ? 1 - r : r});
+        inputs[r].Allocate(false);
+    }
+    Check(cudaSetDevice(reverseDevices ? 1 : 0));
+    ids.ToDevice(DataDevice::CUDA, std::vector<int>{reverseDevices ? 1 : 0}); ids.Allocate(false);
+    scores.ToDevice(DataDevice::CUDA, std::vector<int>{reverseDevices ? 1 : 0}); scores.Allocate(false);
+    Check(cudaSetDevice(0));
+    AllocateGpu(refIds); AllocateGpu(refScores); AllocateGpu(refInput);
+    std::vector<float> activation(maxRows * hidden), routeScores(maxRows * topk),
+        cpu(maxRows * topk * hidden), gpu(maxRows * hidden), grouped(cpu.size());
+    std::vector<int32_t> indices(maxRows * topk), mask(maxRows * topk, -1);
+    std::array<std::vector<float>, 2> actual{std::vector<float>(maxRows * hidden), std::vector<float>(maxRows * hidden)};
+    std::mt19937 rng(912);
+    const uint64_t budget = GetMoeCudaCacheBytes();
+    for (int step = 0; step < 20; ++step) {
+        const int rows = step % 3 == 0 ? 1 : maxRows;
+        const int routes = rows * topk;
+        for (auto &input : inputs) input.Resize({rows, hidden});
+        ids.Resize({rows, topk}); scores.Resize({rows, topk});
+        refIds.Resize({rows, topk}); refScores.Resize({rows, topk}); refInput.Resize({rows, hidden});
+        for (auto &v : activation) v = float(int(rng() % 31) - 15) / 64;
+        for (int r = 0; r < routes; ++r) {
+            const int k = r % topk;
+            indices[r] = ((k == 6 ? 1 : k) + (r / topk) % 3) + (step >= 8 ? 12 : 0);
+            // Keep the other cache usable but send every route to the rank
+            // whose device is disabled, forcing EP's all-CPU reduction.
+            if (disableSecondDevice && step == 12)
+                indices[r] = 2 * ((k == 6 ? 1 : k) + (r / topk) % 3) +
+                    (reverseDevices ? 0 : 1);
+            routeScores[r] = k == 3 ? 0 : k == 5 ? -.125f : float(k + 1) / 32;
+        }
+        for (int r = 0; r < ranks; ++r) {
+            Check(cudaSetDevice(reverseDevices ? 1 - r : r));
+            Check(cudaMemcpy(inputs[r].cudaData, activation.data(), rows * hidden * sizeof(float), cudaMemcpyHostToDevice));
+        }
+        Check(cudaSetDevice(reverseDevices ? 1 : 0));
+        Check(cudaMemcpy(ids.cudaData, indices.data(), routes * sizeof(int32_t), cudaMemcpyHostToDevice));
+        Check(cudaMemcpy(scores.cudaData, routeScores.data(), routes * sizeof(float), cudaMemcpyHostToDevice));
+        Check(cudaSetDevice(0));
+        Check(cudaMemcpy(refInput.cudaData, activation.data(), rows * hidden * sizeof(float), cudaMemcpyHostToDevice));
+        Check(cudaMemcpy(refIds.cudaData, indices.data(), routes * sizeof(int32_t), cudaMemcpyHostToDevice));
+        // Independent existing backends bound every route's CPU/GPU arithmetic.
+        for (int row = 0; row < rows; ++row)
+            NumasMoeDecodeExperts(activation.data() + row * hidden, cpu.data() + row * topk * hidden,
+                weights.data(), indices.data() + row * topk, mask.data(), topk, 0);
+        NumasMoeDecodeExpertsBatch(activation.data(), grouped.data(), rows, weights.data(), weights.size(),
+            indices.data(), mask.data(), routeScores.data(), topk, 0);
+        for (int i = 0; i < routes * hidden; ++i)
+            Require(std::abs(grouped[i] - cpu[i]) <= 3e-5f * (1 + std::abs(cpu[i])),
+                    "EP grouped NUMA differs from single-row expert reference");
+        std::vector<float> lower(rows * hidden, 0), upper(rows * hidden, 0), magnitude(rows * hidden, 0);
+        for (int r = 0; r < topk; ++r) {
+            std::vector<float> one(routes, 0);
+            for (int row = 0; row < rows; ++row) one[row * topk + r] = 1;
+            Check(cudaMemcpy(refScores.cudaData, one.data(), routes * sizeof(float), cudaMemcpyHostToDevice));
+            Require(FastllmCudaMergeMOECache(refInput, refGate, refOutput,
+                reference.data(), reference.size(), static_cast<int32_t *>(refIds.cudaData),
+                static_cast<float *>(refScores.cudaData), topk), "EP GPU reference rejected");
+            Check(cudaMemcpy(gpu.data(), refOutput.cudaData, rows * hidden * sizeof(float), cudaMemcpyDeviceToHost));
+            for (int c = 0; c < rows * hidden; ++c) {
+                const int route = (c / hidden) * topk + r;
+                const float a = cpu[route * hidden + c % hidden] * routeScores[route], b = gpu[c] * routeScores[route];
+                lower[c] += std::min(a, b); upper[c] += std::max(a, b);
+                magnitude[c] += std::max(std::abs(a), std::abs(b));
+            }
+        }
+        const bool reject = step >= 16;
+        // FP16/BF16 are supported EP inputs; use an unsupported type to
+        // verify that one rank's rejection makes every rank fall back.
+        if (step == 16) inputs[ranks - 1].dataType = INT8;
+        if (step == 17) SetMoeCudaCacheBytes(0);
+        if (step == 18) inputs[ranks - 1].Resize({rows == 1 ? 2 : 1, hidden});
+        if (step == 19) {
+            Check(cudaSetDevice(reverseDevices ? 1 : 0));
+            const int32_t invalid = weights.size() / 2;
+            Check(cudaMemcpy(ids.cudaData, &invalid, sizeof(invalid), cudaMemcpyHostToDevice));
+        }
+        bool accepted[2]{}; int callbacks[2]{}; std::exception_ptr errors[2];
+        const auto before = FastllmCudaGetMoeExpertParallelStats(*context);
+        auto run = [&](int rank) {
+            try {
+                Check(cudaSetDevice(reverseDevices ? 1 - rank : rank));
+                Data empty;
+                if (singleDeviceHybrid) {
+                    void *policy = rows == 1 && !reject
+                        ? FastllmCudaBeginMoeDecode(weights.data(), weights.size(), topk) : nullptr;
+                    accepted[rank] = FastllmCudaMergeMOEHybrid(inputs[rank], ids, scores, results[rank],
+                        weights.data(), weights.size(), 0, [&] { ++callbacks[rank]; });
+                    FastllmCudaEndMoeDecode(policy);
+                } else {
+                    accepted[rank] = FastllmCudaMergeMOEExpertParallel(*context, rank, inputs[rank],
+                        rank == 0 ? ids : empty, rank == 0 ? scores : empty, results[rank],
+                        weights.data(), weights.size(), 0, [&] { ++callbacks[rank]; });
+                }
+                if (accepted[rank]) Check(cudaMemcpy(actual[rank].data(), results[rank].cudaData,
+                    rows * hidden * sizeof(float), cudaMemcpyDeviceToHost));
+            } catch (...) { errors[rank] = std::current_exception(); }
+        };
+        if (singleDeviceHybrid) run(0);
+        else {
+            std::thread first(run, 0), second(run, 1);
+            first.join(); second.join();
+        }
+        inputs[ranks - 1].dataType = FLOAT32;
+        SetMoeCudaCacheBytes(budget);
+        for (int rank = 0; rank < ranks; ++rank) {
+            if (errors[rank]) std::rethrow_exception(errors[rank]);
+            Require(accepted[rank] == !reject, "EP rejection was not collective");
+            Require(callbacks[rank] == int(!reject), "EP shared expert callback count changed");
+        }
+        if (reject) continue;
+        if (!singleDeviceHybrid) {
+            Check(cudaSetDevice(reverseDevices ? 1 : 0));
+            Require(FastllmCudaBeginMoeDecode(weights.data(), weights.size(), topk) == nullptr,
+                    "outer decode scope advanced an EP-owned frequency step");
+        }
+        const auto after = FastllmCudaGetMoeExpertParallelStats(*context);
+        Require(singleDeviceHybrid || after.cpuRoutes - before.cpuRoutes +
+            after.gpuRoutes[0] - before.gpuRoutes[0] + after.gpuRoutes[1] - before.gpuRoutes[1] == routes,
+            "EP route ownership is not exclusive and complete");
+        if (disableSecondDevice && step == 12) {
+            Require(after.cpuRoutes - before.cpuRoutes == routes,
+                    "EP all-CPU reduction case used GPU experts");
+            for (int c = 0; c < rows * hidden; ++c) {
+                float expected = 0;
+                for (int r = 0; r < topk; ++r) {
+                    const int route = (c / hidden) * topk + r;
+                    expected = std::fma(cpu[route * hidden + c % hidden],
+                                        routeScores[route], expected);
+                }
+                Require(actual[0][c] == expected && actual[1][c] == 0,
+                        "EP all-CPU reduction changed fused accumulation");
+            }
+        }
+        for (int c = 0; c < rows * hidden; ++c) {
+            const float result = actual[0][c] + (singleDeviceHybrid ? 0 : actual[1][c]);
+            // Rank-local sums round before the cross-rank addition. Bound
+            // that error by the terms' magnitudes, even when they cancel.
+            const float tolerance = 3e-5f * (1 + std::max(std::abs(lower[c]), std::abs(upper[c]))) +
+                (topk + 2) * std::numeric_limits<float>::epsilon() * magnitude[c];
+            if (!std::isfinite(result) || result < lower[c] - tolerance || result > upper[c] + tolerance)
+                std::fprintf(stderr, "EP mismatch: step=%d rows=%d column=%d asymmetric=%d reverse=%d "
+                    "rank0=%g rank1=%g bounds=[%g,%g] tolerance=%g\n",
+                    step, rows, c, disableSecondDevice, reverseDevices,
+                    actual[0][c], singleDeviceHybrid ? 0.f : actual[1][c], lower[c], upper[c], tolerance);
+            Require(std::isfinite(result) && result >= lower[c] - tolerance && result <= upper[c] + tolerance,
+                    "EP duplicated or lost an expert contribution");
+        }
+    }
+    const auto stats = FastllmCudaGetMoeExpertParallelStats(*context);
+    if (disableSecondDevice) {
+        Require(stats.gpuRoutes[reverseDevices ? 0 : 1] == 0, "disabled EP device executed experts");
+        Require(stats.admissions[reverseDevices ? 0 : 1] == 0, "disabled EP device admitted experts");
+        Require(stats.gpuRoutes[reverseDevices ? 1 : 0] > 0, "EP disabled both devices");
+    } else if (!singleDeviceHybrid) {
+        Require(stats.gpuRoutes[0] && stats.gpuRoutes[1] && stats.multiGpuSteps,
+                "EP never computed one layer on both GPUs");
+        // The first two-rank run starts with a cold second device. Its
+        // frequency-based fills must be visible in the public statistics.
+        if (maxRows == 1 && !reverseDevices)
+            Require(stats.admissions[1] > 0, "EP frequency admissions were not counted");
+    }
+    context.reset();
+    if (hadOverride) setenv(overrideName, previousValue.c_str(), 1); else unsetenv(overrideName);
+    Check(cudaSetDevice(0));
+    std::printf("PASS expert parallel: ranks=%d asymmetric=%d reverse=%d rows=1/%d, CPU/GPU subsets, duplicates/zero/negative scores, rejection\n",
+                ranks, disableSecondDevice, reverseDevices, maxRows);
+}
+#endif
+
 template<class T>
 static void CompareNumaCache(fastllm::DataType dtype, int nodes, int batch,
                             int hidden = 128, int inter = 64, bool planar = false,
                             bool hybrid = false,
                             fastllm::DataType weightType = fastllm::DataType::NVFP4_BLOCK_16_E4M3,
-                            bool perchannel = false, bool compactScales = false) {
+                            bool perchannel = false, bool compactScales = false, bool prefill = false) {
     constexpr int experts = 24, topk = 7, tables = 2;
     std::mt19937 rng(171);
     std::vector<std::unique_ptr<fastllm::Data>> owned[3];
@@ -449,6 +680,14 @@ static void CompareNumaCache(fastllm::DataType dtype, int nodes, int batch,
         }),
                 "active cache was not reused");
     }
+    if (prefill) {
+        fastllm_prefill_test::Run(layers[1], weights[1], tables, false, 32, dtype);
+        for (int backend = 0; backend < 2; ++backend)
+            FastllmCudaReleaseMoeCache(weights[backend][0].data(), 2 * (experts + 1));
+        for (void *ptr : shards) Check(cudaFreeHost(ptr));
+        fastllm::SetMoeCudaCacheBytes(0);
+        return;
+    }
     fastllm::Data input(dtype, {batch, hidden}), ids(fastllm::DataType::INT32, {batch, topk});
     fastllm::Data scores(fastllm::DataType::FLOAT32, {batch, topk});
     AllocateGpu(input); AllocateGpu(ids); AllocateGpu(scores);
@@ -468,6 +707,26 @@ static void CompareNumaCache(fastllm::DataType dtype, int nodes, int batch,
         Check(cudaMemcpy(input.cudaData, activation.data(), activation.size() * sizeof(T), cudaMemcpyHostToDevice));
         Check(cudaMemcpy(ids.cudaData, indices.data(), indices.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
         Check(cudaMemcpy(scores.cudaData, routes.data(), routes.size() * sizeof(float), cudaMemcpyHostToDevice));
+        if (step == 0) {
+            // Exercise the prefill handoff with real uploaded NUMA layouts.
+            // The following cache kernels must read these admitted records,
+            // and agree bitwise with the independent canonical snapshot.
+            std::unordered_set<int> selected;
+            for (int expert : indices) selected.insert(expert + 1);
+            FastllmCudaMoePrefillPlan plan;
+            FastllmCudaPlanMoePrefill(weights[1][table].data(), experts,
+                indices.data(), routes.data(), batch, topk, selected, plan);
+            Require(!plan.keys.empty(), "NUMA prefill did not reserve cache slots");
+            for (int expert : selected) {
+                auto &gate = *weights[1][table][2 * expert];
+                auto &down = *weights[1][table][2 * expert + 1];
+                gate.ToCudaTemporary({}, true); down.ToCudaTemporary({}, true);
+                FastllmCudaStoreMoePrefillExpert(plan, expert - 1, gate, down);
+                Check(cudaStreamSynchronize(cudaStreamPerThread));
+                gate.FreeCudaTemporary({}, false); down.FreeCudaTemporary({}, false);
+            }
+            FastllmCudaPublishMoePrefill(plan);
+        }
         for (int backend = 0; backend < 2; ++backend) {
             auto launch = [&] {
                 Require(FastllmCudaMergeMOECache(input, gate[backend][table], output[backend][table],
@@ -575,6 +834,17 @@ static void CompareNumaCache(fastllm::DataType dtype, int nodes, int batch,
         }
 #endif
     }
+#ifdef USE_NUMAS
+    if (hybrid) {
+        CheckExpertParallel(weights[0][0], weights[1][0], false, false, 4, true);
+        CheckExpertParallel(weights[0][0], weights[1][0], false, false, FASTLLM_CUDA_MOE_CACHE_MAX_BATCH, true);
+        CheckExpertParallel(weights[0][0], weights[1][0], planar);
+        CheckExpertParallel(weights[0][0], weights[1][0], planar, false, 4);
+        CheckExpertParallel(weights[0][0], weights[1][0], planar, false, FASTLLM_CUDA_MOE_CACHE_MAX_BATCH);
+        if (planar) CheckExpertParallel(weights[0][0], weights[1][0], true, true);
+        if (planar) CheckExpertParallel(weights[0][0], weights[1][0], true, true, 4);
+    }
+#endif
     for (int backend = 0; backend < 2; ++backend) {
         for (int table = 0; table < tables; ++table) {
             Check(cudaGraphExecDestroy(exec[backend][table]));
@@ -827,6 +1097,28 @@ static void CheckDecodePolicy() {
 
 int main(int argc, char **argv) {
     try {
+        if (argc == 2 && std::strcmp(argv[1], "--prefill-model-shape") == 0) {
+            CompareNumaCache<__nv_bfloat16>(fastllm::BFLOAT16, 2, 1, 2560, 640,
+                false, false, fastllm::NVFP4_BLOCK_16_E4M3, false, true, true);
+            CompareNumaCache<float>(fastllm::FLOAT32, 2, 1, 2560, 640,
+                false, false, fastllm::NVFP4_BLOCK_16_E4M3, false, true, true);
+            std::puts("ALL_PASS shared prefill model shape");
+            return 0;
+        }
+        if (argc == 2 && std::strcmp(argv[1], "--prefill") == 0) {
+            for (int nodes : {1, 2}) {
+                for (int layout = 0; layout < 3; ++layout)
+                    CompareNumaCache<__nv_bfloat16>(fastllm::BFLOAT16, nodes, 1, 256, 128,
+                        layout == 1, false, fastllm::NVFP4_BLOCK_16_E4M3, false, layout == 2, true);
+                for (auto type : {fastllm::FP8_E4M3, fastllm::FP8_E4M3_BLOCK_128})
+                    CompareNumaCache<__nv_bfloat16>(fastllm::BFLOAT16, nodes, 1, 256, 128,
+                        false, false, type, false, false, true);
+                CompareNumaCache<__nv_bfloat16>(fastllm::BFLOAT16, nodes, 1, 256, 128,
+                    false, false, fastllm::FP8_E4M3, true, false, true);
+            }
+            std::puts("ALL_PASS shared prefill NVFP4/FP8 layouts");
+            return 0;
+        }
         if (argc == 2 && std::strcmp(argv[1], "--compact") == 0) {
             for (int columns : {33, 640, 2560}) for (int batch : {1, 4, 8, 32, 65}) {
                 ComparePlanarLinear<float>(fastllm::DataType::FLOAT32, columns, batch, true);

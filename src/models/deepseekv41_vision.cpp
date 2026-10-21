@@ -17,7 +17,12 @@
 
 #include "deepseekv41.h"
 
+#include "executor.h"
 #include "utils.h"
+
+#ifdef USE_CUDA
+#include "fastllm-cuda.cuh"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -298,6 +303,37 @@ namespace fastllm {
     void DeepSeekV41Model::EncodeImageSpans(const std::map <std::string, std::vector <Data*> > &multimodalInput,
                                             DeepSeekV41RequestState &state) {
         AssertInFastLLM(VisionEnabled(), "DeepSeekV41: this checkpoint has no vision tower (vision_n_layers == 0).");
+        // 视觉塔不做张量并行：TP 下主执行器把 multicuda 排在最前，视觉塔的 RMSNorm / 注意力就会
+        // 跑成「每卡一份副本、主张量为空」，紧接着的 numa Linear 和 CopyFrom 读到的是空的或旧的数据
+        // （#772：先段错误，补上收回副本后又读出乱码特征）。这里换一个线程局部的执行器：
+        // numa 排第一（Linear 照旧走 numa），单卡 cuda 第二，multicuda 基本轮不到。
+        struct VisionExecutorScope {
+            void *previous = GetExecutor();
+#ifdef USE_CUDA
+            int previousDevice = FastllmCudaGetDevice();
+#endif
+            ~VisionExecutorScope() {
+                SetCurrentThreadExecutor(previous);
+#ifdef USE_CUDA
+                FastllmCudaSetDevice(previousDevice);
+#endif
+            }
+        } visionExecutorScope;
+        static thread_local Executor visionExecutor;
+        static thread_local bool visionExecutorReady = false;
+        if (!visionExecutorReady) {
+            std::vector<int> gpus = ((Executor*)visionExecutorScope.previous)->GetDeviceIds("multicuda");
+            visionExecutor.SetFirstDevice("cuda:" + std::to_string(gpus.empty() ? 0 : gpus[0]));
+            visionExecutor.SetFirstDevice("numa");
+            visionExecutorReady = true;
+        }
+#ifdef USE_CUDA
+        {
+            std::vector<int> ids = visionExecutor.GetDeviceIds("cuda");
+            FastllmCudaSetDevice(ids.empty() ? 0 : ids[0]);
+        }
+#endif
+        SetCurrentThreadExecutor(&visionExecutor);
         const int dim = embed_dim;
         const int r = vision_downsample_ratio;
         state.imageSpans.clear();

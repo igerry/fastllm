@@ -1187,8 +1187,27 @@ namespace fastllm {
         }
     }
 
+    // A replicated MultiCUDA activation keeps its payload only in the
+    // per-device replicas; the root is metadata-only and may still be
+    // labelled CPU with a null cpuData. Anything that reads the root directly
+    // (a cpu/numa operator, CopyFrom) would read a null or stale pointer, e.g.
+    // the DeepSeek-V4.1 vision tower: RMSNorm / Attention run on multicuda,
+    // the following Linear runs on numa. Collapse one replica onto the root.
+    static void CollapseEmptyReplicatedRoot(Data &data) {
+        if (!data.multiDeviceData || !data.IsTensorParallelReplicated() ||
+            data.multiDeviceDatas.empty()) {
+            return;
+        }
+        if ((data.dataDevice == DataDevice::CPU && data.cpuData != nullptr) ||
+            (data.dataDevice == DataDevice::CUDA && data.cudaData != nullptr)) {
+            return;
+        }
+        data.ResetMultiDeviceState();
+    }
+
     void Data::CopyFrom(const Data &ori) {
         if (this == &ori) return;
+        CollapseEmptyReplicatedRoot(const_cast<Data&>(ori));
 #if defined(USE_CUDA) && !defined(USE_ROCM)
         if (!this->isFake && this->extraCudaData.size() >= 7)
             FastllmCudaReleaseBFloat16FP8Auxiliary(*this);
@@ -2859,6 +2878,7 @@ namespace fastllm {
         if (dev->deviceType == "cuda" || dev->deviceType == "multicuda") {
             this->ToDevice(DataDevice::CUDA, dev->deviceIds, copyData);
         } else {
+            CollapseEmptyReplicatedRoot(*this);
             this->ToDevice(DataDevice::CPU, dev->deviceIds, copyData);
         }
     }
